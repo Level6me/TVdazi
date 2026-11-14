@@ -352,81 +352,14 @@ export class DeepSeekAgent {
       this.sessionManager.clearPendingImageSearch(userId);
     }
 
-    // 1. 优先匹配原版指令、快捷翻页或序号选择
+    // 1. 仅对确定性交互（/斜杠指令、翻页/选号、网盘链接、系统配置命令、明确任务管理指令）走 0ms 快路径
     if (this.commandHandler.isCommand(trimmed, userId)) {
       const reply = await this.commandHandler.handle(trimmed, userId);
       appendUserHistory(trimmed, reply);
       return reply;
     }
 
-    // 1.5 优先识别「具体剧情细节找特定某部片 / 记不清片名」意图（避免被泛化推荐正则抢占）
-    const isSpecificPlotIdentify =
-      /(?:记不清名字|忘了叫什么|叫什么名字|哪部电影|哪部剧|什么电影|什么电视剧|有一部(?:电影|电视剧|剧|动漫|片)|有个(?:电影|电视剧|剧|片)|讲的是.+|男主.+女主.+|主角.+)/.test(
-        trimmed
-      ) && !/(?:推荐|有哪些|有什么好看|求推荐|安利|类似|同款)/.test(trimmed);
-
-    if (isSpecificPlotIdentify && trimmed.length < 200) {
-      const reply = await this.commandHandler.renderSearch(trimmed, userId);
-      appendUserHistory(trimmed, reply);
-      return reply;
-    }
-
-    // 2. 意图快速嗅探：影视推荐与种草对话（支持指定年份、年代、档期、类似剧情、数量、时效、地区、类型及多轮追问等自然语言表达）
-    const isHotFollowUp =
-      this.sessionManager.getLastActiveType(userId) === 'hot' &&
-      trimmed.length <= 18 &&
-      !SessionManager.isCancelCommand(trimmed) &&
-      !/(?:不要了|不用了|算了|取消|不看了|不选了)/.test(trimmed) &&
-      /(?:^(?:不要|别推|不看|换|那|再来|有没?有)|(?:的呢|的吗|呢)$|(?:韩剧|美剧|英剧|日剧|国产剧|电影|悬疑|喜剧|科幻|爱情|古装|恐怖|治愈|高分|今年|去年|最近))/.test(
-        trimmed
-      ) &&
-      !/(?:我想看|帮我搜|搜一下)/.test(trimmed);
-
-    const isRecommendIntent =
-      isHotFollowUp ||
-      /(?:推荐|有什么好看|有哪些好看|求推荐|安利|介绍几部|介绍一部|推几部|推一部|发几部|换一部.+|换几部.+|有没有类似|类似.+的(?:剧|电影|片|动漫)|像.+?(?:一样|那样|这种|那种).*?(?:的剧|的电影|的片|有哪些|有什么|推荐)|(?:来一部|来部|找一部|找部|看一部|有没有).*?(?:火|好看|新|高分|经典|悬疑|搞笑|喜剧|治愈|甜宠|科幻|动作|犯罪|下饭|恐怖|古装|武侠|奇幻|战争|历史|灾难|家庭|19\d\d|20\d\d|[789012]0年代)|(?:最近|近期|今年|去年|前年|这两个月|近两个月|这阵子|19\d\d年?|20\d\d年?|[789012]0年代|春节档|暑期档|国庆档).*?(?:新出|比較火|比较火|最火|热门|好看|热播|在播|高分|经典|有什么|有哪些).*?(?:电影|剧|动漫|片|综艺|纪录片)?|(?:韩剧|美剧|英剧|日剧|国剧|国产剧|港片|港剧|台剧|泰剧|动漫|电影|电视剧|悬疑片|科幻片|喜剧片|动作片|恐怖片|犯罪片).*?(?:有哪些|有什么|推荐))/i.test(
-        trimmed
-      );
-    if (isRecommendIntent) {
-      const prevHot = this.sessionManager.getHot(userId);
-      let type: 'movie' | 'tv' = isHotFollowUp && prevHot ? prevHot.type : 'tv';
-      let tag = isHotFollowUp && prevHot?.tag ? prevHot.tag : '热门';
-
-      if (/(?:电影|大片|影史|高分片|院线|科幻片|动作片|喜剧片|恐怖片|悬疑片)/i.test(trimmed)) {
-        type = 'movie';
-      } else if (/(?:电视剧|剧集|韩剧|美剧|英剧|日剧|国剧|国产剧|港剧|台剧|泰剧|网剧)/i.test(trimmed)) {
-        type = 'tv';
-      }
-      if (/韩剧|韩国/i.test(trimmed)) tag = '韩剧';
-      else if (/美剧|美国/i.test(trimmed)) tag = '美剧';
-      else if (/英剧|英国/i.test(trimmed)) tag = '英剧';
-      else if (/日剧|日本/i.test(trimmed)) tag = '日剧';
-      else if (/(?:国剧|国产剧|华语剧)/i.test(trimmed)) tag = '国产剧';
-      else if (/(?:动漫|日漫|番剧|动画)/i.test(trimmed)) tag = '动漫';
-      else if (/(?:悬疑|推理|烧脑)/i.test(trimmed)) tag = '悬疑';
-      else if (/(?:科幻|硬科幻)/i.test(trimmed)) tag = '科幻';
-      else if (/(?:治愈|温馨|温情)/i.test(trimmed)) tag = '治愈';
-      else if (/(?:喜剧|搞笑|下饭)/i.test(trimmed)) tag = '喜剧';
-
-      const recReply = await this.commandHandler.renderHot(type, tag, userId, 1, undefined, trimmed, chatHistory);
-      appendUserHistory(trimmed, recReply);
-      return recReply;
-    }
-
-    // 3. 意图快速嗅探：如果包含“我想看”、“帮我找一下”、“有一部电影讲...”、“记不清名字了”等自然口语或剧情细节描述，直接进入 renderSearch（由 AiCorrector 推理识别具体片名并搜网盘）
-    const searchMatch = trimmed.match(
-      /^(?:我想看|我想找|我要看|帮我找一下|帮我找|搜一下|搜搜|搜|找找|找一部|找部|找|想看|求一下|求|有没有一部|有一部|有个|记不清名字|忘了叫什么)\s*(?:电影|电视剧|网剧|动漫|动漫电影|韩剧|美剧|日剧|港片)?\s*(.+)$/i
-    );
-    if (searchMatch && searchMatch[1]) {
-      const targetWord = searchMatch[1].trim();
-      if (targetWord.length > 0 && targetWord.length < 200) {
-        const reply = await this.commandHandler.renderSearch(trimmed, userId);
-        appendUserHistory(trimmed, reply);
-        return reply;
-      }
-    }
-
-    // 3. 获取用户专属或共享的 DeepSeek 客户端
+    // 2. 所有自然语言输入统一交由 DeepSeek AI 大脑进行意图识别与实体抽取，再路由后续动作
     const { client, model, hasValidKey } = this.getClientForUser(userId, 12000);
 
     if (!hasValidKey) {
@@ -439,13 +372,22 @@ export class DeepSeekAgent {
           type: 'function',
           function: {
             name: 'search_cloud_resources',
-            description: '从公开频道联合检索影视、剧集、动漫等网盘活链资源。如果用户使用演员俗称/外号（如荷兰弟、小李子、甜茶、阿汤哥）、角色缩写或别字，提炼为标准官方片名检索',
+            description: '从全网公开频道三语并发检索影视、剧集、动漫的网盘资源。无论用户直接输入片名、带有“搜索/电影/想看/帮我找”等自然口语，还是提供演员外号/剧情线索找特定作品，都必须调用此工具并提取纯粹干净的标准中文官方片名！',
             parameters: {
               type: 'object',
               properties: {
                 keyword: {
                   type: 'string',
-                  description: '核心搜索关键词，例如电影名、剧集名，尽量精简且为标准中文官方片名',
+                  description: '提取后的纯粹标准中文官方片名（严禁包含“搜索”“帮我找”“电影”“电视剧”“我想看”等修饰语！例如用户输入“搜索电影 突如其来”，必须提取 keyword="突如其来"）',
+                },
+                mediaType: {
+                  type: 'string',
+                  enum: ['movie', 'tv'],
+                  description: '若能从用户消息中判断作品类型：movie=电影，tv=电视剧/剧集/动漫番剧',
+                },
+                year: {
+                  type: 'string',
+                  description: '用户指定或推理出的 4 位上映/开播年份（如 2026），不确定可省略',
                 },
               },
               required: ['keyword'],
@@ -619,12 +561,12 @@ export class DeepSeekAgent {
           content: `你是一个微信端像朋友一样的智能影视云盘助手「WeSaver」。
 你的性格：热情亲切、自然随和、说话通俗简单、接地气，绝不要输出冰冷呆板的客服话术或技术术语。
 核心系统能力与规则（重要）：
-1. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时或延时任务（包括“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守”等），【绝对严禁】回答“我没法掐表”、“我不能等半小时再动手”等推脱借口！遇到此类需求时，直接调用 manage_scheduled_task 工具注册定时/延时任务。
-2. 当用户有看片、搜剧意图时（例如“我想看流浪地球”、“搜庆余年”），调用 search_cloud_resources 工具检索。
-3. 当用户寻求【立即】影视推荐、询问“有什么好看的/有什么推荐的电视剧/韩剧/美剧/电影”时，调用 get_movie_recommendation 工具生成小红书风格的种草笔记清单。若带有延时（如“X分钟后推一部”），必须调用 manage_scheduled_task。
-4. 当用户询问状态、容量时，调用 get_system_status 工具。
-5. 当用户想要修改网盘保存目录时，调用 set_save_directory 工具或引导其发送 /set-dir。
-6. 日常闲聊像微信好友一样简短、风趣、有温度地回应。`,
+1. 你是所有自然语言消息的总控意图分析大脑，必须先准确理解用户的真实意图再调用对应工具。
+2. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时、延时、周期蹲守或追更任务（如“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守《某剧》”），【绝对严禁】推脱拒答！遇到此类需求直接调用 manage_scheduled_task。
+3. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
+4. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
+5. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
+6. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
         },
         ...chatHistory,
         { role: 'user', content: trimmed },
@@ -635,7 +577,7 @@ export class DeepSeekAgent {
         messages,
         tools,
         tool_choice: 'auto',
-        temperature: 0.3,
+        temperature: 0.2,
       });
 
       const choice = completion.choices[0];
@@ -646,7 +588,14 @@ export class DeepSeekAgent {
         const args = JSON.parse(toolCall.function.arguments || '{}');
 
         if (toolCall.function.name === 'search_cloud_resources') {
-          const searchReply = await this.commandHandler.renderSearch(args.keyword, userId);
+          const targetKeyword = String(args.keyword || '').trim() || trimmed;
+          const mediaType = args.mediaType === 'movie' || args.mediaType === 'tv' ? args.mediaType : undefined;
+          const year = args.year ? String(args.year).slice(0, 4) : undefined;
+          const searchReply = await this.commandHandler.renderSearch(targetKeyword, userId, {
+            mediaType,
+            year,
+            skipAiCorrector: Boolean(args.keyword && String(args.keyword).trim()),
+          });
           appendUserHistory(trimmed, searchReply);
           return searchReply;
         } else if (toolCall.function.name === 'transfer_resource') {

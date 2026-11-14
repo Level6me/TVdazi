@@ -190,6 +190,17 @@ jobs:
             smGlobal.clearPendingImageSearch('img_u1');
             assert.strictEqual(smGlobal.getPendingImageSearch('img_u1'), undefined);
 
+            // 11. Natural language routing & cleanQuery regression check ("搜索电影 突如其来")
+            const { AiCorrector } = require('./dist/services/AiCorrector');
+            const { CommandHandler } = require('./dist/commands/CommandHandler');
+            const corrector = AiCorrector.getInstance();
+            assert.strictEqual(corrector.cleanQuery('搜索电影 突如其来'), '突如其来');
+            assert.strictEqual(corrector.cleanQuery('帮我搜电视剧 庆余年'), '庆余年');
+            assert.strictEqual(corrector.cleanQuery('搜一下动漫 你的名字'), '你的名字');
+            const cmdHandler = new CommandHandler();
+            assert.strictEqual(cmdHandler.isCommand('搜索电影 突如其来'), false);
+            assert.strictEqual(cmdHandler.isCommand('/search 突如其来'), true);
+
             console.log('ALL_CI_CHECKS_PASSED');
             process.exit(0);
           })().catch((err) => {

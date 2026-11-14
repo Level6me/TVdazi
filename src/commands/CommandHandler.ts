@@ -72,7 +72,6 @@ export class CommandHandler {
       /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质)(?:\s+.*)?$/i.test(
         trimmed
       ) ||
-      /^(?:搜|搜索)\s+.+/i.test(trimmed) ||
       this.isFriendInviteIntent(trimmed)
     ) {
       return true;
@@ -839,12 +838,22 @@ export class CommandHandler {
       mediaType?: 'movie' | 'tv';
       overview?: string;
       enableAiFilter?: boolean;
+      skipAiCorrector?: boolean;
     }
   ): Promise<string> {
     this.userManager.recordSearch(userId);
 
-    // 1. AI 实体纠错与意图归一化（识别俗称/外号/错别字/缩写）
-    const correction = await this.aiCorrector.correct(keyword, userId);
+    // 1. AI 实体纠错与意图归一化（若上层 AI 意图路由器已完成片名提炼，直接跳过避免二次误改）
+    const cleanedRawKeyword = this.aiCorrector.cleanQuery(keyword) || keyword.trim();
+    const correction = searchMeta?.skipAiCorrector
+      ? {
+          originalKeyword: keyword,
+          correctedKeyword: cleanedRawKeyword,
+          standardTitle: cleanedRawKeyword,
+          candidateKeywords: [cleanedRawKeyword],
+          isCorrected: false,
+        }
+      : await this.aiCorrector.correct(keyword, userId);
     let searchWord = correction.correctedKeyword;
     let standardTitle = correction.standardTitle || searchWord;
     const resolver = MetadataResolver.getInstance();
@@ -1039,15 +1048,21 @@ export class CommandHandler {
       const cleanName = standardTitle || searchWord;
       if (interceptedAllByAi) {
         return [
+          metaHeader ? `${metaHeader}\n----------------------------------------` : '',
           `🔍 全网检索到 ${rawCountBeforeAi} 条含「${cleanName}」的候选帖，但经 AI 逐条核对均非目标作品本身${interceptedReason ? `（${interceptedReason}）` : ''}，已为您自动过滤误匹配资源。`,
           `💡 如确认尚未流出资源，直接回复「蹲守《${cleanName}》」，出资源后第一时间微信通知你并自动入库！`,
-        ].join('\n');
+        ]
+          .filter(Boolean)
+          .join('\n');
       }
       const triedHint = allAliases.length > 0 ? `\n（已自动扩展尝试关联别名：${allAliases.slice(0, 3).join(' / ')}）` : '';
       return [
+        metaHeader ? `${metaHeader}\n----------------------------------------` : '',
         `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢~${triedHint}`,
         `💡 还没出资源？直接回复「蹲守《${cleanName}》」，一旦全网出资源我第一时间微信通知你并自动存进网盘！`,
-      ].join('\n');
+      ]
+        .filter(Boolean)
+        .join('\n');
     }
 
     // 每页精简显示 8 条，避免微信端单条消息过长
