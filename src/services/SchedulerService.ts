@@ -194,8 +194,8 @@ export class SchedulerService {
           continue;
         }
 
-        // 2. 周期轮询监控型任务（resource_watch, episode_chase, quality_upgrade）
-        if (['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
+        // 2. 周期轮询型任务（含 resource_watch, episode_chase, quality_upgrade，或任意显式配置了 intervalMinutes 的任务）
+        if (task.intervalMinutes || ['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
           const intervalMs = (task.intervalMinutes || 30) * 60 * 1000;
           const lastRun = task.lastRunAt || 0;
           if (nowMs - lastRun >= intervalMs) {
@@ -307,11 +307,12 @@ export class SchedulerService {
 
     if (items.length === 0) {
       if (isManual) {
+        const freqText = SchedulerService.formatInterval(task.intervalMinutes || 30);
         return [
           `🛰️ 【全网蹲守巡检报告】《${keyword}》`,
           `─────────────────────────`,
           `📡 刚刚已轮询 50+ 资源频道，目前暂未发现《${keyword}》的有效网盘活链。`,
-          `✅ 蹲守任务持续运行中（每 ${task.intervalMinutes || 30} 分钟自动巡检一次），一旦全网出资源我会在第一时间微信通知你${task.autoSave ? '并自动转存进你的夸克网盘' : ''}！`,
+          `✅ 蹲守任务持续运行中（${freqText}自动巡检一次），一旦全网出资源我会在第一时间微信通知你${task.autoSave ? '并自动转存进你的夸克网盘' : ''}！`,
         ].join('\n');
       }
       return null;
@@ -415,7 +416,8 @@ export class SchedulerService {
 
     if (items.length === 0) {
       if (isManual) {
-        return `📺 【智能追更巡检】《${keyword}》目前暂未检索到网盘资源，后台将每 ${task.intervalMinutes || 30} 分钟持续为你盯梢更新！`;
+        const freqText = SchedulerService.formatInterval(task.intervalMinutes || 30);
+        return `📺 【智能追更巡检】《${keyword}》目前暂未检索到网盘资源，后台将${freqText}持续为你盯梢更新！`;
       }
       return null;
     }
@@ -515,11 +517,12 @@ export class SchedulerService {
 
     if (hqItems.length === 0) {
       if (isManual) {
+        const freqText = SchedulerService.formatInterval(task.intervalMinutes || 30);
         return [
           `💎 【4K 高画质洗版监控】《${keyword}》`,
           `─────────────────────────`,
           `🔍 当前共检索到 ${items.length} 条普通资源，暂未发现标注有「4K / 2160P / REMUX / 杜比视界」的高规格洗版片源。`,
-          `⏳ 后台将继续为你蹲守高码率 4K 版本，出片即刻自动入库并通知你！`,
+          `⏳ 后台将继续（${freqText}）为你蹲守高码率 4K 版本，出片即刻自动入库并通知你！`,
         ].join('\n');
       }
       return null;
@@ -870,6 +873,169 @@ export class SchedulerService {
   }
 
   /**
+   * 格式化轮询间隔描述（如 10 -> "每 10 分钟"，60 -> "每 1 小时 (60分钟)"，120 -> "每 2 小时 (120分钟)"）
+   */
+  public static formatInterval(minutes: number): string {
+    const m = Math.max(1, Math.round(minutes || 30));
+    if (m >= 60 && m % 60 === 0) {
+      return `每 ${m / 60} 小时（${m} 分钟）`;
+    }
+    return `每 ${m} 分钟`;
+  }
+
+  /**
+   * 从自然语言或指令中解析轮询间隔（返回分钟数，支持“每10分钟”、“每隔2小时”、“半小时一次”、“15min”、“2h”等）
+   */
+  public static parseIntervalMinutes(text: string): number | undefined {
+    const cnNums: Record<string, number> = {
+      一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+      十一: 11, 十二: 12, 十五: 15, 二十: 20, 三十: 30, 四十: 40, 四十五: 45, 五十: 50, 六十: 60,
+    };
+
+    const parseVal = (raw: string): number => {
+      if (/^\d+(?:\.\d+)?$/.test(raw)) return parseFloat(raw);
+      return cnNums[raw] ?? NaN;
+    };
+
+    // 1. 特殊口语：半小时 / 半个小时 / 一个半小时
+    if (/(?:每|每隔|间隔)?\s*一个半\s*小时|(?:一个半小时)\s*(?:一次|一轮|一扫|巡检|扫描)?/.test(text)) {
+      return 90;
+    }
+    if (/(?:每|每隔|间隔)?\s*半\s*个?\s*小时|(?:半个?小时)\s*(?:一次|一轮|一扫|巡检|扫描)?/.test(text)) {
+      return 30;
+    }
+    if (/(?:每|每隔)\s*小时|(?:每|每隔)\s*个\s*小时/.test(text)) {
+      return 60;
+    }
+
+    // 2. 匹配 分钟：每X分钟 / 每隔X分钟 / 间隔X分钟 / X分钟一次 / X分钟扫描一次 / 改为X分钟 / 设为X分钟 / Xmin / Xm
+    const minMatch = text.match(
+      /(?:(?:每|每隔|间隔|改成|改为|设为|设置成|设置为|调整为|调成)\s*)?(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|min(?:utes?)?|m\b)\s*(?:一次|一轮|一扫|巡检|扫描|检测|轮询)?/i
+    );
+    // 排除把“早上8点15分”里的“15分”误判为轮询间隔
+    const isClockPoint = /(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*分/.test(
+      text
+    );
+    if (minMatch && !isClockPoint) {
+      const hasIntervalContext =
+        /(?:每|每隔|间隔|轮询|扫描|巡检|检测|一次|一轮|频率|周期|改成|改为|设为|调整|调成|\/task-interval)/i.test(text);
+      if (hasIntervalContext) {
+        const val = parseVal(minMatch[1]);
+        if (!isNaN(val) && val > 0) {
+          return Math.max(1, Math.min(10080, Math.round(val)));
+        }
+      }
+    }
+
+    // 3. 匹配 小时：每X小时 / 每隔X个小时 / 间隔X小时 / X小时一次 / 改为X小时 / Xh
+    const hourMatch = text.match(
+      /(?:(?:每|每隔|间隔|改成|改为|设为|设置成|设置为|调整为|调成)\s*)?(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?\s*小时|钟头|hours?|hr|h\b)\s*(?:一次|一轮|一扫|巡检|扫描|检测|轮询)?/i
+    );
+    if (hourMatch) {
+      const hasIntervalContext =
+        /(?:每|每隔|间隔|轮询|扫描|巡检|检测|一次|一轮|频率|周期|改成|改为|设为|调整|调成|\/task-interval)/i.test(text);
+      if (hasIntervalContext) {
+        const val = parseVal(hourMatch[1]);
+        if (!isNaN(val) && val > 0) {
+          return Math.max(1, Math.min(10080, Math.round(val * 60)));
+        }
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * 动态修改已有任务的轮询间隔（支持按任务序号、按片名关键词或全部轮询任务批量修改）
+   */
+  public updateUserTaskInterval(
+    userId: string,
+    selector: { index1Based?: number; keyword?: string; all?: boolean },
+    intervalMinutes: number
+  ): { success: boolean; message: string } {
+    const userTasks = this.getUserTasks(userId);
+    if (userTasks.length === 0) {
+      return {
+        success: false,
+        message: '你当前还没有创建任何定时或监控任务哦！可以先发「帮我追更《今天是太阳雨》」或「每10分钟蹲守《奥德赛》」来创建任务~',
+      };
+    }
+
+    const safeMinutes = Math.max(1, Math.min(10080, Math.round(intervalMinutes)));
+    const freqDesc = SchedulerService.formatInterval(safeMinutes);
+
+    // 1. 按序号精准修改
+    if (selector.index1Based !== undefined) {
+      const idx = selector.index1Based;
+      if (idx < 1 || idx > userTasks.length) {
+        return {
+          success: false,
+          message: `序号【${idx}】超出范围啦，你当前共有 ${userTasks.length} 个任务（发送「/tasks」可查看任务序号）。`,
+        };
+      }
+      const target = userTasks[idx - 1];
+      target.intervalMinutes = safeMinutes;
+      // 若原本是定点任务被用户主动改为轮询间隔模式，清除固定时刻使其按间隔运行
+      if (target.scheduleTime) {
+        delete target.scheduleTime;
+        delete target.daysOfWeek;
+        delete target.oneShotDate;
+      }
+      this.saveTasks();
+      return {
+        success: true,
+        message: `⏱️ 已将任务 #${idx}【${target.title}】的扫描轮询间隔更新为：**${freqDesc}巡检一次**！`,
+      };
+    }
+
+    // 2. 按片名/关键词匹配修改
+    if (selector.keyword) {
+      const cleanKey = selector.keyword.replace(/[《》\s]/g, '').toLowerCase();
+      const matched = userTasks.filter(
+        (t) =>
+          (t.keyword && t.keyword.toLowerCase().includes(cleanKey)) ||
+          t.title.toLowerCase().includes(cleanKey)
+      );
+      if (matched.length > 0) {
+        for (const t of matched) {
+          t.intervalMinutes = safeMinutes;
+          if (t.scheduleTime) {
+            delete t.scheduleTime;
+          }
+        }
+        this.saveTasks();
+        const names = matched.map((t) => `【${t.title}】`).join('、');
+        return {
+          success: true,
+          message: `⏱️ 已将 ${names} 的扫描轮询间隔更新为：**${freqDesc}巡检一次**！`,
+        };
+      }
+    }
+
+    // 3. 默认批量更新用户的轮询监控类任务（若无轮询任务则更新最后一条任务）
+    const pollingTasks = userTasks.filter(
+      (t) =>
+        ['resource_watch', 'episode_chase', 'quality_upgrade'].includes(t.type) ||
+        Boolean(t.intervalMinutes)
+    );
+    const targets = pollingTasks.length > 0 ? pollingTasks : [userTasks[userTasks.length - 1]];
+
+    for (const t of targets) {
+      t.intervalMinutes = safeMinutes;
+      if (selector.all && t.scheduleTime) {
+        delete t.scheduleTime;
+      }
+    }
+    this.saveTasks();
+
+    const names = targets.map((t) => `【${t.title}】`).join('、');
+    return {
+      success: true,
+      message: `⏱️ 已将你的 ${targets.length} 个监控任务（${names}）轮询间隔统一调整为：**${freqDesc}巡检一次**！`,
+    };
+  }
+
+  /**
    * 格式化展示用户的全部定时与监控任务列表
    */
   public renderUserTasks(userId: string): string {
@@ -883,11 +1049,12 @@ export class SchedulerService {
         '🎬 1. 每日定时荐片：',
         '  • 「每天早上8点推送一部科幻电影给我」',
         '  • 「每天晚上9点推一部轻松韩剧」',
-        '🛰️ 2. 新片资源全网蹲守：',
+        '🛰️ 2. 新片资源全网蹲守（支持自定义轮询间隔）：',
         '  • 「《流浪地球3》有资源了通知我」',
-        '  • 「等《蛮好的人生》有资源了自动存进网盘」',
-        '📺 3. 热播剧全自动追更：',
+        '  • 「每10分钟帮我蹲守《奥德赛》」',
+        '📺 3. 热播剧全自动追更（支持自定义轮询间隔）：',
         '  • 「帮我追更《今天是太阳雨》」',
+        '  • 「每隔15分钟追更《小城良方》」',
         '💎 4. 4K 高画质洗版监控：',
         '  • 「等《奥德赛》出4K了帮我存一下」',
         '🛡️ 5. 周报 / 网盘巡检 / 任意自定义任务：',
@@ -927,7 +1094,7 @@ export class SchedulerService {
           scheduleDesc = `每天 ${t.scheduleTime}`;
         }
       } else {
-        scheduleDesc = `每 ${t.intervalMinutes || 30} 分钟巡检`;
+        scheduleDesc = `${SchedulerService.formatInterval(t.intervalMinutes || 30)}巡检`;
       }
 
       const extraInfo =
@@ -944,6 +1111,7 @@ export class SchedulerService {
     lines.push(`─────────────────────────`);
     lines.push(`💡 快捷操作指令：`);
     lines.push(`• 发「执行任务 1」或「/task-run 1」：立即测试触发第1个任务`);
+    lines.push(`• 发「把任务1间隔改成10分钟」或「/task-interval 1 10」：修改轮询间隔`);
     lines.push(`• 发「删除任务 1」或「/task-del 1」：删除对应任务`);
     lines.push(`• 发「暂停任务 1」/「恢复任务 1」：暂停或恢复任务`);
     return lines.join('\n');
@@ -1017,7 +1185,28 @@ export class SchedulerService {
   public isScheduleIntent(text: string): boolean {
     const trimmed = text.trim();
     if (
-      /^(?:\/tasks|\/schedule|\/定时|\/watch|\/追更|\/蹲守|\/task-run|\/task-del|\/task-all|定时任务|我的任务|我的定时|查看任务|任务列表|执行任务\s*\d+|测试任务\s*\d+|删除任务\s*\d+|取消任务\s*\d+|暂停任务\s*\d+|恢复任务\s*\d+|清空任务|开启全套)/i.test(
+      /^(?:\/tasks|\/schedule|\/定时|\/watch|\/追更|\/蹲守|\/task-run|\/task-del|\/task-all|\/task-interval|定时任务|我的任务|我的定时|查看任务|任务列表|执行任务\s*\d+|测试任务\s*\d+|删除任务\s*\d+|取消任务\s*\d+|暂停任务\s*\d+|恢复任务\s*\d+|清空任务|开启全套)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+
+    // 修改轮询间隔意图：把任务1间隔改成10分钟 / 修改扫描间隔为15分钟 / 轮询频率设为1小时
+    if (
+      /(?:把|将|修改|设置|调整|改|设).*?(?:任务\s*\d+|轮询|扫描|巡检|监控|追更|蹲守|间隔|频率|周期).*?(?:改成|改为|设为|设置成|调整为|调成|间隔|频率)?.*?(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时|min|m\b|h\b)/i.test(
+        trimmed
+      ) ||
+      /^(?:轮询间隔|扫描间隔|巡检间隔|监控间隔|追更间隔|蹲守间隔)\s*(?:改成|改为|设为|设置成)?\s*(?:\d+|[一二两三四五六七八九十半]+)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+
+    // 带有“每X分钟 / 每隔X小时”的轮询创建意图
+    if (
+      /(?:每|每隔|间隔)\s*(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时|min|m\b|h\b).*?(?:蹲|追更|订阅|监控|扫描|巡检|检测|查|搜|推|发|荐|提醒|叫我|通知)/i.test(
         trimmed
       )
     ) {
@@ -1164,8 +1353,9 @@ export class SchedulerService {
     }
 
     return text
+      .replace(/(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b)\s*(?:一次|一轮|一扫|巡检|扫描|检测|轮询)?/gi, '')
       .replace(/^(?:请|帮我|给我|麻烦|我想|我要|自动|全网)*/g, '')
-      .replace(/(?:蹲守|蹲一下|蹲一个|蹲|追更|订阅更新|监控|看看|查查)/g, '')
+      .replace(/(?:蹲守|蹲一下|蹲一个|蹲|追更|订阅更新|监控|扫描|巡检|检测|看看|查查)/g, '')
       .replace(/(?:如果|要是|等|当)?(.+?)(?:有4K资源了|出4K资源了|出4K了|有4K了|有资源了|出资源了|更新了|出了).*$/i, '$1')
       .replace(/(?:推送消息给我|推送给我|通知我|告诉我|发给我|自动帮我存.*|帮我存.*|存进网盘.*)$/g, '')
       .replace(/^[，,。！!？?\s]+|[，,。！!？?\s]+$/g, '')
@@ -1211,6 +1401,43 @@ export class SchedulerService {
       return this.toggleUserTaskByIndex(userId, parseInt(resumeMatch[1], 10), true).message;
     }
 
+    // 4.5 修改已有任务的轮询间隔：
+    // 支持 `/task-interval 1 10`、`/task-interval all 15`、或自然语言「把任务1的间隔改成10分钟」「把《奥德赛》扫描间隔改为15分钟」「把追更间隔设为20分钟」
+    const cmdIntervalMatch = trimmed.match(/^\/task-interval\s+(all|\d+)\s+(.+)$/i);
+    if (cmdIntervalMatch) {
+      const targetArg = cmdIntervalMatch[1].toLowerCase();
+      const rawInterval = cmdIntervalMatch[2].trim();
+      const parsedMin =
+        SchedulerService.parseIntervalMinutes(`每${rawInterval}`) ||
+        (/^\d+$/.test(rawInterval) ? parseInt(rawInterval, 10) : undefined);
+      if (!parsedMin) {
+        return '⚠️ 请提供有效的轮询间隔时长哦，例如：`/task-interval 1 10`（10分钟）或 `/task-interval 1 2h`（2小时）';
+      }
+      if (targetArg === 'all') {
+        return this.updateUserTaskInterval(userId, { all: true }, parsedMin).message;
+      }
+      return this.updateUserTaskInterval(userId, { index1Based: parseInt(targetArg, 10) }, parsedMin).message;
+    }
+
+    const isModifyIntervalIntent =
+      /(?:把|将|修改|设置|调整|改|设).*?(?:任务\s*\d+|轮询|扫描|巡检|监控|追更|蹲守|间隔|频率|周期).*?(?:改成|改为|设为|设置成|调整为|调成|间隔|频率)/i.test(
+        trimmed
+      ) ||
+      /^(?:轮询间隔|扫描间隔|巡检间隔|监控间隔|追更间隔|蹲守间隔)\s*(?:改成|改为|设为|设置成)?/i.test(trimmed);
+
+    const parsedInterval = SchedulerService.parseIntervalMinutes(trimmed);
+    if (isModifyIntervalIntent && parsedInterval) {
+      const taskIdxMatch = trimmed.match(/(?:任务|序号|#)\s*(\d+)/);
+      const bookMatch = trimmed.match(/《([^》]+)》/);
+      if (taskIdxMatch) {
+        return this.updateUserTaskInterval(userId, { index1Based: parseInt(taskIdxMatch[1], 10) }, parsedInterval).message;
+      }
+      if (bookMatch && bookMatch[1]) {
+        return this.updateUserTaskInterval(userId, { keyword: bookMatch[1] }, parsedInterval).message;
+      }
+      return this.updateUserTaskInterval(userId, { all: /全部|所有/.test(trimmed) }, parsedInterval).message;
+    }
+
     // 5. 一键开启全套智能守护
     if (/^(?:\/task-all|开启全套|开启全套智能守护|开启全部定时)$/i.test(trimmed)) {
       this.setupFullSuiteForUser(userId);
@@ -1222,6 +1449,8 @@ export class SchedulerService {
     }
 
     const wantAutoSave = /(?:自动存|自动转存|帮我存|存进网盘|存入网盘|存到网盘|直接存)/i.test(trimmed);
+    const activeInterval = parsedInterval || 30;
+    const activeFreqText = SchedulerService.formatInterval(activeInterval);
 
     // 6. 扩展 D：4K / 高画质洗版监控
     if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|4[kK]\s*原盘|高画质|洗版)/i.test(trimmed)) {
@@ -1233,7 +1462,7 @@ export class SchedulerService {
           title: `《${movieTitle}》4K高画质洗版监控`,
           keyword: movieTitle,
           enabled: true,
-          intervalMinutes: 30,
+          intervalMinutes: activeInterval,
           autoSave: true,
           targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'],
         });
@@ -1241,6 +1470,7 @@ export class SchedulerService {
         return [
           `💎 已为你创建【4K 高画质洗版监控】任务！`,
           `📺 监控目标：《${movieTitle}》（匹配 4K / 2160P / REMUX / 杜比）`,
+          `⏱️ 轮询间隔：${activeFreqText}自动巡检一次`,
           `⚡ 动作设定：一旦出 4K 洗版资源，自动转存至你的夸克网盘并微信通知你`,
           `─────────────────────────`,
           firstCheck || '',
@@ -1251,10 +1481,10 @@ export class SchedulerService {
     }
 
     // 7. 扩展 A：连载热播剧全自动追更入库
-    if (/^(?:\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed)) {
+    if (/(?:\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed)) {
       const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/追更\s*/i, ''));
       if (!movieTitle) {
-        return '请告诉我要追更哪部剧呀，例如发送：「帮我追更《今天是太阳雨》」或「/追更 小城良方」~';
+        return '请告诉我要追更哪部剧呀，例如发送：「帮我追更《今天是太阳雨》」或「每15分钟追更《小城良方》」~';
       }
       const task = this.addTask({
         userId,
@@ -1262,7 +1492,7 @@ export class SchedulerService {
         title: `追更《${movieTitle}》`,
         keyword: movieTitle,
         enabled: true,
-        intervalMinutes: 30,
+        intervalMinutes: activeInterval,
         autoSave: true,
         lastEpisode: 0,
         knownShareIds: [],
@@ -1272,7 +1502,7 @@ export class SchedulerService {
       const firstCheck = await this.runEpisodeChase(task, true);
       return [
         `📺 已为你开启【连载热播剧全自动追更】：《${movieTitle}》！`,
-        `🔄 巡检频率：每 30 分钟自动检测全网最新集数，发现新集数将自动转存夸克网盘 + 防和谐改名 + 微信推送通知你！`,
+        `🔄 巡检频率：${activeFreqText}自动检测全网最新集数，发现新集数将自动转存夸克网盘 + 防和谐改名 + 微信推送通知你！`,
         `─────────────────────────`,
         firstCheck || '',
       ]
@@ -1282,12 +1512,12 @@ export class SchedulerService {
 
     // 8. 场景 2：某部未出资源电影/剧集全网蹲守监控
     if (
-      /^(?:\/watch|\/蹲守|帮我蹲守|蹲守|蹲一下|蹲一个|蹲)/i.test(trimmed) ||
+      /(?:\/watch|\/蹲守|帮我蹲守|蹲守|蹲一下|蹲一个|蹲)/i.test(trimmed) ||
       /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
     ) {
       const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/(?:watch|蹲守)\s*/i, ''));
       if (!movieTitle) {
-        return '请告诉我要蹲守哪部电影或剧集呀，例如：「《流浪地球3》有资源了通知我」或「/蹲守 奥德赛」~';
+        return '请告诉我要蹲守哪部电影或剧集呀，例如：「《流浪地球3》有资源了通知我」或「每10分钟蹲守《奥德赛》」~';
       }
       const task = this.addTask({
         userId,
@@ -1295,13 +1525,13 @@ export class SchedulerService {
         title: `蹲守《${movieTitle}》全网首发资源`,
         keyword: movieTitle,
         enabled: true,
-        intervalMinutes: 30,
+        intervalMinutes: activeInterval,
         autoSave: wantAutoSave || true,
       });
       const firstCheck = await this.runResourceWatch(task, true);
       return [
         `🛰️ 已为你挂载【全网资源雷达蹲守】：《${movieTitle}》！`,
-        `⚡ 触发动作：后台每 30 分钟轮询 50+ 频道，一旦出资源立即微信推送给你${task.autoSave ? '并自动转存至你的夸克网盘' : ''}！`,
+        `⚡ 触发动作：后台${activeFreqText}轮询 50+ 频道，一旦出资源立即微信推送给你${task.autoSave ? '并自动转存至你的夸克网盘' : ''}！`,
         `─────────────────────────`,
         firstCheck || '',
       ]
@@ -1324,6 +1554,17 @@ export class SchedulerService {
     }
 
     if (/(?:网盘.*?巡检|防和谐.*?巡检|容量.*?预警|网盘.*?守护)/i.test(trimmed)) {
+      if (parsedInterval && !trimmed.includes('点')) {
+        const task = this.addTask({
+          userId,
+          type: 'disk_guard',
+          title: `${activeFreqText}夸克网盘容量预警与防和谐巡检`,
+          enabled: true,
+          intervalMinutes: parsedInterval,
+          minFreeGb: 5,
+        });
+        return `🛡️ 已开启【${task.title}】！后台将${activeFreqText}为你检查网盘剩余容量并自动清洗火星文混淆剧名。`;
+      }
       const { timeStr } = SchedulerService.parseTimeFromText(trimmed.includes('点') ? trimmed : '早上9点');
       const task = this.addTask({
         userId,
@@ -1349,9 +1590,10 @@ export class SchedulerService {
       return `📌 已开启【${task.title}】！每逢周末准时从你的「/追剧」片单中挑出好片提醒你观看。`;
     }
 
-    // 10. 场景 1：每天/周期指定时间推送某类型电影或剧集推荐
+    // 10. 场景 1：每天/周期指定时间（或指定轮询间隔）推送某类型电影或剧集推荐
     if (/(?:推荐|推送|推一部|推几部|发一部|来一部|安利)/i.test(trimmed)) {
       const { timeStr, daysOfWeek, oneShotDate } = SchedulerService.parseTimeFromText(trimmed);
+      const useIntervalMode = Boolean(parsedInterval && !/(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)/.test(trimmed));
       const isMovie = /(?:电影|大片|院线|影史|片)/i.test(trimmed) && !/(?:电视剧|剧集|韩剧|美剧|日剧|国产剧)/i.test(trimmed);
       const mediaType: 'movie' | 'tv' = isMovie ? 'movie' : 'tv';
 
@@ -1374,11 +1616,12 @@ export class SchedulerService {
       const task = this.addTask({
         userId,
         type: 'daily_recommend',
-        title: `每天 ${timeStr} 推送一部${typeLabel}`,
+        title: useIntervalMode ? `${activeFreqText}推送一部${typeLabel}` : `每天 ${timeStr} 推送一部${typeLabel}`,
         enabled: true,
-        scheduleTime: timeStr,
-        daysOfWeek,
-        oneShotDate,
+        scheduleTime: useIntervalMode ? undefined : timeStr,
+        intervalMinutes: useIntervalMode ? parsedInterval : undefined,
+        daysOfWeek: useIntervalMode ? undefined : daysOfWeek,
+        oneShotDate: useIntervalMode ? undefined : oneShotDate,
         mediaType,
         tag: matchedTag,
         query: cleanQuery,
@@ -1386,22 +1629,24 @@ export class SchedulerService {
       });
 
       return [
-        `⏰ 已为你设定好【每日定时荐片任务】！`,
+        `⏰ 已为你设定好【定时荐片任务】！`,
         `─────────────────────────`,
         `📌 任务名称：${task.title}`,
-        `🕒 推送时间：${oneShotDate ? `${oneShotDate} ${timeStr}` : `每天 ${timeStr} 准时推送`}`,
+        `🕒 触发频率：${useIntervalMode ? `${activeFreqText}循环推送` : oneShotDate ? `${oneShotDate} ${timeStr}` : `每天 ${timeStr} 准时推送`}`,
         `🎬 推荐偏好：${typeLabel}${wantAutoSave ? '（并自动转存至夸克网盘）' : '（收到推送后回复 1 即可一键转存）'}`,
         `─────────────────────────`,
         `💡 发送「/tasks」可查看全部定时任务，或发送「执行任务 ${this.getUserTasks(userId).length}」现在立即体验一次推送效果！`,
       ].join('\n');
     }
 
-    // 11. 场景 3：自定义计划任务 / 定时提醒 / 定时搜片
+    // 11. 场景 3：自定义计划任务 / 定时提醒 / 定时搜片（支持定点与自定义轮询间隔）
     const { timeStr, daysOfWeek, oneShotDate } = SchedulerService.parseTimeFromText(trimmed);
+    const useIntervalMode = Boolean(parsedInterval && !/(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)/.test(trimmed));
     const isSearchAction = /(?:帮我搜|搜一下|搜索)/i.test(trimmed);
     const extractedTitle = SchedulerService.extractCleanMovieTitle(trimmed);
     const cleanReminder = trimmed
       .replace(/^(?:请|帮我|给我|麻烦)?(?:设置|创建一个|定个|加个)?(?:定时任务|计划任务)?[：:\s]*/i, '')
+      .replace(/^(?:(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b)\s*(?:一次|一轮)?)\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
       .replace(/^(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|明天|明早|今晚|今天)\s*(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)(?:\d{1,2}|半)?\s*分?\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
       .trim() || trimmed;
 
@@ -1410,9 +1655,10 @@ export class SchedulerService {
       type: 'custom_reminder',
       title: `定时任务：${cleanReminder}`,
       enabled: true,
-      scheduleTime: timeStr,
-      daysOfWeek,
-      oneShotDate,
+      scheduleTime: useIntervalMode ? undefined : timeStr,
+      intervalMinutes: useIntervalMode ? parsedInterval : undefined,
+      daysOfWeek: useIntervalMode ? undefined : daysOfWeek,
+      oneShotDate: useIntervalMode ? undefined : oneShotDate,
       customAction: isSearchAction ? 'search' : 'remind',
       keyword: isSearchAction ? extractedTitle : undefined,
       customPayload: cleanReminder,
@@ -1422,7 +1668,7 @@ export class SchedulerService {
       `🔔 已为你创建【自定义计划任务】！`,
       `─────────────────────────`,
       `📌 任务内容：${cleanReminder}`,
-      `🕒 触发时间：${oneShotDate ? `${oneShotDate} ${timeStr}（单次触发）` : `每天 ${timeStr} 准时执行`}`,
+      `🕒 触发频率：${useIntervalMode ? `${activeFreqText}循环执行` : oneShotDate ? `${oneShotDate} ${timeStr}（单次触发）` : `每天 ${timeStr} 准时执行`}`,
       `─────────────────────────`,
       `💡 发送「/tasks」可管理你的全部任务，发送「执行任务 ${this.getUserTasks(userId).length}」可立即触发测试！`,
     ].join('\n');

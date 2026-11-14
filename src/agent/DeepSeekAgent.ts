@@ -342,13 +342,13 @@ export class DeepSeekAgent {
           type: 'function',
           function: {
             name: 'manage_scheduled_task',
-            description: '当用户希望设置定时荐片（如每天早上8点推一部电影）、新片蹲守监控（如某部电影有资源了通知我）、连载剧集自动追更、4K洗版监控、周末观影周报、网盘巡检或自定义计划任务时调用',
+            description: '当用户希望设置定时荐片、新片蹲守监控、连载剧集自动追更、4K洗版监控、周末观影周报、网盘巡检、自定义计划任务，或者指定/修改任务的扫描轮询间隔（如每10分钟蹲守、把任务1间隔改成15分钟）时调用',
             parameters: {
               type: 'object',
               properties: {
                 instruction: {
                   type: 'string',
-                  description: '用户的完整定时或监控需求指令原文，如“每天早上8点准时推送一部科幻电影给我”、“《流浪地球3》有资源了通知我”、“帮我追更《今天是太阳雨》”',
+                  description: '用户的完整定时、监控或轮询间隔修改指令原文，如“每10分钟帮我蹲守《流浪地球3》”、“把任务1的轮询间隔改成15分钟”、“每隔2小时检查一次《今天是太阳雨》更新”',
                 },
               },
               required: ['instruction'],
