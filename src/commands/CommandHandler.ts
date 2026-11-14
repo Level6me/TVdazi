@@ -499,9 +499,15 @@ export class CommandHandler {
   }
 
   private async handleSelection(index: number, userId: string): Promise<string> {
+    const lastType = this.sessionManager.getLastActiveType(userId);
     const searchSession = this.sessionManager.getSearch(userId);
     const hotSession = this.sessionManager.getHot(userId);
     const userPlan = this.userManager.getUserPlan(userId);
+
+    // 若用户刚刚触发的是影视推荐 (hot)，优先从推荐列表中按序号搜存，避免被旧的搜索会话抢占
+    if (lastType === 'hot' && hotSession && hotSession.items.length > 0) {
+      return await this.handleHotSelection(index, userId, hotSession, userPlan);
+    }
 
     if (searchSession && searchSession.items.length > 0) {
       const itemIndex = index - 1;
@@ -557,84 +563,93 @@ export class CommandHandler {
     }
 
     if (hotSession && hotSession.items.length > 0) {
-      const itemIndex = index - 1;
-      if (itemIndex < 0 || itemIndex >= hotSession.items.length) {
-        return `序号【${index}】超出范围啦，榜单上一共有 ${hotSession.items.length} 部，回复数字（比如 1、2）就可以选啦！`;
-      }
+      return await this.handleHotSelection(index, userId, hotSession, userPlan);
+    }
 
-      const subject = hotSession.items[itemIndex];
-      const title = subject.title;
+    return '还没有在搜索或者看榜单呢~ 告诉我你想看的片名（如“流浪地球2”），或者发送“热门”先挑挑看吧！';
+  }
 
-      const searchRes = await this.searcher.search({ keyword: title });
-      if (!searchRes.items || searchRes.items.length === 0) {
+  private async handleHotSelection(
+    index: number,
+    userId: string,
+    hotSession: any,
+    userPlan: any
+  ): Promise<string> {
+    const itemIndex = index - 1;
+    if (itemIndex < 0 || itemIndex >= hotSession.items.length) {
+      return `序号【${index}】超出范围啦，当前推荐共有 ${hotSession.items.length} 部，回复数字（比如 1）就可以选啦！`;
+    }
+
+    const subject = hotSession.items[itemIndex];
+    const title = subject.title;
+
+    const searchRes = await this.searcher.search({ keyword: title });
+    if (!searchRes.items || searchRes.items.length === 0) {
+      return [
+        `🔍 正在全网为你搜寻《${title}》的资源...`,
+        '----------------------------------------',
+        `暂时还没找到《${title}》的有效网盘活链资源 😿`,
+        '💡 这部剧可能刚刚上映或还没有公开流，可以回复「换一部」看看其他好剧，或者告诉我你想看的其他片子吧！',
+      ].join('\n');
+    }
+
+    this.sessionManager.setSearch(userId, title, searchRes.items, 10);
+
+    const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
+    const targetItem = bestQuark || searchRes.items[0];
+
+    let category: ResourceCategory = '电影';
+    if (hotSession.type === 'tv') {
+      const tag = hotSession.tag || '';
+      if (tag.includes('韩剧')) category = '韩剧';
+      else if (tag.includes('美剧')) category = '美剧';
+      else if (tag.includes('日剧')) category = '日剧';
+      else if (tag.includes('动漫')) category = '动漫';
+      else if (tag.includes('综艺')) category = '综艺';
+      else category = '国产剧';
+    }
+
+    if (targetItem.panType === 'quark' || targetItem.shareUrl.includes('pan.quark.cn')) {
+      const saveRes = await this.quarkService.saveShareFiles(targetItem.shareId, '', category, {
+        customCookie: userPlan.quarkCookie,
+        rootDir: userPlan.saveRootDir,
+        standardTitle: title,
+        userId: userId,
+      });
+      if (saveRes.success) {
+        this.userManager.recordSave(userId, title, targetItem.shareUrl, category);
         return [
-          `🔍 正在全网为你搜寻《${title}》的资源...`,
-          '----------------------------------------',
-          `暂时还没找到《${title}》的有效网盘活链资源 😿`,
-          '💡 这部剧可能刚刚上映或还没有公开流，过两天再问我试试，或者告诉我你想看的其他片子吧！',
-        ].join('\n');
-      }
-
-      this.sessionManager.setSearch(userId, title, searchRes.items, 10);
-
-      const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
-      const targetItem = bestQuark || searchRes.items[0];
-
-      let category: ResourceCategory = '电影';
-      if (hotSession.type === 'tv') {
-        const tag = hotSession.tag || '';
-        if (tag.includes('韩剧')) category = '韩剧';
-        else if (tag.includes('美剧')) category = '美剧';
-        else if (tag.includes('日剧')) category = '日剧';
-        else if (tag.includes('动漫')) category = '动漫';
-        else if (tag.includes('综艺')) category = '综艺';
-        else category = '国产剧';
-      }
-
-      if (targetItem.panType === 'quark' || targetItem.shareUrl.includes('pan.quark.cn')) {
-        const saveRes = await this.quarkService.saveShareFiles(targetItem.shareId, '', category, {
-          customCookie: userPlan.quarkCookie,
-          rootDir: userPlan.saveRootDir,
-          standardTitle: title,
-          userId: userId,
-        });
-        if (saveRes.success) {
-          this.userManager.recordSave(userId, title, targetItem.shareUrl, category);
-          return [
-            `🎉 一键全网搜存成功！`,
-            `📺 剧名：《${title}》`,
-            `📁 存放目录：夸克网盘【${saveRes.targetPath}】`,
-            `🎬 版本信息：${targetItem.title}`,
-            '----------------------------------------',
-            saveRes.message,
-            `🔗 分享链接：${targetItem.shareUrl}`,
-          ].join('\n');
-        }
-
-        return [
-          `🎬 正在为你转存《${title}》精选资源：`,
+          `🎉 一键全网搜存成功！`,
+          `📺 剧名：《${title}》`,
+          `📁 存放目录：夸克网盘【${saveRes.targetPath}】`,
           `🎬 版本信息：${targetItem.title}`,
           '----------------------------------------',
-          `⚠️ 转存未能成功：${saveRes.message}`,
+          saveRes.message,
           `🔗 分享链接：${targetItem.shareUrl}`,
-          '----------------------------------------',
-          '💡 该分享链接可能已失效：',
-          `👉 列表中还有其他候选资源，你可以继续回复数字序号（1~${searchRes.items.length}）尝试转存其他版本；`,
-          '👉 或回复「取消」退出当前找片。',
         ].join('\n');
       }
 
       return [
-        `🎉 找到《${title}》的网盘资源啦！`,
-        `📁 资源分类：【${category}】`,
-        `🎬 版本详情：${targetItem.title}`,
-        `🔗 资源链接：${targetItem.shareUrl}`,
+        `🎬 正在为你转存《${title}》精选资源：`,
+        `🎬 版本信息：${targetItem.title}`,
         '----------------------------------------',
-        '💡 复制链接到对应网盘打开即可转存观看。已把结果记下，回复「我要第1个」也可以直接操作！',
+        `⚠️ 转存未能成功：${saveRes.message}`,
+        `🔗 分享链接：${targetItem.shareUrl}`,
+        '----------------------------------------',
+        '💡 该分享链接可能已失效：',
+        `👉 列表中还有其他候选资源，你可以继续回复数字序号（1~${searchRes.items.length}）尝试转存其他版本；`,
+        '👉 或回复「取消」退出当前找片。',
       ].join('\n');
     }
 
-    return '还没有在搜索或者看榜单呢~ 告诉我你想看的片名（如“流浪地球2”），或者发送“热门”先挑挑看吧！';
+    return [
+      `🎉 找到《${title}》的网盘资源啦！`,
+      `📁 资源分类：【${category}】`,
+      `🎬 版本详情：${targetItem.title}`,
+      `🔗 资源链接：${targetItem.shareUrl}`,
+      '----------------------------------------',
+      '💡 复制链接到对应网盘打开即可转存观看。已把结果记下，回复「我要第1个」也可以直接操作！',
+    ].join('\n');
   }
 
   /**
@@ -741,7 +756,8 @@ export class CommandHandler {
     userId: string = 'default_user',
     page: number = 1,
     existingSubjects?: any[],
-    query?: string
+    query?: string,
+    chatHistory?: any[]
   ): Promise<string> {
     const recommender = AiRecommender.getInstance();
     const result = await recommender.generateXiaohongshuNote({
@@ -750,6 +766,7 @@ export class CommandHandler {
       tag,
       page,
       userId,
+      chatHistory,
     });
 
     this.sessionManager.setHot(userId, type, result.subjects, tag, page, 6, query);

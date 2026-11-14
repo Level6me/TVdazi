@@ -169,9 +169,9 @@ export class DeepSeekAgent {
       return reply;
     }
 
-    // 2. 意图快速嗅探：影视推荐与种草清单（支持数量、时效、地区、题材等自然语言表达）
+    // 2. 意图快速嗅探：影视推荐与种草对话（支持数量、时效、地区、题材及多轮追问等自然语言表达）
     const isRecommendIntent =
-      /(?:推荐|有什么好看|有哪些好看|求推荐|安利|介绍几部|介绍一部|推几部|推一部|发几部|来一部.*?(?:火|好看|新|高分)|(?:最近|近期|今年).*?(?:新出|比較火|比较火|最火|热门|好看).*?(?:电影|剧|动漫|片)|(?:韩剧|美剧|英剧|日剧|国剧|国产剧|动漫|电影|电视剧|悬疑片|科幻片).*?(?:有哪些|有什么|推荐))/i.test(
+      /(?:推荐|有什么好看|有哪些好看|求推荐|安利|介绍几部|介绍一部|推几部|推一部|发几部|换一部.+|换几部.+|(?:来一部|来部|找一部|找部|看一部|有没有).*?(?:火|好看|新|高分|悬疑|搞笑|喜剧|治愈|甜宠|科幻|动作|犯罪|下饭)|(?:最近|近期|今年|这两个月|近两个月|这阵子).*?(?:新出|比較火|比较火|最火|热门|好看|热播|在播).*?(?:电影|剧|动漫|片)|(?:韩剧|美剧|英剧|日剧|国剧|国产剧|动漫|电影|电视剧|悬疑片|科幻片).*?(?:有哪些|有什么|推荐))/i.test(
         trimmed
       );
     if (isRecommendIntent) {
@@ -192,7 +192,7 @@ export class DeepSeekAgent {
       else if (/(?:治愈|温馨|温情)/i.test(trimmed)) tag = '治愈';
       else if (/(?:喜剧|搞笑|下饭)/i.test(trimmed)) tag = '喜剧';
 
-      const recReply = await this.commandHandler.renderHot(type, tag, userId, 1, undefined, trimmed);
+      const recReply = await this.commandHandler.renderHot(type, tag, userId, 1, undefined, trimmed, chatHistory);
       appendUserHistory(trimmed, recReply);
       return recReply;
     }

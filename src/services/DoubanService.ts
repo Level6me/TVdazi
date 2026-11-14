@@ -10,11 +10,60 @@ export interface DoubanSubject {
   year?: string;
   sub_title?: string;
   actors?: string;
+  directors?: string;
+  types?: string[];
+  region?: string;
+  episodesCount?: string;
+  shortComment?: string;
 }
 
 export class DoubanService {
   private baseUrl = 'https://movie.douban.com/j';
   private detailCache: Map<string, { rating: string; actors: string; year: string }> = new Map();
+  private abstractCache: Map<string, Partial<DoubanSubject>> = new Map();
+
+  /**
+   * 获取豆瓣单部作品的真实详情摘要（包含准确上映年份、题材类型、主演、导演、集数与热门短评）
+   */
+  async getSubjectAbstract(subjectId: string): Promise<Partial<DoubanSubject> | null> {
+    if (!subjectId || !/^\d+$/.test(String(subjectId))) return null;
+    if (this.abstractCache.has(subjectId)) {
+      return this.abstractCache.get(subjectId)!;
+    }
+
+    try {
+      const resp = await axios.get(`${this.baseUrl}/subject_abstract`, {
+        params: { subject_id: subjectId },
+        headers: {
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          Referer: 'https://movie.douban.com/',
+          Accept: 'application/json, text/plain, */*',
+        },
+        timeout: 3500,
+      });
+
+      const sub = resp.data?.subject;
+      if (!sub) return null;
+
+      const info: Partial<DoubanSubject> = {
+        id: String(sub.id || subjectId),
+        year: sub.release_year ? String(sub.release_year).trim() : undefined,
+        rate: sub.rate ? String(sub.rate).trim() : undefined,
+        types: Array.isArray(sub.types) ? sub.types : [],
+        region: sub.region ? String(sub.region).trim() : undefined,
+        actors: Array.isArray(sub.actors) ? sub.actors.slice(0, 4).join(' / ') : undefined,
+        directors: Array.isArray(sub.directors) ? sub.directors.slice(0, 2).join(' / ') : undefined,
+        episodesCount: sub.episodes_count ? String(sub.episodes_count).trim() : undefined,
+        shortComment: sub.short_comment?.content ? String(sub.short_comment.content).trim() : undefined,
+      };
+
+      this.abstractCache.set(subjectId, info);
+      return info;
+    } catch {
+      return null;
+    }
+  }
 
   /**
    * 拉取豆瓣热门电影/剧集榜单
