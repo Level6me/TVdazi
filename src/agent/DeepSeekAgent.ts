@@ -58,8 +58,11 @@ export class DeepSeekAgent {
    * 使用 DeepSeek 多模态模型识别图片中的影视剧名或电影（增强模糊推理与角色关联）
    */
   async recognizeMovieFromImage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string | null> {
-    const { client, visionModel, hasValidKey } = this.getClientForUser(userId, 15000);
-    if (!hasValidKey) return null;
+    const { client, visionModel, hasValidKey } = this.getClientForUser(userId, 25000);
+    if (!hasValidKey) {
+      console.warn('[DeepSeek 识图跳过] 未检测到有效的 DEEPSEEK_API_KEY');
+      return null;
+    }
 
     try {
       let mimeType = 'image/jpeg';
@@ -77,18 +80,18 @@ export class DeepSeekAgent {
         messages: [
           {
             role: 'system',
-            content: `你是一个精通古今中外全部电影、电视剧、动漫、网剧的专家。
-用户会发送剧照、海报、剧集截图、台词截图、主角合照、动漫画面甚至是画质模糊的影视片段。
+            content: `你是一个精通古今中外全部电影、电视剧、动漫、综艺、纪录片的影视百科专家。
+用户会发送剧照、海报、剧集截图、台词字幕截图、演员同框画面、动漫截图甚至略微模糊的翻拍/裁剪片段。
 任务要求：
-1. 请深度观察图片中的人物面孔、角色装扮、服饰道具、场景特征、字幕台词或画面文字；
-2. 尽最大可能推断出这最可能是哪一部电影、电视剧或动漫作品的中文名称；
-3. 输出格式要求：如果推断出结果，请【严格只输出标准中文片名】，绝对不要包含标点符号、书名号、演员名字或额外解释（例如直接输出：功夫之王、庆余年、仙剑奇侠传、繁花、海贼王）；
-4. 如果图片完全与影视剧无关（例如纯风景、纯美食、自拍照），才输出「NONE」。`,
+1. 仔细观察图片中的人物面孔（明星/演员特征）、角色造型装扮、场景构图、UI/水印、台词或画面任何文字线索；
+2. 即使没有直接出现剧名文字，也要根据演员组合、经典服化道或名场面大胆推断最可能对应的那一部作品中文标准片名；
+3. 输出格式要求：只输出【最可能的一部作品中文标准片名】，不要附加标点、书名号、演员名字或解释（例如直接输出：功夫之王、庆余年、繁花、海贼王）；
+4. 只有在图片完全属于纯风景、纯美食、日常证件/聊天记录等与任何影视动漫毫不相关的内容时，才输出「NONE」。`,
           },
           {
             role: 'user',
             content: [
-              { type: 'text', text: '请观察这张图片，推断并直接输出对应影视作品的中文片名：' },
+              { type: 'text', text: '请识别或根据画面/演员/台词推断这部影视动漫作品的中文片名，直接给出片名：' },
               { type: 'image_url', image_url: { url: base64Data } },
             ],
           },
@@ -97,14 +100,30 @@ export class DeepSeekAgent {
       });
 
       const reply = res.choices[0]?.message?.content?.trim() || '';
-      if (!reply || reply.toUpperCase() === 'NONE' || reply.includes('无法识别') || reply.includes('无法查看')) {
+      console.log(`[DeepSeek 识图] model=${visionModel}, bytes=${imageBuffer.length}, mime=${mimeType}, rawReply=${reply.slice(0, 80)}`);
+
+      if (!reply || reply.toUpperCase() === 'NONE') {
         return null;
       }
 
-      const cleanTitle = reply.replace(/[《》""''「」\n\r]/g, '').trim();
+      // 若模型附带了《片名》说明句，优先提取首个书名号内的片名
+      const quotedMatch = reply.match(/《([^》\n]{1,40})》/);
+      if (quotedMatch && quotedMatch[1]?.trim()) {
+        return quotedMatch[1].trim();
+      }
+
+      if (reply.includes('无法识别') || reply.includes('无法查看') || reply.includes('无法确定')) {
+        return null;
+      }
+
+      const firstLine = reply.split(/\r?\n/)[0] || '';
+      const cleanTitle = firstLine
+        .replace(/^(?:片名|作品名|电影|电视剧|动漫)[：:\s]*/i, '')
+        .replace(/[《》""''「」。，,!！?？]/g, '')
+        .trim();
       return cleanTitle || null;
     } catch (err: any) {
-      console.error('[DeepSeek 多模态识别异常]', err.message);
+      console.error(`[DeepSeek 多模态识别异常] model=${visionModel}:`, err.message);
       return null;
     }
   }

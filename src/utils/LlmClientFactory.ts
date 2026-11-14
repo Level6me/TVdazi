@@ -28,7 +28,8 @@ export class LlmClientFactory {
   }
 
   public static getVisionModel(): string {
-    return (process.env.DEEPSEEK_VISION_MODEL || process.env.DEEPSEEK_MODEL || 'deepseek-flash').trim();
+    // 视觉识图固定优先使用多模态专用环境变量或原生多模态模型 deepseek-flash，避免误继承纯文本模型（如 deepseek-v4-pro）
+    return (process.env.DEEPSEEK_VISION_MODEL || 'deepseek-flash').trim();
   }
 
   private static getOrCreateGlobalClient(apiKey: string, baseURL: string, timeoutMs: number): OpenAI {
