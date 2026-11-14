@@ -7,7 +7,11 @@ import { AntiCensorService } from './AntiCensorService';
 export interface QuarkUserInfo {
   nickname: string;
   totalCapacity: string;
+  usedCapacity?: string;
   freeCapacity: string;
+  usagePercent?: string;
+  memberType?: string;
+  freeBytes?: number;
 }
 
 export interface QuarkFolderItem {
@@ -75,32 +79,81 @@ export class QuarkService {
     };
   }
 
+  private static formatCapacityBytes(bytes: number): string {
+    if (!Number.isFinite(bytes) || bytes < 0) return '未知';
+    const tb = bytes / (1024 * 1024 * 1024 * 1024);
+    const gb = bytes / (1024 * 1024 * 1024);
+    const mb = bytes / (1024 * 1024);
+    if (tb >= 1) {
+      return `${tb.toFixed(2)} TB (${gb.toFixed(1)} GB)`;
+    }
+    if (gb >= 1) {
+      return `${gb.toFixed(1)} GB`;
+    }
+    return `${mb.toFixed(1)} MB`;
+  }
+
   /**
-   * 获取网盘用户信息与容量
+   * 获取网盘用户信息与真实容量（并发拉取 account/info 昵称与 clouddrive/member 容量数据）
    */
   async getUserInfo(customCookie?: string): Promise<QuarkUserInfo | null> {
     if (!this.isConfigured(customCookie)) return null;
 
-    try {
-      const resp = await axios.get('https://pan.quark.cn/account/info', {
-        headers: this.getHeaders(customCookie),
-        timeout: 6000,
-      });
+    const headers = this.getHeaders(customCookie);
 
-      if (resp.data && resp.data.data) {
-        const d = resp.data.data;
-        const totalGB = (d.total_capacity / (1024 * 1024 * 1024)).toFixed(1);
-        const freeGB = ((d.total_capacity - d.used_capacity) / (1024 * 1024 * 1024)).toFixed(1);
+    try {
+      const [accRes, memRes] = await Promise.allSettled([
+        axios.get('https://pan.quark.cn/account/info', {
+          headers,
+          timeout: 6000,
+        }),
+        axios.get(
+          'https://drive-pc.quark.cn/1/clouddrive/member?pr=ucpro&fr=pc&uc_param_str=&fetch_subscribe=true&_ch=home&fetch_identity=true',
+          {
+            headers,
+            timeout: 6000,
+          }
+        ),
+      ]);
+
+      const accData = accRes.status === 'fulfilled' ? accRes.value.data?.data : null;
+      const memData = memRes.status === 'fulfilled' ? memRes.value.data?.data : null;
+
+      if (!accData && !memData) {
+        return null;
+      }
+
+      const nickname = accData?.nickname || '夸克用户';
+      const totalBytes = Number(memData?.total_capacity ?? accData?.total_capacity);
+      const usedBytes = Number(memData?.use_capacity ?? memData?.used_capacity ?? accData?.used_capacity);
+
+      const memberMap: Record<string, string> = {
+        SUPER_VIP: 'SVIP超级会员',
+        VIP: 'VIP会员',
+        NORMAL: '普通用户',
+      };
+      const rawMember = memData?.member_type;
+      const memberType = rawMember ? memberMap[rawMember] || rawMember : undefined;
+
+      if (Number.isFinite(totalBytes) && totalBytes > 0 && Number.isFinite(usedBytes) && usedBytes >= 0) {
+        const freeBytes = Math.max(0, totalBytes - usedBytes);
+        const usagePct = ((usedBytes / totalBytes) * 100).toFixed(1) + '%';
         return {
-          nickname: d.nickname || '夸克用户',
-          totalCapacity: isNaN(Number(totalGB)) ? '充足' : `${totalGB} GB`,
-          freeCapacity: isNaN(Number(freeGB)) ? '充足' : `${freeGB} GB`,
+          nickname,
+          totalCapacity: QuarkService.formatCapacityBytes(totalBytes),
+          usedCapacity: QuarkService.formatCapacityBytes(usedBytes),
+          freeCapacity: QuarkService.formatCapacityBytes(freeBytes),
+          usagePercent: usagePct,
+          memberType,
+          freeBytes,
         };
       }
+
       return {
-        nickname: '夸克用户',
-        totalCapacity: '就绪',
-        freeCapacity: '就绪',
+        nickname,
+        totalCapacity: '充足',
+        freeCapacity: '充足',
+        memberType,
       };
     } catch {
       return null;

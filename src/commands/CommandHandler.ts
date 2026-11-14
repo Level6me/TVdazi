@@ -911,16 +911,24 @@ export class CommandHandler {
       return '网盘登录凭证好像过期啦，重新在电脑浏览器复制一下 Cookie，发「/set-quark <新Cookie>」就可以更新啦！';
     }
 
+    const memberBadge = info.memberType ? ` [${info.memberType}]` : '';
+    const usedLine = info.usedCapacity
+      ? `📊 已用空间：${info.usedCapacity}${info.usagePercent ? `（已用 ${info.usagePercent}）` : ''}`
+      : null;
+
     return [
       '☁️ 【你的夸克网盘容量状态】',
       '----------------------------------------',
-      `👤 账号昵称：${info.nickname}`,
+      `👤 账号昵称：${info.nickname}${memberBadge}`,
       `💾 总共容量：${info.totalCapacity}`,
+      usedLine,
       `🟢 剩余空间：${info.freeCapacity}`,
       `📂 默认保存目录：${userPlan.saveRootDir || this.quarkService.getDefaultRootDir()}`,
       `🏷️ 账号模式：${customCookie ? '个人独立账号' : '共享系统公共账号'}`,
       '✅ 随时可以发片名让我帮你自动转存！',
-    ].join('\n');
+    ]
+      .filter(Boolean)
+      .join('\n');
   }
 
   private renderChannels(): string {
