@@ -8,6 +8,7 @@ import { SessionManager } from './SessionManager';
 import { UserManager } from './UserManager';
 import { CategoryClassifier, ResourceCategory } from './CategoryClassifier';
 import { CloudResource } from '../types';
+import { atomicWriteFileSync } from '../utils/FileUtils';
 
 export type TaskType =
   | 'daily_recommend'   // 场景1：每日/周期定时推送指定类型影视推荐
@@ -105,7 +106,7 @@ export class SchedulerService {
 
   private saveTasks(): void {
     try {
-      fs.writeFileSync(this.tasksFilePath, JSON.stringify(this.tasks, null, 2), 'utf-8');
+      atomicWriteFileSync(this.tasksFilePath, JSON.stringify(this.tasks, null, 2));
     } catch (err: any) {
       console.error('[SchedulerService] 保存定时任务失败:', err.message);
     }
@@ -159,7 +160,7 @@ export class SchedulerService {
   }
 
   /**
-   * 核心调度 Tick：检查所有启用中的定时任务与资源轮询任务
+   * 核心调度 Tick：先同步筛选到期任务并落盘状态，再以有界并发执行，避免长耗时搜片阻塞定点任务
    */
   public async tick(): Promise<void> {
     if (this.isTickRunning) return;
@@ -168,69 +169,95 @@ export class SchedulerService {
     try {
       const { dateStr, timeStr, dayOfWeek, minuteKey } = this.getCurrentTimeParts();
       const nowMs = Date.now();
+      const [curH, curM] = timeStr.split(':').map((n) => parseInt(n, 10));
+      const curTotalMin = curH * 60 + curM;
+
+      const dueTasks: ScheduledTask[] = [];
+      let stateChanged = false;
 
       for (const task of this.tasks) {
         if (!task.enabled || task.status === 'completed' || task.status === 'paused') {
           continue;
         }
 
-        // 0. 精准相对延时单次任务（精确到秒级时间戳，确保绝不提前触发）
+        // 0. 精准相对延时单次任务
         if (task.triggerAt) {
           if (nowMs >= task.triggerAt) {
+            const staleMs = nowMs - task.triggerAt;
             task.lastTriggeredDate = minuteKey;
             task.lastRunAt = nowMs;
             task.status = 'completed';
             task.enabled = false;
-            this.saveTasks();
-
-            const msg = await this.executeTask(task, false);
-            if (msg && this.pushCallback) {
-              await this.pushCallback(task.userId, msg);
+            stateChanged = true;
+            // 若因长时间停机已过期超过 2 小时，静默关闭而不突兀补发过时提醒
+            if (staleMs <= 2 * 60 * 60 * 1000) {
+              dueTasks.push(task);
             }
           }
           continue;
         }
 
-        // 1. 时间定点触发型任务（含 daily_recommend, friday_weekly, disk_guard, watchlist_remind, custom_reminder，或者带 scheduleTime 的任务）
+        // 1. 时间定点触发型任务（允许 0~1 分钟补偿窗口，防止跨分钟漏触发）
         if (task.scheduleTime) {
-          if (task.scheduleTime === timeStr && task.lastTriggeredDate !== minuteKey) {
-            if (task.oneShotDate && task.oneShotDate !== dateStr) {
-              continue;
-            }
-            if (task.daysOfWeek && task.daysOfWeek.length > 0 && !task.daysOfWeek.includes(dayOfWeek)) {
-              continue;
-            }
+          if (task.oneShotDate && task.oneShotDate < dateStr) {
+            task.status = 'completed';
+            task.enabled = false;
+            stateChanged = true;
+            continue;
+          }
+          if (task.oneShotDate && task.oneShotDate !== dateStr) {
+            continue;
+          }
+          if (task.daysOfWeek && task.daysOfWeek.length > 0 && !task.daysOfWeek.includes(dayOfWeek)) {
+            continue;
+          }
 
-            task.lastTriggeredDate = minuteKey;
+          const [schedH, schedM] = task.scheduleTime.split(':').map((n) => parseInt(n, 10));
+          const schedTotalMin = schedH * 60 + schedM;
+          const diffMin = curTotalMin - schedTotalMin;
+          const dayTriggerKey = `${dateStr} ${task.scheduleTime}`;
+
+          if (diffMin >= 0 && diffMin <= 1 && task.lastTriggeredDate !== dayTriggerKey) {
+            task.lastTriggeredDate = dayTriggerKey;
             task.lastRunAt = nowMs;
             if (task.oneShotDate) {
               task.status = 'completed';
               task.enabled = false;
             }
-            this.saveTasks();
-
-            const msg = await this.executeTask(task, false);
-            if (msg && this.pushCallback) {
-              await this.pushCallback(task.userId, msg);
-            }
+            stateChanged = true;
+            dueTasks.push(task);
           }
           continue;
         }
 
-        // 2. 周期轮询型任务（含 resource_watch, episode_chase, quality_upgrade，或任意显式配置了 intervalMinutes 的任务）
+        // 2. 周期轮询型任务
         if (task.intervalMinutes || ['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
           const intervalMs = (task.intervalMinutes || 30) * 60 * 1000;
           const lastRun = task.lastRunAt || 0;
           if (nowMs - lastRun >= intervalMs) {
             task.lastRunAt = nowMs;
-            this.saveTasks();
+            stateChanged = true;
+            dueTasks.push(task);
+          }
+        }
+      }
 
+      if (stateChanged) {
+        this.saveTasks();
+      }
+
+      // 有界并发执行到期任务（最多 4 并发），防止单一慢搜片任务卡死整个调度队列
+      const CONCURRENCY = 4;
+      for (let i = 0; i < dueTasks.length; i += CONCURRENCY) {
+        const batch = dueTasks.slice(i, i + CONCURRENCY);
+        await Promise.allSettled(
+          batch.map(async (task) => {
             const msg = await this.executeTask(task, false);
             if (msg && this.pushCallback) {
               await this.pushCallback(task.userId, msg);
             }
-          }
-        }
+          })
+        );
       }
     } finally {
       this.isTickRunning = false;
@@ -456,8 +483,8 @@ export class SchedulerService {
     const prevEp = task.lastEpisode || 0;
     const knownIds = new Set(task.knownShareIds || []);
 
-    // 判断是否有新集数更新
-    const hasNewEpisode = highestEp > prevEp || (prevEp === 0 && !knownIds.has(bestCandidate.shareId));
+    // 判断是否有新集数更新（仅当明确识别到更高集数，或首次完全未见过资源时才触发通知，避免无集号分享换链接反复轰炸）
+    const hasNewEpisode = highestEp > prevEp || (prevEp === 0 && knownIds.size === 0);
 
     if (!hasNewEpisode) {
       if (isManual) {
@@ -473,29 +500,33 @@ export class SchedulerService {
       return null;
     }
 
-    // 发现新集数更新！
-    task.lastEpisode = Math.max(prevEp, highestEp);
-    task.knownShareIds = [...Array.from(knownIds), bestCandidate.shareId].slice(-20);
-    if (completeFlag && highestEp > 0) {
-      // 完结剧集追更圆满完成
-      task.status = 'completed';
-      task.enabled = false;
-    }
-    this.saveTasks();
-
     this.sessionManager.setSearch(task.userId, keyword, items, 8);
 
+    // 发现新集数更新！先执行自动转存，再持久化进度与完结状态，避免转存失败导致进度被提前锁死
     let saveDetail = '';
+    let saveSucceeded = task.autoSave === false;
     if (task.autoSave !== false) {
-      // 优先尝试含最高集数的 bestCandidate，失败时自动顺延同批次其他有效夸克候选（最多 3 条）
       const prioritized = [bestCandidate, ...candidates.filter((c) => c.shareId !== bestCandidate.shareId)];
-      const autoRes = await this.trySaveQuarkCandidates(prioritized, task.userId, '国产剧', keyword);
+      const inferredCategory =
+        bestCandidate.category || CategoryClassifier.classify(bestCandidate.title, bestCandidate.rawText || '') || '国产剧';
+      const autoRes = await this.trySaveQuarkCandidates(prioritized, task.userId, inferredCategory, keyword);
       if (autoRes.success) {
+        saveSucceeded = true;
         saveDetail = `\n📂 已自动转存至夸克网盘：【${autoRes.targetPath}】\n${autoRes.message}`;
       } else {
         saveDetail = `\n🔗 最新分享链接：${bestCandidate.shareUrl}（回复「1」可手动转存）`;
       }
     }
+
+    task.knownShareIds = [...Array.from(knownIds), bestCandidate.shareId].slice(-20);
+    if (saveSucceeded || highestEp > prevEp) {
+      task.lastEpisode = Math.max(prevEp, highestEp);
+      if (completeFlag && highestEp > 0 && saveSucceeded) {
+        task.status = 'completed';
+        task.enabled = false;
+      }
+    }
+    this.saveTasks();
 
     const epText = highestEp > 0 ? `最新第 ${highestEp} 集${completeFlag ? '（全集完结）' : ''}` : '最新资源包';
     return [
@@ -1044,6 +1075,10 @@ export class SchedulerService {
           message: `⏱️ 已将 ${names} 的扫描轮询间隔更新为：**${freqDesc}巡检一次**！`,
         };
       }
+      return {
+        success: false,
+        message: `未找到与「${selector.keyword}」相关的监控任务，请发送「/tasks」查看当前任务序号后再试~`,
+      };
     }
 
     // 3. 默认批量更新用户的轮询监控类任务（若无轮询任务则更新最后一条任务）
@@ -1587,7 +1622,7 @@ export class SchedulerService {
     let oneShotDate = parsedFromText?.oneShotDate;
     let triggerAt = parsedFromText?.triggerAt;
     let isRelative = Boolean(parsedFromText?.isRelative);
-    let intervalMinutes = hasInterval ? Math.max(1, Math.min(1440, Math.round(params.interval_minutes!))) : undefined;
+    let intervalMinutes = hasInterval ? Math.max(1, Math.min(10080, Math.round(params.interval_minutes!))) : undefined;
 
     if (hasDelay) {
       const future = computeFutureBeijing(Math.round(params.delay_minutes! * 60000));
@@ -1822,6 +1857,9 @@ export class SchedulerService {
           targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'],
         });
         const firstCheck = await this.runQualityUpgrade(task, true);
+        if (task.status === 'completed') {
+          return firstCheck || `💎 《${movieTitle}》已命中 4K 高规格片源！`;
+        }
         return [
           `💎 已为你创建【4K 高画质洗版监控】任务！`,
           `📺 监控目标：《${movieTitle}》（匹配 4K / 2160P / REMUX / 杜比）`,
@@ -1858,6 +1896,9 @@ export class SchedulerService {
       // 同时加入个人追剧片单
       this.userManager.addToWatchlist(userId, movieTitle);
       const firstCheck = await this.runEpisodeChase(task, true);
+      if (task.status === 'completed') {
+        return firstCheck || `📺 《${movieTitle}》全集已追更完毕并入库！`;
+      }
       return [
         `📺 已为你开启【连载热播剧全自动追更】：《${movieTitle}》！`,
         `🔄 巡检频率：${activeFreqText}自动检测全网最新集数，发现新集数将自动转存夸克网盘 + 防和谐改名 + 微信推送通知你！`,
@@ -1877,6 +1918,7 @@ export class SchedulerService {
       if (!movieTitle) {
         return '请告诉我要蹲守哪部电影或剧集呀，例如：「《流浪地球3》有资源了通知我」或「每10分钟蹲守《奥德赛》」~';
       }
+      const notifyOnly = /(?:通知我|提醒我|告诉我|发给我)/.test(trimmed) && !wantAutoSave;
       const task = this.addTask({
         userId,
         type: 'resource_watch',
@@ -1884,9 +1926,12 @@ export class SchedulerService {
         keyword: movieTitle,
         enabled: true,
         intervalMinutes: activeInterval,
-        autoSave: wantAutoSave || true,
+        autoSave: wantAutoSave || !notifyOnly,
       });
       const firstCheck = await this.runResourceWatch(task, true);
+      if (task.status === 'completed') {
+        return firstCheck || `🎉 你蹲守的《${movieTitle}》已经有资源啦！`;
+      }
       return [
         `🛰️ 已为你挂载【全网资源雷达蹲守】：《${movieTitle}》！`,
         `⚡ 触发动作：后台${activeFreqText}轮询 50+ 频道，一旦出资源立即微信推送给你${task.autoSave ? '并自动转存至你的夸克网盘' : ''}！`,

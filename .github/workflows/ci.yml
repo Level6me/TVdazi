@@ -1,0 +1,84 @@
+name: CI Build & Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: TypeScript build (tsc)
+        run: npm run build
+
+      - name: Run module load & unit tests
+        run: |
+          node << 'EOF'
+          const assert = require('assert');
+          const fs = require('fs');
+          const os = require('os');
+          const path = require('path');
+
+          // 1. Verify compiled core modules load cleanly without runtime errors
+          const { CategoryClassifier } = require('./dist/services/CategoryClassifier');
+          const { SessionManager } = require('./dist/services/SessionManager');
+          const { upsertEnvVar, atomicWriteFileSync } = require('./dist/utils/FileUtils');
+          const { LlmClientFactory } = require('./dist/utils/LlmClientFactory');
+          require('./dist/services/UserManager');
+          require('./dist/services/ChannelManager');
+          require('./dist/services/DoubanService');
+          require('./dist/services/AntiCensorService');
+          require('./dist/services/AiCorrector');
+          require('./dist/services/AiRecommender');
+          require('./dist/services/Searcher');
+          require('./dist/services/QuarkService');
+          require('./dist/services/SchedulerService');
+          require('./dist/commands/CommandHandler');
+          require('./dist/agent/DeepSeekAgent');
+          require('./dist/wechat/WeixinBot');
+
+          // 2. CategoryClassifier tests
+          assert.strictEqual(CategoryClassifier.classify('沙丘2 2024 4K电影'), '电影');
+          assert.strictEqual(CategoryClassifier.classify('庆余年 第二季 全集 电视剧'), '国产剧');
+          assert.strictEqual(CategoryClassifier.classify('怪奇物语 第四季 Netflix'), '美剧');
+          assert.strictEqual(CategoryClassifier.classify('眼泪之女王 tvN 韩剧'), '韩剧');
+          assert.strictEqual(CategoryClassifier.classify('进击的巨人 最终季 动漫'), '动漫');
+
+          // 3. FileUtils tests ($ replacement safety + atomic write)
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wesaver-ci-'));
+          const envFile = path.join(tmpDir, '.env');
+          upsertEnvVar(envFile, 'QUARK_COOKIE', 'abc$1$$xyz=123');
+          upsertEnvVar(envFile, 'QUARK_COOKIE', 'updated$&val');
+          assert(fs.readFileSync(envFile, 'utf8').includes('QUARK_COOKIE=updated$&val'));
+          const jsonFile = path.join(tmpDir, 'test.json');
+          atomicWriteFileSync(jsonFile, '{"ok":true}');
+          assert.strictEqual(fs.readFileSync(jsonFile, 'utf8'), '{"ok":true}');
+          fs.rmSync(tmpDir, { recursive: true, force: true });
+
+          // 4. SessionManager tests
+          const sm = new SessionManager();
+          sm.setSearch('u1', '测试剧', [{ title: '测试剧', url: 'https://pan.quark.cn/s/1', source: 'quark', channel: 'c1' }]);
+          assert.strictEqual(sm.getSearch('u1').keyword, '测试剧');
+          assert.strictEqual(sm.getLastActiveType('u1'), 'search');
+
+          // 5. LlmClientFactory defaults check
+          assert.strictEqual(LlmClientFactory.DEFAULT_MODEL, 'deepseek-flash');
+          assert.strictEqual(LlmClientFactory.VISION_MODEL, 'deepseek-flash');
+
+          console.log('ALL_CI_CHECKS_PASSED');
+          EOF

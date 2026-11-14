@@ -1,9 +1,9 @@
 import axios from 'axios';
 import * as crypto from 'crypto';
-import * as fs from 'fs';
 import * as path from 'path';
 import { ResourceCategory } from '../types';
 import { AntiCensorService } from './AntiCensorService';
+import { upsertEnvVar } from '../utils/FileUtils';
 
 export interface QuarkUserInfo {
   nickname: string;
@@ -24,7 +24,8 @@ export class QuarkService {
   private cookie: string;
   private envPath: string;
   private defaultRootDir: string;
-  private dirCache: Map<string, string> = new Map();
+  private dirCache: Map<string, { fid: string; cachedAt: number }> = new Map();
+  private static readonly DIR_CACHE_TTL_MS = 10 * 60 * 1000;
 
   constructor(cookie?: string, envPath?: string) {
     this.cookie = cookie || process.env.QUARK_COOKIE || '';
@@ -49,17 +50,7 @@ export class QuarkService {
     process.env.QUARK_COOKIE = this.cookie;
 
     try {
-      let content = '';
-      if (fs.existsSync(this.envPath)) {
-        content = fs.readFileSync(this.envPath, 'utf8');
-      }
-      const regex = /^QUARK_COOKIE=.*/m;
-      if (regex.test(content)) {
-        content = content.replace(regex, `QUARK_COOKIE=${this.cookie}`);
-      } else {
-        content += `\nQUARK_COOKIE=${this.cookie}\n`;
-      }
-      fs.writeFileSync(this.envPath, content, 'utf8');
+      upsertEnvVar(this.envPath, 'QUARK_COOKIE', this.cookie);
       return true;
     } catch (err: any) {
       console.error('[QuarkService] 写入 Cookie 失败:', err.message);
@@ -162,9 +153,12 @@ export class QuarkService {
   }
 
   /**
-   * 获取目录列表
+   * 获取目录列表（严格区分接口成功返回空列表与请求失败/未登录）
    */
-  async getFolderList(parentCid = '0', customCookie?: string): Promise<QuarkFolderItem[]> {
+  private async getFolderListStrict(
+    parentCid = '0',
+    customCookie?: string
+  ): Promise<{ ok: boolean; unauthorized?: boolean; folders: QuarkFolderItem[] }> {
     try {
       const response = await axios.get('https://drive-h.quark.cn/1/clouddrive/file/sort', {
         params: {
@@ -183,19 +177,35 @@ export class QuarkService {
         timeout: 7000,
       });
 
-      if (response.data?.data?.list) {
-        return response.data.data.list
-          .filter((item: any) => item.dir)
-          .map((item: any) => ({
-            cid: item.fid,
-            name: item.file_name,
-          }));
+      if (response.data?.status === 401 || response.data?.code === 40001 || response.data?.message?.includes('登录')) {
+        return { ok: false, unauthorized: true, folders: [] };
       }
-      return [];
+
+      if (response.data?.data?.list) {
+        return {
+          ok: true,
+          folders: response.data.data.list
+            .filter((item: any) => item.dir)
+            .map((item: any) => ({
+              cid: item.fid,
+              name: item.file_name,
+            })),
+        };
+      }
+      return { ok: false, folders: [] };
     } catch (err: any) {
+      const unauthorized = err.response?.status === 401 || err.response?.data?.message?.includes('登录');
       console.error('[QuarkService] 获取文件夹列表失败:', err.message);
-      return [];
+      return { ok: false, unauthorized, folders: [] };
     }
+  }
+
+  /**
+   * 获取目录列表
+   */
+  async getFolderList(parentCid = '0', customCookie?: string): Promise<QuarkFolderItem[]> {
+    const res = await this.getFolderListStrict(parentCid, customCookie);
+    return res.folders;
   }
 
   /**
@@ -236,6 +246,33 @@ export class QuarkService {
     return crypto.createHash('md5').update(raw).digest('hex').slice(0, 12);
   }
 
+  private getCachedDirFid(cacheKey: string): string | undefined {
+    const entry = this.dirCache.get(cacheKey);
+    if (!entry) return undefined;
+    if (Date.now() - entry.cachedAt > QuarkService.DIR_CACHE_TTL_MS) {
+      this.dirCache.delete(cacheKey);
+      return undefined;
+    }
+    return entry.fid;
+  }
+
+  private setCachedDirFid(cacheKey: string, fid: string): void {
+    if (!this.dirCache.has(cacheKey) && this.dirCache.size >= 300) {
+      const oldest = this.dirCache.keys().next().value;
+      if (oldest) this.dirCache.delete(oldest);
+    }
+    this.dirCache.set(cacheKey, { fid, cachedAt: Date.now() });
+  }
+
+  private invalidateDirCacheForScope(customCookie?: string): void {
+    const prefix = `${this.getCookieScopeKey(customCookie)}:`;
+    for (const key of this.dirCache.keys()) {
+      if (key.startsWith(prefix)) {
+        this.dirCache.delete(key);
+      }
+    }
+  }
+
   /**
    * 递归解析并自动逐层创建多级路径，返回最底层目录 FID
    * 例如 "/我的资源/MI/电影"，会依次定位或创建 "我的资源" -> "MI" -> "电影"
@@ -243,8 +280,9 @@ export class QuarkService {
   async ensureDirectoryPath(fullPath: string, customCookie?: string): Promise<string> {
     const scopeKey = this.getCookieScopeKey(customCookie);
     const cacheKey = `${scopeKey}:${fullPath}`;
-    if (this.dirCache.has(cacheKey)) {
-      return this.dirCache.get(cacheKey)!;
+    const hit = this.getCachedDirFid(cacheKey);
+    if (hit) {
+      return hit;
     }
 
     const segments = fullPath
@@ -254,18 +292,24 @@ export class QuarkService {
 
     let currentFid = '0';
     let currentPath = '';
+    let allSucceeded = true;
 
     for (const segment of segments) {
       currentPath += `/${segment}`;
       const subCacheKey = `${scopeKey}:${currentPath}`;
-      if (this.dirCache.has(subCacheKey)) {
-        currentFid = this.dirCache.get(subCacheKey)!;
+      const subHit = this.getCachedDirFid(subCacheKey);
+      if (subHit) {
+        currentFid = subHit;
         continue;
       }
 
-      const folders = await this.getFolderList(currentFid, customCookie);
-      const found = folders.find((f) => f.name === segment);
+      const listRes = await this.getFolderListStrict(currentFid, customCookie);
+      if (!listRes.ok) {
+        allSucceeded = false;
+        break;
+      }
 
+      const found = listRes.folders.find((f) => f.name === segment);
       if (found) {
         currentFid = found.cid;
       } else {
@@ -274,13 +318,17 @@ export class QuarkService {
           currentFid = newFid;
         } else {
           console.warn(`[QuarkService] 创建子目录【${segment}】失败 (父节点: ${currentFid})`);
+          allSucceeded = false;
           break;
         }
       }
-      this.dirCache.set(subCacheKey, currentFid);
+      this.setCachedDirFid(subCacheKey, currentFid);
     }
 
-    this.dirCache.set(cacheKey, currentFid);
+    // 仅当路径所有层级全部成功定位/创建时才写入完整路径缓存，防止半截父目录污染缓存
+    if (allSucceeded && segments.length > 0) {
+      this.setCachedDirFid(cacheKey, currentFid);
+    }
     return currentFid;
   }
 
@@ -463,30 +511,35 @@ export class QuarkService {
         };
       }
 
-      // 2. 获取分享文件列表
+      // 2. 分页获取分享文件列表（突破单页 50 条限制，最多拉取 500 条防止长剧集漏存）
       let fid_list: string[] = [];
       let fid_token_list: string[] = [];
       let shareItems: Array<{ fid: string; file_name: string }> = [];
       try {
-        const dResp = await axios.get('https://drive-h.quark.cn/1/clouddrive/share/sharepage/detail', {
-          params: {
-            pr: 'ucpro',
-            fr: 'pc',
-            pwd_id: pwdId,
-            stoken: stoken,
-            pdir_fid: '0',
-            _page: '1',
-            _size: '50',
-          },
-          headers: this.getHeaders(customCookie),
-          timeout: 8000,
-        });
+        for (let page = 1; page <= 10; page++) {
+          const dResp = await axios.get('https://drive-h.quark.cn/1/clouddrive/share/sharepage/detail', {
+            params: {
+              pr: 'ucpro',
+              fr: 'pc',
+              pwd_id: pwdId,
+              stoken: stoken,
+              pdir_fid: '0',
+              _page: String(page),
+              _size: '50',
+            },
+            headers: this.getHeaders(customCookie),
+            timeout: 8000,
+          });
 
-        const list = dResp.data?.data?.list || [];
-        if (list.length > 0) {
-          fid_list = list.map((item: any) => item.fid);
-          fid_token_list = list.map((item: any) => item.share_fid_token);
-          shareItems = list.map((item: any) => ({ fid: item.fid, file_name: item.file_name }));
+          const list = dResp.data?.data?.list || [];
+          if (list.length === 0) break;
+
+          for (const item of list) {
+            fid_list.push(item.fid);
+            fid_token_list.push(item.share_fid_token);
+            shareItems.push({ fid: item.fid, file_name: item.file_name });
+          }
+          if (list.length < 50) break;
         }
       } catch {}
 
@@ -555,6 +608,17 @@ export class QuarkService {
       }
 
       const msg = saveResp.data?.message || '转存失败';
+      if (status === 401 || code === 40001 || /登录|未授权/.test(msg)) {
+        this.invalidateDirCacheForScope(customCookie);
+        return {
+          success: false,
+          message: `⚠️ 转存至【${targetPath}】失败：夸克 Cookie 凭证未激活或已过期。\n💡 解决方式：请在电脑打开 pan.quark.cn 登录，按 F12 在 Network（网络）中点击任意请求复制完整 Cookie，发送「/set-quark <新Cookie>」即可！`,
+          targetPath,
+        };
+      }
+      if (/目录不存在|父目录/.test(msg)) {
+        this.invalidateDirCacheForScope(customCookie);
+      }
       return {
         success: false,
         message: `转存接口返回: ${msg} (状态码: ${status || code})`,
@@ -562,6 +626,7 @@ export class QuarkService {
       };
     } catch (err: any) {
       if (err.response?.status === 401 || err.response?.data?.message?.includes('登录')) {
+        this.invalidateDirCacheForScope(customCookie);
         return {
           success: false,
           message: `⚠️ 转存至【${targetPath}】失败：夸克 Cookie 凭证未激活或已过期。\n💡 解决方式：请在电脑打开 pan.quark.cn 登录，按 F12 在 Network（网络）中点击任意请求复制完整 Cookie，发送「/set-quark <新Cookie>」即可！`,

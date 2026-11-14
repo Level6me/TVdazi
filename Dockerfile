@@ -2,8 +2,8 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# 安装构建必要工具
-RUN apk add --no-cache python3 make g++ git
+# 安装基础工具
+RUN apk add --no-cache git
 
 # 拷贝依赖配置
 COPY package*.json tsconfig.json ./

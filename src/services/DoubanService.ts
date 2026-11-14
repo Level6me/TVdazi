@@ -19,7 +19,6 @@ export interface DoubanSubject {
 
 export class DoubanService {
   private baseUrl = 'https://movie.douban.com/j';
-  private detailCache: Map<string, { rating: string; actors: string; year: string }> = new Map();
   private abstractCache: Map<string, Partial<DoubanSubject>> = new Map();
 
   /**

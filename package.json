@@ -35,8 +35,7 @@
     "cheerio": "^1.0.0-rc.12",
     "dotenv": "^16.4.5",
     "openai": "^4.70.2",
-    "qrcode": "^1.5.4",
-    "sqlite3": "^5.1.7"
+    "qrcode": "^1.5.4"
   },
   "devDependencies": {
     "@types/node": "^22.7.5",

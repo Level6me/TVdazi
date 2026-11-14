@@ -145,7 +145,7 @@ export class ResourceSearcher {
       try {
         const url = `https://t.me/s/${channel}?q=${encodeURIComponent(keyword)}`;
         const response = await axios.get(url, {
-          timeout: 7000,
+          timeout: 5500,
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
@@ -173,67 +173,29 @@ export class ResourceSearcher {
           const combinedText = hrefLinks.length > 0 ? `${rawTextContent}\n${hrefLinks.join('\n')}` : rawTextContent;
           if (!combinedText) return;
 
-          // 提取各种网盘链接（优先提取夸克网盘链接及可能附带的提取码）
-          const quarkMatch = combinedText.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/i);
-          const aliyunMatch = combinedText.match(/https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/);
-          const ucMatch = combinedText.match(/https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/);
-          const pan115Match = combinedText.match(/https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/);
-          const pan123Match = combinedText.match(/https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/);
-          const tianyiMatch = combinedText.match(/https?:\/\/cloud\.189\.cn\/[^\s<>"]+/);
-          const baiduMatch = combinedText.match(/https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/);
-
-          let shareUrl = '';
-          let shareId = '';
-          let passcode = '';
-          let panType: CloudResource['panType'] = 'other';
-
-          if (quarkMatch) {
-            shareId = quarkMatch[1];
-            shareUrl = `https://pan.quark.cn/s/${shareId}`;
-            const textPassMatch = combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
-            passcode = quarkMatch[2] || (textPassMatch ? textPassMatch[1] : '');
-            panType = 'quark';
-          } else if (aliyunMatch) {
-            shareUrl = aliyunMatch[0];
-            shareId = aliyunMatch[1];
-            panType = 'aliyun';
-          } else if (ucMatch) {
-            shareUrl = ucMatch[0];
-            shareId = ucMatch[1];
-            panType = 'uc';
-          } else if (pan115Match) {
-            shareUrl = pan115Match[0];
-            shareId = pan115Match[1];
-            panType = '115';
-          } else if (pan123Match) {
-            shareUrl = pan123Match[0];
-            shareId = pan123Match[1];
-            panType = 'other';
-          } else if (tianyiMatch) {
-            shareUrl = tianyiMatch[0];
-            panType = 'other';
-          } else if (baiduMatch) {
-            shareUrl = baiduMatch[0];
-            panType = 'other';
+          let extractedTitle = keyword;
+          const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
+          if (nameMatch && nameMatch[1]) {
+            extractedTitle = nameMatch[1].trim();
+          } else {
+            const lines = rawTextContent
+              .split(/\r?\n/)
+              .map((l) => l.trim())
+              .filter((l) => l && !/^https?:\/\//i.test(l));
+            extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
           }
 
-          if (shareUrl && !seenUrls.has(shareUrl)) {
-            let extractedTitle = keyword;
-            const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
-            if (nameMatch && nameMatch[1]) {
-              extractedTitle = nameMatch[1].trim();
-            } else {
-              const lines = rawTextContent
-                .split(/\r?\n/)
-                .map((l) => l.trim())
-                .filter((l) => l && !/^https?:\/\//i.test(l));
-              extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
-            }
+          const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
+          const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
 
-            const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
+          const addResource = (
+            shareUrl: string,
+            shareId: string,
+            panType: CloudResource['panType'],
+            passcode?: string
+          ) => {
+            if (!shareUrl || seenUrls.has(shareUrl)) return;
             seenUrls.add(shareUrl);
-            const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
-
             results.push({
               title: cleanTitle || keyword,
               shareUrl,
@@ -244,6 +206,36 @@ export class ResourceSearcher {
               rawText: rawTextContent.slice(0, 400),
               sourceChannel: channel,
             });
+          };
+
+          // 提取一条消息内的全部网盘链接（支持同帖多链接/多清晰度/多网盘共存）
+          const quarkRegex = /https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/gi;
+          for (const m of combinedText.matchAll(quarkRegex)) {
+            const shareId = m[1];
+            const shareUrl = `https://pan.quark.cn/s/${shareId}`;
+            const matchPos = m.index ?? 0;
+            const nearbySlice = combinedText.slice(Math.max(0, matchPos - 20), Math.min(combinedText.length, matchPos + m[0].length + 45));
+            const nearbyPassMatch = nearbySlice.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
+            const fallbackPassMatch = !nearbyPassMatch
+              ? combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i)
+              : null;
+            const passcode = m[2] || nearbyPassMatch?.[1] || fallbackPassMatch?.[1] || '';
+            addResource(shareUrl, shareId, 'quark', passcode);
+          }
+
+          const otherPatterns: Array<{ regex: RegExp; panType: CloudResource['panType']; hasId: boolean }> = [
+            { regex: /https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'aliyun', hasId: true },
+            { regex: /https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/gi, panType: 'uc', hasId: true },
+            { regex: /https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: '115', hasId: true },
+            { regex: /https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'other', hasId: true },
+            { regex: /https?:\/\/cloud\.189\.cn\/[^\s<>"]+/gi, panType: 'other', hasId: false },
+            { regex: /https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/gi, panType: 'other', hasId: false },
+          ];
+
+          for (const pat of otherPatterns) {
+            for (const m of combinedText.matchAll(pat.regex)) {
+              addResource(m[0], pat.hasId ? m[1] || '' : '', pat.panType);
+            }
           }
         });
       } catch {
@@ -251,9 +243,13 @@ export class ResourceSearcher {
       }
     };
 
-    // 分批并发控制（每批 12 个频道），防止瞬时 50 并发触发连接池耗尽或 429 限流
-    const CONCURRENCY = 12;
+    // 分批并发控制（每批 15 个频道），并限制单次全网检索软超时上限（14秒）避免阻塞响应
+    const CONCURRENCY = 15;
+    const SEARCH_BUDGET_MS = 14000;
     for (let i = 0; i < channels.length; i += CONCURRENCY) {
+      if (i > 0 && Date.now() - startTime >= SEARCH_BUDGET_MS) {
+        break;
+      }
       const batch = channels.slice(i, i + CONCURRENCY);
       await Promise.allSettled(batch.map((ch) => fetchChannel(ch)));
     }

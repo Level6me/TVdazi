@@ -61,7 +61,8 @@ export class CategoryClassifier {
 
     // 6. 美剧 / 欧美剧
     if (
-      /美剧|英剧|欧美剧|hbo|netflix|网飞|disney\+|apple tv|paramount|amazon|cw台|第[0-9一二三四五六七八九十]+季|season\s*[0-9]+/i.test(text)
+      /美剧|英剧|欧美剧|hbo|netflix|网飞|disney\+|apple tv|paramount|amazon|cw台|season\s*[0-9]+|s[0-9]{2}e[0-9]{2}/i.test(text) &&
+      !/国产剧|大陆剧|华语剧|港剧|tvb|台剧/i.test(text)
     ) {
       if (/电影|原盘REMUX/i.test(title) && !/第.*[季集]|全.*集|s[0-9]{2}e[0-9]{2}/i.test(text)) {
         return '电影';

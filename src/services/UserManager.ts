@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import { atomicWriteFileSync } from '../utils/FileUtils';
 
 export interface UserPlan {
   // 基础身份
@@ -198,7 +199,7 @@ export class UserManager {
     this.memoryCache.set(plan.userId, plan);
     try {
       const filePath = this.getSafeFilename(plan.userId);
-      fs.writeFileSync(filePath, JSON.stringify(plan, null, 2), 'utf-8');
+      atomicWriteFileSync(filePath, JSON.stringify(plan, null, 2));
     } catch (err: any) {
       console.error(`[UserManager] 保存用户 ${plan.userId} 数据失败:`, err.message);
     }
@@ -217,14 +218,18 @@ export class UserManager {
     plan.stats.lastActiveAt = Date.now();
 
     if (title) {
-      const existing = plan.watchlist.find((w) => w.title.toLowerCase() === title.toLowerCase());
+      const cleanTitle = title.replace(/[《》]/g, '').trim();
+      const existing = plan.watchlist.find((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
+      const inferredType: 'movie' | 'tv' =
+        category && /剧|动漫|综艺|纪录片/.test(category) ? 'tv' : 'movie';
       if (existing) {
         existing.status = 'completed';
         existing.lastSavedUrl = shareUrl;
+        if (category) existing.category = category;
       } else {
         plan.watchlist.push({
-          title,
-          type: 'movie',
+          title: cleanTitle,
+          type: inferredType,
           category,
           status: 'completed',
           addedAt: Date.now(),
@@ -237,28 +242,40 @@ export class UserManager {
 
   addToWatchlist(userId: string, title: string, category: string = '剧集', note: string = ''): { success: boolean; message: string } {
     const plan = this.getUserPlan(userId);
-    const exists = plan.watchlist.some((w) => w.title.toLowerCase() === title.toLowerCase());
+    const cleanTitle = title.replace(/[《》]/g, '').trim();
+    const exists = plan.watchlist.some((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
     if (exists) {
-      return { success: false, message: `《${title}》已经在您的影视追剧清单中了。` };
+      return { success: false, message: `《${cleanTitle}》已经在您的影视追剧清单中了。` };
     }
 
     plan.watchlist.push({
-      title,
-      type: category.includes('剧') ? 'tv' : 'movie',
+      title: cleanTitle,
+      type: /剧|动漫|综艺|纪录片/.test(category) ? 'tv' : 'movie',
       category,
       status: 'planned',
       addedAt: Date.now(),
       note,
     });
     this.saveUserPlan(plan);
-    return { success: true, message: `✅ 已将《${title}》加入您的专属追剧/收藏清单！` };
+    return { success: true, message: `✅ 已将《${cleanTitle}》加入您的专属追剧/收藏清单！` };
   }
 
   removeFromWatchlist(userId: string, title: string): boolean {
     const plan = this.getUserPlan(userId);
-    const beforeLen = plan.watchlist.length;
-    plan.watchlist = plan.watchlist.filter((w) => !w.title.includes(title));
-    if (plan.watchlist.length !== beforeLen) {
+    const cleanTitle = title.replace(/[《》]/g, '').trim().toLowerCase();
+    if (!cleanTitle) return false;
+
+    const exactIdx = plan.watchlist.findIndex((w) => w.title.trim().toLowerCase() === cleanTitle);
+    if (exactIdx !== -1) {
+      plan.watchlist.splice(exactIdx, 1);
+      this.saveUserPlan(plan);
+      return true;
+    }
+
+    // 无精确匹配时，仅当存在唯一模糊命中项才移除，避免删《庆余年》误删《庆余年2》
+    const partialMatches = plan.watchlist.filter((w) => w.title.toLowerCase().includes(cleanTitle));
+    if (partialMatches.length === 1) {
+      plan.watchlist = plan.watchlist.filter((w) => w !== partialMatches[0]);
       this.saveUserPlan(plan);
       return true;
     }

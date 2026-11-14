@@ -1,5 +1,4 @@
-import OpenAI from 'openai';
-import { UserManager } from './UserManager';
+import { LlmClientFactory } from '../utils/LlmClientFactory';
 
 export interface CorrectionResult {
   originalKeyword: string;
@@ -13,11 +12,6 @@ export interface CorrectionResult {
 
 export class AiCorrector {
   private static instance: AiCorrector;
-  private globalClient: OpenAI;
-  private userManager: UserManager;
-  private globalApiKey: string;
-  private globalBaseURL: string;
-  private model: string;
   private cache: Map<string, { result: CorrectionResult; timestamp: number }> = new Map();
   private readonly CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24小时缓存
 
@@ -164,16 +158,7 @@ export class AiCorrector {
     },
   ];
 
-  private constructor() {
-    this.globalApiKey = process.env.DEEPSEEK_API_KEY || '';
-    this.globalBaseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
-    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-flash';
-    this.globalClient = new OpenAI({
-      apiKey: this.globalApiKey,
-      baseURL: this.globalBaseURL,
-    });
-    this.userManager = UserManager.getInstance();
-  }
+  private constructor() {}
 
   public static getInstance(): AiCorrector {
     if (!AiCorrector.instance) {
@@ -182,22 +167,12 @@ export class AiCorrector {
     return AiCorrector.instance;
   }
 
-  private getClientForUser(userId: string): { client: OpenAI; model: string } {
-    const userPlan = this.userManager.getUserPlan(userId);
-    const activeKey = userPlan.deepseekApiKey?.trim() || userPlan.inheritedApiKey?.trim();
-    if (activeKey) {
-      return {
-        client: new OpenAI({
-          apiKey: activeKey,
-          baseURL: this.globalBaseURL,
-        }),
-        model: userPlan.deepseekModel || this.model,
-      };
+  private setCachedResult(cacheKey: string, result: CorrectionResult): void {
+    if (!this.cache.has(cacheKey) && this.cache.size >= 500) {
+      const oldestKey = this.cache.keys().next().value;
+      if (oldestKey) this.cache.delete(oldestKey);
     }
-    return {
-      client: this.globalClient,
-      model: this.model,
-    };
+    this.cache.set(cacheKey, { result, timestamp: Date.now() });
   }
 
   /**
@@ -243,19 +218,21 @@ export class AiCorrector {
           isCorrected: true,
           explanation: rule.explanation,
         };
-        this.cache.set(cacheKey, { result, timestamp: Date.now() });
+        this.setCachedResult(cacheKey, result);
         return result;
       }
     }
 
     // 3. 判断是否需要大模型纠错：
-    // 若含有常见演员外号/角色/字词（如“荷兰弟”、“小李子”、“甜茶”、“阿汤哥”、“星爷”、“发哥”、“演的”、“主演”、“那个”、“谁演的”），
-    // 或者长度较长带有口语描述，调用大模型；若本身就是标准的 2-4 字常规词（如“肖申克的救赎”、“泰坦尼克号”），也可以快速校验
-    const hasColloquialClues = /(?:荷兰弟|小李子|甜茶|阿汤哥|星爷|发哥|大表姐|抖森|拔叔|锤哥|美队|桃总|寡姐|一美|法鲨|演的|主演|主演的|的电影|的剧|那个|错别字|电视剧|电影)/.test(cleaned);
+    // 若含有常见演员外号/角色/剧情线索或长度较长带有口语描述，才调用大模型；常规短片名直接直搜，避免额外延迟与额度消耗
+    const hasColloquialClues =
+      /(?:荷兰弟|小李子|甜茶|阿汤哥|星爷|发哥|大表姐|抖森|拔叔|锤哥|美队|桃总|寡姐|一美|法鲨|演的|主演|主角|男主|女主|讲的是|记不清|忘了叫|叫什么|哪部|什么电影|什么剧|那个|错别字|电视剧|电影|里有个|里面有)/i.test(
+        cleaned
+      );
+    const looksLikePlotOrLongDesc = cleaned.length > 12 || /[，,。！？?!、\s]/.test(cleaned);
 
-    const { client, model } = this.getClientForUser(userId);
-    if (!client.apiKey) {
-      // 无 API Key 时降级为原词
+    const { client, model, hasValidKey } = LlmClientFactory.getClientForUser(userId, 7000);
+    if (!hasValidKey || (!hasColloquialClues && !looksLikePlotOrLongDesc)) {
       const fallback: CorrectionResult = {
         originalKeyword: rawKeyword,
         correctedKeyword: cleaned,
@@ -263,6 +240,7 @@ export class AiCorrector {
         candidateKeywords: [cleaned],
         isCorrected: false,
       };
+      this.setCachedResult(cacheKey, fallback);
       return fallback;
     }
 
@@ -329,11 +307,7 @@ export class AiCorrector {
         explanation: parsed.explanation,
       };
 
-      if (this.cache.size >= 500) {
-        const oldestKey = this.cache.keys().next().value;
-        if (oldestKey) this.cache.delete(oldestKey);
-      }
-      this.cache.set(cacheKey, { result, timestamp: Date.now() });
+      this.setCachedResult(cacheKey, result);
       return result;
     } catch (err: any) {
       // 容错降级：如果识别失败，回退到原始已清理词

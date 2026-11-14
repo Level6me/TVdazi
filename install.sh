@@ -208,7 +208,7 @@ cat > .env << EOF
 # ==============================================================================
 DEEPSEEK_API_KEY=${USER_DEEPSEEK_KEY}
 DEEPSEEK_BASE_URL=https://api.deepseek.com
-DEEPSEEK_MODEL=deepseek-chat
+DEEPSEEK_MODEL=deepseek-flash
 
 QUARK_COOKIE=${USER_QUARK_COOKIE}
 DEFAULT_PAN=quark

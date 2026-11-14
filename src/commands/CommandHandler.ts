@@ -11,6 +11,9 @@ import { SchedulerService } from '../services/SchedulerService';
 import { CloudResource } from '../types';
 import axios from 'axios';
 import * as crypto from 'crypto';
+import * as fs from 'fs';
+import * as path from 'path';
+import QRCode from 'qrcode';
 
 export class CommandHandler {
   private searcher: ResourceSearcher;
@@ -444,6 +447,7 @@ export class CommandHandler {
       this.userManager.registerInvite(qrcode, inviterUserId, shareApiKey);
 
       // 后台异步启动扫码监听，扫码确认后自动加入轮询与继承 Key
+      let sentQrImage = false;
       try {
         const { WeixinBot } = require('../wechat/WeixinBot');
         const bot = WeixinBot.getInstance();
@@ -453,22 +457,38 @@ export class CommandHandler {
             console.log(`[CommandHandler] 好友 ${auth.userId} 扫码绑定成功，已继承配置并接入消息监听！`);
           }
         }).catch(() => {});
+
+        const qrTmpDir = path.resolve(__dirname, '../../data');
+        if (!fs.existsSync(qrTmpDir)) {
+          fs.mkdirSync(qrTmpDir, { recursive: true });
+        }
+        const qrPath = path.join(qrTmpDir, `invite_qr_${Date.now()}.png`);
+        await QRCode.toFile(qrPath, qrcodeUrl, { width: 360, margin: 2 });
+        try {
+          sentQrImage = await bot.sendImageMessage(inviterUserId, qrPath);
+        } finally {
+          try {
+            if (fs.existsSync(qrPath)) fs.unlinkSync(qrPath);
+          } catch {}
+        }
       } catch {}
 
       const modeTip = shareApiKey
-        ? '✅ 已开启共享（朋友扫码后将一起共用你的 AI 额度）'
-        : '🔒 独立模式（朋友扫码后使用其自己的独立额度）';
+        ? '✅ 已开启共享（朋友扫码绑定后，将共享你的 AI 额度）'
+        : '🔒 独立模式（朋友扫码绑定后使用其自己的独立额度）';
 
       return [
-        '🎉 好友邀请链接准备好啦！快发给朋友吧：',
+        '🎉 好友邀请授权已准备好啦！',
         '----------------------------------------',
         `📌 当前设定：${modeTip}`,
         '',
-        '👉 直接把下面这个官方授权链接转发给微信好友，好友在微信里点开即可一键绑定使用：',
-        qrcodeUrl,
+        sentQrImage
+          ? '📸 上方已为你生成专属微信授权二维码图片，直接长按转发给好友扫码即可绑定！'
+          : '👉 请把下面这个官方授权链接转发给好友，打开并微信扫码即可绑定：',
+        sentQrImage ? `🔗 备用链接：${qrcodeUrl}` : qrcodeUrl,
         '',
-        '💡 小贴士：也可以直接把我的个人名片推给好友，好友跟我聊天也能独立搜片转存哦！',
-        '⏱️ 该授权链接 5 分钟内有效。',
+        '💡 说明：该授权码用于好友绑定独立的微信助手通道并继承额度设置；仅转发名片无法触发额度继承。',
+        '⏱️ 该授权码 5 分钟内有效。',
       ].join('\n');
     } catch (err: any) {
       return `哎呀，向微信服务器申请邀请二维码时走神了：${err.message || '网络超时'}，请稍后再试一次哦！`;
@@ -675,10 +695,11 @@ export class CommandHandler {
       if (hotSession.type === 'tv' && category === '电影') {
         const tag = `${hotSession.tag || ''} ${subject.region || ''} ${(subject.types || []).join(' ')}`;
         if (tag.includes('韩')) category = '韩剧';
-        else if (tag.includes('美') || tag.includes('英')) category = '美剧';
-        else if (tag.includes('日') && !tag.includes('动画')) category = '日剧';
+        else if (tag.includes('美') || tag.includes('英') || tag.includes('欧美')) category = '美剧';
+        else if (tag.includes('日') && !tag.includes('动画') && !tag.includes('动漫')) category = '日剧';
         else if (tag.includes('动画') || tag.includes('动漫')) category = '动漫';
         else if (tag.includes('综艺') || tag.includes('真人秀')) category = '综艺';
+        else if (tag.includes('纪录')) category = '纪录片';
         else category = '国产剧';
       }
       return category;
@@ -839,17 +860,16 @@ export class CommandHandler {
     const userPlan = this.userManager.getUserPlan(userId);
     const preferredQuality = userPlan.preferences?.preferredQuality;
 
-    // 智能多级检索尝试：先检索主词，无结果时自动尝试备选词
+    // 智能多级检索尝试：先检索主词，无结果时最多顺延尝试 2 个备选词，防止冷门片名连续触发多轮全网检索拖死响应
     let res = await this.searcher.search({ keyword: searchWord, quality: preferredQuality });
     if ((!res.items || res.items.length === 0) && correction.candidateKeywords && correction.candidateKeywords.length > 0) {
-      for (const candidate of correction.candidateKeywords) {
-        if (candidate !== searchWord) {
-          const candidateRes = await this.searcher.search({ keyword: candidate, quality: preferredQuality });
-          if (candidateRes.items && candidateRes.items.length > 0) {
-            res = candidateRes;
-            searchWord = candidate;
-            break;
-          }
+      const candidatesToTry = correction.candidateKeywords.filter((c) => c && c !== searchWord).slice(0, 2);
+      for (const candidate of candidatesToTry) {
+        const candidateRes = await this.searcher.search({ keyword: candidate, quality: preferredQuality });
+        if (candidateRes.items && candidateRes.items.length > 0) {
+          res = candidateRes;
+          searchWord = candidate;
+          break;
         }
       }
     }
@@ -878,7 +898,7 @@ export class CommandHandler {
     tag: string = '热门',
     userId: string = 'default_user',
     page: number = 1,
-    existingSubjects?: any[],
+    _existingSubjects?: any[],
     query?: string,
     chatHistory?: any[]
   ): Promise<string> {

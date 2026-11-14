@@ -7,9 +7,9 @@ import { CommandHandler } from '../commands/CommandHandler';
 import { SessionManager } from '../services/SessionManager';
 import { UserManager } from '../services/UserManager';
 import { SchedulerService } from '../services/SchedulerService';
+import { LlmClientFactory } from '../utils/LlmClientFactory';
 
 export class DeepSeekAgent {
-  private globalClient: OpenAI;
   private searcher: ResourceSearcher;
   private quarkService: QuarkService;
   private doubanService: DoubanService;
@@ -17,22 +17,14 @@ export class DeepSeekAgent {
   private commandHandler: CommandHandler;
   private sessionManager: SessionManager;
   private userManager: UserManager;
-  private userHistories: Map<string, OpenAI.Chat.Completions.ChatCompletionMessageParam[]> = new Map();
-  private globalApiKey: string;
-  private globalBaseURL: string;
-  private defaultModel: string;
-  private visionModel: string;
+  private userHistories: Map<string, { messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[]; updatedAt: number }> = new Map();
+  private static readonly HISTORY_TTL_MS = 2 * 60 * 60 * 1000;
+  private overrideApiKey?: string;
+  private overrideModel?: string;
 
-  constructor(apiKey?: string, baseURL?: string, model?: string) {
-    this.globalApiKey = apiKey || process.env.DEEPSEEK_API_KEY || '';
-    this.globalBaseURL = baseURL || process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
-    this.defaultModel = model || process.env.DEEPSEEK_MODEL || 'deepseek-flash';
-    this.visionModel = process.env.DEEPSEEK_VISION_MODEL || 'deepseek-flash';
-
-    this.globalClient = new OpenAI({
-      apiKey: this.globalApiKey,
-      baseURL: this.globalBaseURL,
-    });
+  constructor(apiKey?: string, _baseURL?: string, model?: string) {
+    this.overrideApiKey = apiKey;
+    this.overrideModel = model;
 
     this.searcher = new ResourceSearcher();
     this.quarkService = new QuarkService();
@@ -43,34 +35,31 @@ export class DeepSeekAgent {
     this.userManager = UserManager.getInstance();
   }
 
-  private getClientForUser(userId: string): { client: OpenAI; model: string; isCustom: boolean } {
-    const userPlan = this.userManager.getUserPlan(userId);
-    const activeKey = userPlan.deepseekApiKey?.trim() || userPlan.inheritedApiKey?.trim();
-
-    if (activeKey) {
+  private getClientForUser(userId: string, timeoutMs: number = 12000) {
+    const resolved = LlmClientFactory.getClientForUser(userId, timeoutMs);
+    if (!resolved.isCustom && (this.overrideApiKey || this.overrideModel)) {
+      const apiKey = (this.overrideApiKey || LlmClientFactory.getGlobalApiKey()).trim();
       return {
         client: new OpenAI({
-          apiKey: activeKey,
-          baseURL: this.globalBaseURL,
+          apiKey: apiKey || 'dummy_key',
+          baseURL: LlmClientFactory.getGlobalBaseUrl(),
+          timeout: timeoutMs,
         }),
-        model: userPlan.deepseekModel || this.defaultModel,
-        isCustom: true,
+        model: this.overrideModel || resolved.model,
+        visionModel: resolved.visionModel,
+        hasValidKey: apiKey.length > 0,
+        isCustom: false,
       };
     }
-
-    return {
-      client: this.globalClient,
-      model: this.defaultModel,
-      isCustom: false,
-    };
+    return resolved;
   }
 
   /**
    * 使用 DeepSeek 多模态模型识别图片中的影视剧名或电影（增强模糊推理与角色关联）
    */
   async recognizeMovieFromImage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string | null> {
-    const { client } = this.getClientForUser(userId);
-    if (!client.apiKey) return null;
+    const { client, visionModel, hasValidKey } = this.getClientForUser(userId, 15000);
+    if (!hasValidKey) return null;
 
     try {
       let mimeType = 'image/jpeg';
@@ -84,7 +73,7 @@ export class DeepSeekAgent {
       const base64Data = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
 
       const res = await client.chat.completions.create({
-        model: this.visionModel,
+        model: visionModel,
         messages: [
           {
             role: 'system',
@@ -158,7 +147,14 @@ export class DeepSeekAgent {
     }
 
     if (chatHistory.length === 0) {
-      chatHistory = this.userHistories.get(userId) || [];
+      const histEntry = this.userHistories.get(userId);
+      if (histEntry) {
+        if (Date.now() - histEntry.updatedAt <= DeepSeekAgent.HISTORY_TTL_MS) {
+          chatHistory = histEntry.messages;
+        } else {
+          this.userHistories.delete(userId);
+        }
+      }
     }
 
     const appendUserHistory = (userText: string, assistantReply: string) => {
@@ -170,7 +166,11 @@ export class DeepSeekAgent {
           this.sessionManager.setLastMentionedTitle(userId, lastMatch);
         }
       }
-      let list = this.userHistories.get(userId) || [];
+      const existing = this.userHistories.get(userId);
+      let list =
+        existing && Date.now() - existing.updatedAt <= DeepSeekAgent.HISTORY_TTL_MS
+          ? [...existing.messages]
+          : [];
       list.push({ role: 'user', content: userText });
       list.push({ role: 'assistant', content: assistantReply });
       if (list.length > 12) {
@@ -180,7 +180,7 @@ export class DeepSeekAgent {
         const oldestUser = this.userHistories.keys().next().value;
         if (oldestUser) this.userHistories.delete(oldestUser);
       }
-      this.userHistories.set(userId, list);
+      this.userHistories.set(userId, { messages: list, updatedAt: Date.now() });
     };
 
     // 1. 优先匹配原版指令、快捷翻页或序号选择
@@ -206,6 +206,8 @@ export class DeepSeekAgent {
     const isHotFollowUp =
       this.sessionManager.getLastActiveType(userId) === 'hot' &&
       trimmed.length <= 18 &&
+      !SessionManager.isCancelCommand(trimmed) &&
+      !/(?:不要了|不用了|算了|取消|不看了|不选了)/.test(trimmed) &&
       /(?:^(?:不要|别推|不看|换|那|再来|有没?有)|(?:的呢|的吗|呢)$|(?:韩剧|美剧|英剧|日剧|国产剧|电影|悬疑|喜剧|科幻|爱情|古装|恐怖|治愈|高分|今年|去年|最近))/.test(
         trimmed
       ) &&
@@ -256,10 +258,10 @@ export class DeepSeekAgent {
     }
 
     // 3. 获取用户专属或共享的 DeepSeek 客户端
-    const { client, model } = this.getClientForUser(userId);
+    const { client, model, hasValidKey } = this.getClientForUser(userId, 12000);
 
-    if (!this.globalApiKey && (!client.apiKey || client.apiKey === '')) {
-      return this.fallbackDirectSearch(trimmed, userId);
+    if (!hasValidKey) {
+      return this.fallbackDirectSearch(trimmed, userId, false);
     }
 
     try {
@@ -530,16 +532,30 @@ export class DeepSeekAgent {
       appendUserHistory(trimmed, defaultReply);
       return defaultReply;
     } catch (err: any) {
-      const fallbackReply = await this.fallbackDirectSearch(trimmed, userId);
+      console.error('[DeepSeekAgent 调用异常]', err?.message || err);
+      const fallbackReply = await this.fallbackDirectSearch(trimmed, userId, true);
       appendUserHistory(trimmed, fallbackReply);
       return fallbackReply;
     }
   }
 
-  private async fallbackDirectSearch(text: string, userId: string = 'default_user'): Promise<string> {
-    const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '早', '晚上好', '在么'];
-    if (greetings.includes(text.toLowerCase())) {
-      return '嗨，我是你的网盘看片小助手！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
+  private async fallbackDirectSearch(
+    text: string,
+    userId: string = 'default_user',
+    isApiError: boolean = false
+  ): Promise<string> {
+    const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '早', '晚上好', '在么', '你是谁', '你叫什么'];
+    const lower = text.toLowerCase().replace(/[？?！!。，,\s]/g, '');
+    if (greetings.includes(lower)) {
+      return '嗨，我是你的网盘看片小助手 WeSaver！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
+    }
+
+    // 明显是日常聊天/疑问句且并非具体片名时，API 异常时友好提示而不是硬搜 50 个频道
+    const looksLikeChatQuestion =
+      text.length > 18 ||
+      /(?:为什么|怎么回事|怎么样|天气|吃什么|谢谢|哈哈|好的|知道了|没事|在干嘛|干什么)/.test(text);
+    if (isApiError && looksLikeChatQuestion) {
+      return '哎呀，AI 助手刚刚开了个小差 😅\n如果是想找影视资源，可以直接发送「搜 片名」（如：搜 庆余年），或者发送 /help 查看快捷指令！';
     }
 
     return await this.commandHandler.renderSearch(text, userId);

@@ -9,6 +9,7 @@ import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 import { downloadAndDecryptWechatImage } from './CdnDecrypt';
 import { uploadImageToWechatCdn } from './CdnUpload';
 import { SchedulerService } from '../services/SchedulerService';
+import { atomicWriteFileSync } from '../utils/FileUtils';
 
 const FIXED_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const BOT_TYPE = '3';
@@ -104,19 +105,21 @@ export class WeixinBot {
   public saveAuth(data: AuthData) {
     data.baseUrl = data.baseUrl.replace(/^https?:\/\/https?:\/\//, 'https://');
     this.authData = data;
-    fs.writeFileSync(AUTH_FILE, JSON.stringify(data, null, 2), 'utf-8');
+    atomicWriteFileSync(AUTH_FILE, JSON.stringify(data, null, 2));
 
     // 同时以 botId 保存到多账号凭证池
-    if (data.botId) {
+    if (data.botId && data.botId !== 'undefined') {
       const accountPath = path.join(ACCOUNTS_DIR, `${data.botId}.json`);
-      fs.writeFileSync(accountPath, JSON.stringify(data, null, 2), 'utf-8');
+      atomicWriteFileSync(accountPath, JSON.stringify(data, null, 2));
     }
   }
 
   public saveAccountAuth(data: AuthData) {
     data.baseUrl = data.baseUrl.replace(/^https?:\/\/https?:\/\//, 'https://');
-    const accountPath = path.join(ACCOUNTS_DIR, `${data.botId}.json`);
-    fs.writeFileSync(accountPath, JSON.stringify(data, null, 2), 'utf-8');
+    if (data.botId && data.botId !== 'undefined') {
+      const accountPath = path.join(ACCOUNTS_DIR, `${data.botId}.json`);
+      atomicWriteFileSync(accountPath, JSON.stringify(data, null, 2));
+    }
     // 如果主 auth 不存在，顺便设为主账号
     if (!this.authData) {
       this.saveAuth(data);
@@ -136,7 +139,7 @@ export class WeixinBot {
   private saveSyncBuf(buf: string) {
     this.syncBuf = buf;
     try {
-      fs.writeFileSync(SYNC_FILE, buf, 'utf-8');
+      atomicWriteFileSync(SYNC_FILE, buf);
     } catch {}
   }
 
@@ -196,10 +199,18 @@ export class WeixinBot {
   }
 
   private pushToFeishu(filePath: string) {
-    const pusher = '/home/ubuntu/codex-feishu-bot/send_to_feishu.py';
-    if (fs.existsSync(pusher)) {
-      exec(`python3 ${pusher} "${filePath}"`, () => {});
+    const pusher = (process.env.FEISHU_PUSH_SCRIPT || '').trim();
+    if (pusher && fs.existsSync(pusher)) {
+      exec(`python3 "${pusher}" "${filePath}"`, () => {});
     }
+  }
+
+  private maskSensitiveLog(text: string): string {
+    if (/^\/(?:set-quark|set-key|set-deepseek)\b/i.test(text.trim())) {
+      const cmd = text.trim().split(/\s+/)[0];
+      return `${cmd} [REDACTED]`;
+    }
+    return text.length > 120 ? `${text.slice(0, 120)}...` : text;
   }
 
   /**
@@ -358,7 +369,7 @@ export class WeixinBot {
             const userQueueKey = `${auth.botId}:${fromUser}`;
 
             if (userText) {
-              console.log(`[Weixin 收到消息] [Bot:${auth.botId}] 来自 ${fromUser}: ${userText}`);
+              console.log(`[Weixin 收到消息] [Bot:${auth.botId}] 来自 ${fromUser}: ${this.maskSensitiveLog(userText)}`);
 
               // 异步入队处理：不阻塞长轮询心跳，同时保证同一用户连发消息按顺序执行
               this.enqueueUserTask(userQueueKey, async () => {
@@ -406,9 +417,10 @@ export class WeixinBot {
   }
 
   private saveAccountSyncBuf(botId: string, buf: string) {
+    if (!botId || botId === 'undefined') return;
     const filePath = path.resolve(DATA_DIR, `weixin_sync_${botId}.dat`);
     try {
-      fs.writeFileSync(filePath, buf, 'utf-8');
+      atomicWriteFileSync(filePath, buf);
       if (this.authData?.botId === botId) {
         this.saveSyncBuf(buf);
       }
@@ -463,14 +475,11 @@ export class WeixinBot {
       updatedAt: Date.now(),
     };
     try {
-      fs.writeFileSync(USER_ROUTES_FILE, JSON.stringify(this.userRoutes, null, 2), 'utf-8');
+      atomicWriteFileSync(USER_ROUTES_FILE, JSON.stringify(this.userRoutes, null, 2));
     } catch {}
   }
 
-  /**
-   * 主动向指定微信用户推送文本消息（供定时荐片、追更入库、全网蹲守等后台任务调用）
-   */
-  public async pushMessageToUser(toUserId: string, text: string): Promise<boolean> {
+  private resolveAuthForUser(toUserId: string): { auth?: AuthData; contextToken?: string } {
     const accounts = this.getAllAccounts();
     const route = this.userRoutes[toUserId];
     let targetAuth: AuthData | undefined;
@@ -481,12 +490,20 @@ export class WeixinBot {
     if (!targetAuth) {
       targetAuth = accounts.find((a) => a.userId === toUserId) || this.authData || accounts[0];
     }
+    return { auth: targetAuth, contextToken: route?.contextToken };
+  }
+
+  /**
+   * 主动向指定微信用户推送文本消息（供定时荐片、追更入库、全网蹲守等后台任务调用）
+   */
+  public async pushMessageToUser(toUserId: string, text: string): Promise<boolean> {
+    const { auth: targetAuth, contextToken } = this.resolveAuthForUser(toUserId);
     if (!targetAuth) {
       console.error(`[WeixinBot 主动推送失败] 未找到可用的 Bot 账号凭证 (目标用户: ${toUserId})`);
       return false;
     }
 
-    await this.sendTextMessageWithAuth(targetAuth, toUserId, text, route?.contextToken);
+    await this.sendTextMessageWithAuth(targetAuth, toUserId, text, contextToken);
     return true;
   }
 
@@ -510,49 +527,22 @@ export class WeixinBot {
   }
 
   /**
-   * 处理用户发送的图片消息：自动 CDN 解密 -> DeepSeek 多模态识别影视片名 -> 自动全网检索活链
-   */
-  private async handleInboundImage(fromUser: string, imageItem: any, contextToken?: string) {
-    try {
-      const media = imageItem.image_item?.media;
-      const aeskeyHex = imageItem.image_item?.aeskey;
-
-      if (!media) {
-        await this.sendTextMessage(fromUser, '📸 收到图片啦，不过图片数据似乎有点损坏，再发一次试试看？', contextToken);
-        return;
-      }
-
-      const baseUrl = (this.authData?.baseUrl || FIXED_BASE_URL).replace(/^https?:\/\/https?:\/\//, 'https://');
-      const decryptedBuf = await downloadAndDecryptWechatImage(media, aeskeyHex, baseUrl);
-
-      if (!decryptedBuf || decryptedBuf.length === 0) {
-        await this.sendTextMessage(
-          fromUser,
-          '📸 收到图片啦！微信图片解密连接超时，建议直接把剧名发给我，我立马为你全网搜存！',
-          contextToken
-        );
-        return;
-      }
-
-      // 调用多模态大模型识别并全网搜片
-      const reply = await this.agent.handleImageMessage(decryptedBuf, fromUser);
-      await this.sendTextMessage(fromUser, reply, contextToken);
-    } catch (err: any) {
-      console.error('[handleInboundImage 异常]', err.message);
-      await this.sendTextMessage(fromUser, '📸 看图识片开小差了，直接发剧名或电影名给我，我来帮你搜！', contextToken);
-    }
-  }
-
-  /**
-   * 向微信用户下发原生图片消息
+   * 向微信用户下发原生图片消息（自动匹配多账号路由凭证）
    */
   async sendImageMessage(toUserId: string, imagePath: string, contextToken?: string): Promise<boolean> {
-    if (!this.authData) return false;
-    const baseUrl = (this.authData.baseUrl || FIXED_BASE_URL).replace(/^https?:\/\/https?:\/\//, 'https://');
-    const token = this.authData.botToken;
+    const resolved = this.resolveAuthForUser(toUserId);
+    const auth = resolved.auth;
+    if (!auth) {
+      console.error(`[Weixin 图片发送失败] 未找到可用的 Bot 账号凭证 (目标用户: ${toUserId})`);
+      return false;
+    }
+
+    const effectiveContextToken = contextToken || resolved.contextToken;
+    const baseUrl = (auth.baseUrl || FIXED_BASE_URL).replace(/^https?:\/\/https?:\/\//, 'https://');
+    const token = auth.botToken;
 
     try {
-      const uploadRes = await uploadImageToWechatCdn(imagePath, toUserId, this.authData, (t) => this.getCommonHeaders(t));
+      const uploadRes = await uploadImageToWechatCdn(imagePath, toUserId, auth, (t) => this.getCommonHeaders(t));
       if (!uploadRes) return false;
 
       const res = await axios.post(
@@ -576,7 +566,7 @@ export class WeixinBot {
                 },
               },
             ],
-            context_token: contextToken,
+            context_token: effectiveContextToken,
           },
           base_info: {
             channel_version: '2.4.10',
@@ -586,10 +576,10 @@ export class WeixinBot {
         { headers: this.getCommonHeaders(token), timeout: 15000 }
       );
 
-      console.log(`[Weixin 图片发送成功] 目标: ${toUserId}, msg_id: ${res.data?.message_id}`);
+      console.log(`[Weixin 图片发送成功] [Bot:${auth.botId}] 目标: ${toUserId}, msg_id: ${res.data?.message_id}`);
       return true;
     } catch (err: any) {
-      console.error(`[Weixin 图片发送失败]`, err.response?.data || err.message);
+      console.error(`[Weixin 图片发送失败] [Bot:${auth.botId}]`, err.response?.data || err.message);
       return false;
     }
   }
@@ -629,42 +619,62 @@ export class WeixinBot {
     }
   }
 
+  private splitMessageChunks(text: string, maxLen = 1800): string[] {
+    if (!text) return [''];
+    if (text.length <= maxLen) return [text];
+
+    const chunks: string[] = [];
+    let remaining = text;
+    while (remaining.length > maxLen) {
+      let splitIdx = remaining.lastIndexOf('\n', maxLen);
+      if (splitIdx < Math.floor(maxLen * 0.4)) {
+        splitIdx = maxLen;
+      }
+      chunks.push(remaining.slice(0, splitIdx).trimEnd());
+      remaining = remaining.slice(splitIdx).replace(/^\n+/, '');
+    }
+    if (remaining) {
+      chunks.push(remaining);
+    }
+    return chunks.length > 0 ? chunks : [''];
+  }
+
   public async sendTextMessageWithAuth(auth: AuthData, toUserId: string, text: string, contextToken?: string) {
     const baseUrl = (auth.baseUrl || FIXED_BASE_URL).replace(/^https?:\/\/https?:\/\//, 'https://');
     const token = auth.botToken;
+    const chunks = this.splitMessageChunks(text, 1800);
 
     try {
-      const res = await axios.post(
-        `${baseUrl}/ilink/bot/sendmessage`,
-        {
-          msg: {
-            to_user_id: toUserId,
-            client_id: `wesaver-${Date.now()}`,
-            message_type: 2, // BOT
-            message_state: 2, // FINISH
-            item_list: [
-              {
-                type: 1, // TEXT
-                text_item: { text },
-              },
-            ],
-            context_token: contextToken,
+      for (let i = 0; i < chunks.length; i++) {
+        const res = await axios.post(
+          `${baseUrl}/ilink/bot/sendmessage`,
+          {
+            msg: {
+              to_user_id: toUserId,
+              client_id: `wesaver-${Date.now()}-${i}`,
+              message_type: 2, // BOT
+              message_state: 2, // FINISH
+              item_list: [
+                {
+                  type: 1, // TEXT
+                  text_item: { text: chunks[i] },
+                },
+              ],
+              context_token: contextToken,
+            },
+            base_info: {
+              channel_version: '2.4.10',
+              bot_agent: 'OpenClaw',
+            },
           },
-          base_info: {
-            channel_version: '2.4.10',
-            bot_agent: 'OpenClaw',
-          },
-        },
-        { headers: this.getCommonHeaders(token), timeout: 15000 }
-      );
-      console.log(`[Weixin 回复成功] [Bot:${auth.botId}] 目标: ${toUserId}, msg_id: ${res.data?.message_id}`);
+          { headers: this.getCommonHeaders(token), timeout: 15000 }
+        );
+        console.log(
+          `[Weixin 回复成功] [Bot:${auth.botId}] 目标: ${toUserId} (${i + 1}/${chunks.length}), msg_id: ${res.data?.message_id}`
+        );
+      }
     } catch (err: any) {
       console.error(`[Weixin 回复失败] [Bot:${auth.botId}]`, err.response?.data || err.message);
     }
-  }
-
-  private async sendTextMessage(toUserId: string, text: string, contextToken?: string) {
-    if (!this.authData) return;
-    await this.sendTextMessageWithAuth(this.authData, toUserId, text, contextToken);
   }
 }

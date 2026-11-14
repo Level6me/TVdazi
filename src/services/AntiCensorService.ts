@@ -1,5 +1,5 @@
-import OpenAI from 'openai';
 import { UserManager } from './UserManager';
+import { LlmClientFactory } from '../utils/LlmClientFactory';
 
 export interface AntiCensorResult {
   isHarmonized: boolean;
@@ -10,11 +10,7 @@ export interface AntiCensorResult {
 
 export class AntiCensorService {
   private static instance: AntiCensorService;
-  private globalClient: OpenAI;
   private userManager: UserManager;
-  private globalApiKey: string;
-  private globalBaseURL: string;
-  private model: string;
   private cache: Map<string, { result: AntiCensorResult; timestamp: number }> = new Map();
   private readonly CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24小时内存缓存
 
@@ -66,15 +62,6 @@ export class AntiCensorService {
 
   private constructor() {
     this.userManager = UserManager.getInstance();
-    this.globalApiKey = process.env.DEEPSEEK_API_KEY || '';
-    this.globalBaseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-flash';
-
-    this.globalClient = new OpenAI({
-      apiKey: this.globalApiKey || 'dummy_key',
-      baseURL: this.globalBaseURL,
-      timeout: 4500,
-    });
   }
 
   public static getInstance(): AntiCensorService {
@@ -235,15 +222,9 @@ export class AntiCensorService {
     }
 
     // 尝试使用 DeepSeek AI 进行高精度语义与拼音/谐音还原
-    const userPlan = userId ? this.userManager.getUserPlan(userId) : null;
-    const apiKey = (userPlan?.deepseekApiKey?.trim() || userPlan?.inheritedApiKey?.trim() || this.globalApiKey || '').trim();
-    if (apiKey) {
+    const { client, model: activeModel, hasValidKey } = LlmClientFactory.getClientForUser(userId, 4500);
+    if (hasValidKey) {
       try {
-        const client =
-          apiKey !== this.globalApiKey
-            ? new OpenAI({ apiKey, baseURL: this.globalBaseURL, timeout: 4000 })
-            : this.globalClient;
-        const activeModel = userPlan?.deepseekModel || this.model;
 
       const systemPrompt = `你是一个专业的网盘资源防版权混淆与火星文名称还原专家。
 网盘资源分享者为了防止被版权自动检测删除，经常使用火星文、谐音同音字、拼音首字母前缀、拆字加点、生僻字来篡改影视剧名（例如把《今天是太阳雨》改成 "J 妗兲湜忲陽雨"、把《庆余年》改成 "Q 慶餘年"、把《甄嬛传》改成 "真环传"、把《白夜破晓》改成 "B 苩液岥晓"）。

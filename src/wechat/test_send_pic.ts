@@ -36,7 +36,11 @@ async function run() {
   }
 
   const authData = JSON.parse(fs.readFileSync(AUTH_FILE, 'utf-8'));
-  const targetUser = authData.userId || 'o9cq80_cGpKxGuRMyDiR3PWOIkvk@im.wechat';
+  const targetUser = (process.env.TEST_WECHAT_USER || authData.userId || '').trim();
+  if (!targetUser) {
+    console.error('缺少目标微信用户 ID，请通过环境变量 TEST_WECHAT_USER 指定或确保 authData.userId 存在');
+    process.exit(1);
+  }
   const baseUrl = (authData.baseUrl || 'https://ilinkai.weixin.qq.com').replace(/^https?:\/\/https?:\/\//, 'https://');
 
   console.log(`准备向微信用户 [${targetUser}] 发送测试图片...`);

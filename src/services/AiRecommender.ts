@@ -1,6 +1,6 @@
-import OpenAI from 'openai';
 import { UserManager } from './UserManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
+import { LlmClientFactory } from '../utils/LlmClientFactory';
 
 export type TimeScope = 'current_season' | 'this_year' | 'last_year' | 'custom_year' | 'classic' | 'mixed';
 
@@ -39,10 +39,6 @@ export class AiRecommender {
   private static instance: AiRecommender;
   private userManager: UserManager;
   private doubanService: DoubanService;
-  private globalApiKey: string;
-  private globalBaseURL: string;
-  private model: string;
-  private globalClient: OpenAI;
   // 记录每个用户近期已推荐过的片名，实现“换一部/换一批”与多轮推荐自动去重
   private recommendedHistory: Map<string, Set<string>> = new Map();
   // 记录每个用户上一次推荐的意图槽位，用于多轮追问（如“换一部悬疑的”、“不要古装的”）自动继承上下文
@@ -51,15 +47,6 @@ export class AiRecommender {
   private constructor() {
     this.userManager = UserManager.getInstance();
     this.doubanService = new DoubanService();
-    this.globalApiKey = process.env.DEEPSEEK_API_KEY || '';
-    this.globalBaseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-flash';
-
-    this.globalClient = new OpenAI({
-      apiKey: this.globalApiKey || 'dummy_key',
-      baseURL: this.globalBaseURL,
-      timeout: 12000,
-    });
   }
 
   public static getInstance(): AiRecommender {
@@ -69,34 +56,10 @@ export class AiRecommender {
     return AiRecommender.instance;
   }
 
-  private getClientForUser(userId?: string): { client: OpenAI; model: string; hasValidKey: boolean } {
-    if (userId) {
-      const plan = this.userManager.getUserPlan(userId);
-      const activeKey = plan.deepseekApiKey?.trim() || plan.inheritedApiKey?.trim();
-      if (activeKey) {
-        return {
-          client: new OpenAI({
-            apiKey: activeKey,
-            baseURL: this.globalBaseURL,
-            timeout: 12000,
-          }),
-          model: plan.deepseekModel || this.model,
-          hasValidKey: true,
-        };
-      }
-    }
-    return {
-      client: this.globalClient,
-      model: this.model,
-      hasValidKey: Boolean(this.globalApiKey && this.globalApiKey.trim().length > 0),
-    };
-  }
-
   private getCurrentYearAndMonth(): { year: number; month: number } {
     const now = new Date();
-    const year = now.getFullYear() >= 2026 ? now.getFullYear() : 2026;
-    const month = now.getMonth() + 1;
-    return { year, month };
+    const bjNow = new Date(now.getTime() + now.getTimezoneOffset() * 60000 + 8 * 3600000);
+    return { year: bjNow.getFullYear(), month: bjNow.getMonth() + 1 };
   }
 
   /**
@@ -589,53 +552,59 @@ export class AiRecommender {
     };
 
     let mergedMap = collectCandidates(false);
-    // 若用户多次点击“换一批”导致当前页候选均已在历史已推集合中，自动重置该用户的历史去重池并重新选取
+    // 若用户多次点击“换一批”导致当前页候选不足，保留最近 5 条防立刻复推并适度放宽去重（不粗暴清空全部历史）
     if (mergedMap.size < slots.count) {
       if (userId) {
-        this.recommendedHistory.get(userId)?.clear();
+        const hist = this.recommendedHistory.get(userId);
+        if (hist && hist.size > 5) {
+          const recentKeep = Array.from(hist).slice(-5);
+          this.recommendedHistory.set(userId, new Set(recentKeep));
+        }
       }
       mergedMap = collectCandidates(true);
     }
 
     const initialRanked = Array.from(mergedMap.values()).sort((a, b) => b.score - a.score);
-    const topPool = initialRanked.slice(0, 14);
+    const topPool = initialRanked.slice(0, 22);
 
-    // 并发拉取豆瓣单条目真实详情摘要 (release_year / types / actors / shortComment)
-    await Promise.allSettled(
-      topPool.map(async (entry) => {
-        const abs = await this.doubanService.getSubjectAbstract(entry.subject.id);
-        if (abs) {
-          if (abs.year) entry.subject.year = abs.year;
-          if (abs.rate && !entry.subject.rate) entry.subject.rate = abs.rate;
-          if (abs.types && abs.types.length > 0) entry.subject.types = abs.types;
-          if (abs.region) entry.subject.region = abs.region;
-          if (abs.actors) entry.subject.actors = abs.actors;
-          if (abs.directors) entry.subject.directors = abs.directors;
-          if (abs.episodesCount) entry.subject.episodesCount = abs.episodesCount;
-          if (abs.shortComment) entry.subject.shortComment = abs.shortComment;
-        }
-      })
-    );
+    // 限流并发拉取豆瓣单条目真实详情摘要 (release_year / types / actors / shortComment)，降低集中请求被限流概率
+    const ABS_BATCH = 6;
+    for (let i = 0; i < topPool.length; i += ABS_BATCH) {
+      const batch = topPool.slice(i, i + ABS_BATCH);
+      await Promise.allSettled(
+        batch.map(async (entry) => {
+          const abs = await this.doubanService.getSubjectAbstract(entry.subject.id);
+          if (abs) {
+            if (abs.year) entry.subject.year = abs.year;
+            if (abs.rate && !entry.subject.rate) entry.subject.rate = abs.rate;
+            if (abs.types && abs.types.length > 0) entry.subject.types = abs.types;
+            if (abs.region) entry.subject.region = abs.region;
+            if (abs.actors) entry.subject.actors = abs.actors;
+            if (abs.directors) entry.subject.directors = abs.directors;
+            if (abs.episodesCount) entry.subject.episodesCount = abs.episodesCount;
+            if (abs.shortComment) entry.subject.shortComment = abs.shortComment;
+          }
+        })
+      );
+    }
 
     // 基于真实详情元数据进行硬性过滤与精准加权
     const verified: Array<{ subject: DoubanSubject; score: number }> = [];
     for (const entry of topPool) {
       const sub = entry.subject;
-      const itemYear = sub.year ? parseInt(sub.year, 10) : currentYear;
+      const parsedYear = sub.year ? parseInt(sub.year, 10) : NaN;
       const types = sub.types || [];
 
-      // 1. 严格年份过滤：
-      // - 如果用户要求“这两个月/最近/今年”，绝不允许混入 2025 及以前的旧剧！
-      // - 如果用户指定了明确年份或年代区间 (custom_year)，严格过滤在该年份区间内！
-      if ((slots.timeScope === 'current_season' || slots.timeScope === 'this_year') && itemYear < currentYear) {
+      // 1. 严格年份过滤（仅在真实解析到年份时对当年/去年做硬性拦截，避免详情超时无 year 时误杀上游已按年份召回的候选）
+      if ((slots.timeScope === 'current_season' || slots.timeScope === 'this_year') && Number.isFinite(parsedYear) && parsedYear < currentYear) {
         continue;
       }
-      if (slots.timeScope === 'last_year' && itemYear !== currentYear - 1) {
+      if (slots.timeScope === 'last_year' && Number.isFinite(parsedYear) && parsedYear !== currentYear - 1) {
         continue;
       }
-      if (slots.timeScope === 'custom_year' && slots.yearRange && sub.year) {
+      if (slots.timeScope === 'custom_year' && slots.yearRange && Number.isFinite(parsedYear)) {
         const [yStart, yEnd] = slots.yearRange;
-        if (itemYear < yStart || itemYear > yEnd) {
+        if (parsedYear < yStart || parsedYear > yEnd) {
           continue;
         }
       }
@@ -704,7 +673,7 @@ export class AiRecommender {
     const { query, type = 'tv', tag = '热门', page = 1, userId, chatHistory = [] } = options;
     const { year: currentYear, month: currentMonth } = this.getCurrentYearAndMonth();
     const slots = this.parseIntentSlots(query || '', type, tag, userId);
-    const { client, model: activeModel, hasValidKey } = this.getClientForUser(userId);
+    const { client, model: activeModel, hasValidKey } = LlmClientFactory.getClientForUser(userId, 12000);
 
     // 实时召回并经豆瓣 subject_abstract 核验的候选池
     const candidates = await this.recallAndRankCandidates(slots, userId, page);
@@ -843,10 +812,9 @@ ${candidateContext}
               return {
                 id: title,
                 title,
-                rate: '8.2',
+                rate: '',
                 cover: '',
                 url: '',
-                year: String(currentYear),
               };
             })
           );

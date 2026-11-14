@@ -1,5 +1,7 @@
 #!/bin/bash
-cd /home/ubuntu/wesaver
-nohup node dist/login.js >> /home/ubuntu/wesaver/wechat_bot.log 2>&1 &
-echo $! > /home/ubuntu/wesaver/wechat_bot.pid
-echo "WeSaver WeChat Bot started with PID: $(cat /home/ubuntu/wesaver/wechat_bot.pid)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
+cd "$PROJECT_DIR" || exit 1
+nohup node dist/login.js >> "${PROJECT_DIR}/wechat_bot.log" 2>&1 &
+echo $! > "${PROJECT_DIR}/wechat_bot.pid"
+echo "WeSaver WeChat Bot started with PID: $(cat "${PROJECT_DIR}/wechat_bot.pid")"

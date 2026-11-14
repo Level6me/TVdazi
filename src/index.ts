@@ -43,13 +43,15 @@ export async function bootstrap() {
     // 跨域处理
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
       return;
     }
+
+    const escapeXmlCdata = (val: string) => val.replace(/\]\]>/g, ']]]]><![CDATA[>');
 
     // 1. 健康检测
     if (req.method === 'GET' && pathname === '/health') {
@@ -74,9 +76,24 @@ export async function bootstrap() {
 
     // 3. 消息接收网关 (支持 JSON 与 微信官方原生 XML)
     if (req.method === 'POST' && (pathname === '/api/chat' || pathname === '/webhook/wechat' || pathname === '/api/wechat')) {
+      const MAX_BODY_BYTES = 1024 * 1024;
       let body = '';
-      req.on('data', (chunk) => { body += chunk; });
+      let bodySize = 0;
+      let aborted = false;
+      req.on('data', (chunk) => {
+        if (aborted) return;
+        bodySize += chunk.length;
+        if (bodySize > MAX_BODY_BYTES) {
+          aborted = true;
+          res.writeHead(413, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ error: 'Payload Too Large' }));
+          req.destroy();
+          return;
+        }
+        body += chunk;
+      });
       req.on('end', async () => {
+        if (aborted) return;
         try {
           const raw = (body || '').trim();
 
@@ -96,8 +113,8 @@ export async function bootstrap() {
             if (msgType !== 'text' || !userText) {
               const xmlReply = `
 <xml>
-  <ToUserName><![CDATA[${fromUser}]]></ToUserName>
-  <FromUserName><![CDATA[${toUser}]]></FromUserName>
+  <ToUserName><![CDATA[${escapeXmlCdata(fromUser)}]]></ToUserName>
+  <FromUserName><![CDATA[${escapeXmlCdata(toUser)}]]></FromUserName>
   <CreateTime>${Math.floor(Date.now() / 1000)}</CreateTime>
   <MsgType><![CDATA[text]]></MsgType>
   <Content><![CDATA[你好！请直接发送想找的电影或电视剧名（如“功夫”、“庆余年”），或者发送 /help 查看所有功能。]]></Content>
@@ -110,18 +127,31 @@ export async function bootstrap() {
             console.log(`[WeSaver 微信XML消息] 来自 ${fromUser}: ${userText}`);
             let reply = '';
             const cached = xmlPendingCache.get(fromUser);
-            if (cached && cached.reply && Date.now() - cached.timestamp < 120000 && (userText === cached.query || userText === '继续' || userText === '查看结果')) {
+            const isFollowPull =
+              cached &&
+              Date.now() - cached.timestamp < 120000 &&
+              (userText === cached.query || userText === '继续' || userText === '查看结果');
+
+            if (isFollowPull && cached.reply) {
               reply = cached.reply;
               xmlPendingCache.delete(fromUser);
             } else {
-              const chatPromise = agent.chat(userText, [], fromUser).then((resText) => {
-                const entry = xmlPendingCache.get(fromUser);
-                if (entry && entry.query === userText) {
-                  entry.reply = resText;
-                }
-                return resText;
-              });
-              xmlPendingCache.set(fromUser, { query: userText, promise: chatPromise, timestamp: Date.now() });
+              // 若后台同一检索仍在执行中，继续等待同一 promise，避免重复发起新一轮检索陷入超时死循环
+              const activeQuery = isFollowPull && cached ? cached.query : userText;
+              const chatPromise =
+                isFollowPull && cached?.promise
+                  ? cached.promise
+                  : agent.chat(userText, [], fromUser).then((resText) => {
+                      const entry = xmlPendingCache.get(fromUser);
+                      if (entry && entry.query === activeQuery) {
+                        entry.reply = resText;
+                      }
+                      return resText;
+                    });
+
+              if (!isFollowPull || !cached?.promise) {
+                xmlPendingCache.set(fromUser, { query: userText, promise: chatPromise, timestamp: Date.now() });
+              }
 
               // 微信公众号被动回复严格限制 5 秒超时，在 4.4 秒内完成则直接返回，否则转后台缓存引导二次拉取
               const timeoutSentinel = '__WECHAT_XML_TIMEOUT__';
@@ -131,7 +161,7 @@ export async function bootstrap() {
               ]);
 
               if (raceRes === timeoutSentinel) {
-                reply = `🔍 正在全网 50+ 频道为您深度检索「${userText}」...\n⏳ 请过 3 秒后回复「继续」或再次发送「${userText}」立即获取结果！`;
+                reply = `🔍 正在全网 50+ 频道为您深度检索「${activeQuery}」...\n⏳ 请过 3 秒后回复「继续」或再次发送「${activeQuery}」立即获取结果！`;
               } else {
                 xmlPendingCache.delete(fromUser);
                 reply = raceRes;
@@ -140,11 +170,11 @@ export async function bootstrap() {
 
             const xmlReply = `
 <xml>
-  <ToUserName><![CDATA[${fromUser}]]></ToUserName>
-  <FromUserName><![CDATA[${toUser}]]></FromUserName>
+  <ToUserName><![CDATA[${escapeXmlCdata(fromUser)}]]></ToUserName>
+  <FromUserName><![CDATA[${escapeXmlCdata(toUser)}]]></FromUserName>
   <CreateTime>${Math.floor(Date.now() / 1000)}</CreateTime>
   <MsgType><![CDATA[text]]></MsgType>
-  <Content><![CDATA[${reply}]]></Content>
+  <Content><![CDATA[${escapeXmlCdata(reply)}]]></Content>
 </xml>`.trim();
             res.writeHead(200, { 'Content-Type': 'application/xml; charset=utf-8' });
             res.end(xmlReply);
@@ -152,6 +182,17 @@ export async function bootstrap() {
           }
 
           // 场景 B: JSON 格式 (适用于 OpenClaw、Wechaty、Gewechat、自建反向代理)
+          const requiredToken = (process.env.API_AUTH_TOKEN || '').trim();
+          if (requiredToken) {
+            const authHeader = String(req.headers.authorization || '');
+            const provided = authHeader.startsWith('Bearer ') ? authHeader.slice(7).trim() : authHeader.trim();
+            if (provided !== requiredToken) {
+              res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
+              res.end(JSON.stringify({ error: 'Unauthorized' }));
+              return;
+            }
+          }
+
           const data = JSON.parse(raw || '{}');
           const text = data.message || data.content || data.text || '';
           const userId = data.userId || data.fromUser || data.sender || data.openid || 'default_user';
@@ -162,7 +203,10 @@ export async function bootstrap() {
             return;
           }
 
-          console.log(`[WeSaver JSON消息] 用户 ${userId}: ${text}`);
+          const logPreview = /^\/(?:set-quark|set-key|set-deepseek)\b/i.test(String(text).trim())
+            ? `${String(text).trim().split(/\s+/)[0]} [REDACTED]`
+            : text;
+          console.log(`[WeSaver JSON消息] 用户 ${userId}: ${logPreview}`);
           const reply = await agent.chat(text, [], userId);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({

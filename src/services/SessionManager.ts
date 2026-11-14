@@ -21,6 +21,7 @@ export interface HotSession {
 
 export class SessionManager {
   private static instance: SessionManager;
+  private static readonly SESSION_TTL_MS = 30 * 60 * 1000; // 30分钟会话超时，避免隔天回复数字误转存
   private searchSessions: Map<string, SearchSession> = new Map();
   private hotSessions: Map<string, HotSession> = new Map();
   private lastActiveSessionType: Map<string, 'search' | 'hot'> = new Map();
@@ -31,6 +32,10 @@ export class SessionManager {
       SessionManager.instance = new SessionManager();
     }
     return SessionManager.instance;
+  }
+
+  private isExpired(updatedAt: number): boolean {
+    return Date.now() - updatedAt > SessionManager.SESSION_TTL_MS;
   }
 
   private setBounded<T>(map: Map<string, T>, key: string, value: T, limit: number = 300): void {
@@ -55,7 +60,16 @@ export class SessionManager {
   }
 
   getSearch(userId: string): SearchSession | undefined {
-    return this.searchSessions.get(userId);
+    const sess = this.searchSessions.get(userId);
+    if (!sess) return undefined;
+    if (this.isExpired(sess.updatedAt)) {
+      this.searchSessions.delete(userId);
+      if (this.lastActiveSessionType.get(userId) === 'search') {
+        this.lastActiveSessionType.delete(userId);
+      }
+      return undefined;
+    }
+    return sess;
   }
 
   setHot(
@@ -82,11 +96,27 @@ export class SessionManager {
   }
 
   getHot(userId: string): HotSession | undefined {
-    return this.hotSessions.get(userId);
+    const sess = this.hotSessions.get(userId);
+    if (!sess) return undefined;
+    if (this.isExpired(sess.updatedAt)) {
+      this.hotSessions.delete(userId);
+      if (this.lastActiveSessionType.get(userId) === 'hot') {
+        this.lastActiveSessionType.delete(userId);
+      }
+      return undefined;
+    }
+    return sess;
   }
 
   getLastActiveType(userId: string): 'search' | 'hot' | null {
-    return this.lastActiveSessionType.get(userId) || null;
+    const active = this.lastActiveSessionType.get(userId) || null;
+    if (active === 'search' && !this.getSearch(userId)) {
+      return this.getHot(userId) ? 'hot' : null;
+    }
+    if (active === 'hot' && !this.getHot(userId)) {
+      return this.getSearch(userId) ? 'search' : null;
+    }
+    return active;
   }
 
   /**
@@ -95,7 +125,10 @@ export class SessionManager {
   setLastMentionedTitle(userId: string, title: string): void {
     const clean = title.replace(/[《》\s]/g, '').trim();
     if (!clean) return;
-    this.lastMentionedTitles.set(userId, { title: title.replace(/[《》]/g, '').trim(), updatedAt: Date.now() });
+    this.setBounded(this.lastMentionedTitles, userId, {
+      title: title.replace(/[《》]/g, '').trim(),
+      updatedAt: Date.now(),
+    });
   }
 
   /**
@@ -103,16 +136,16 @@ export class SessionManager {
    */
   getRecentTargetTitle(userId: string): string | undefined {
     const candidates: Array<{ title: string; updatedAt: number }> = [];
-    const searchSess = this.searchSessions.get(userId);
+    const searchSess = this.getSearch(userId);
     if (searchSess?.keyword) {
       candidates.push({ title: searchSess.keyword, updatedAt: searchSess.updatedAt });
     }
-    const hotSess = this.hotSessions.get(userId);
+    const hotSess = this.getHot(userId);
     if (hotSess?.items && hotSess.items.length > 0) {
       candidates.push({ title: hotSess.items[0].title, updatedAt: hotSess.updatedAt });
     }
     const mentioned = this.lastMentionedTitles.get(userId);
-    if (mentioned?.title) {
+    if (mentioned?.title && !this.isExpired(mentioned.updatedAt)) {
       candidates.push(mentioned);
     }
     if (candidates.length === 0) return undefined;

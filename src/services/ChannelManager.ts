@@ -1,5 +1,5 @@
-import * as fs from 'fs';
 import * as path from 'path';
+import { upsertEnvVar } from '../utils/FileUtils';
 
 export interface ChannelItem {
   name: string;
@@ -154,17 +154,7 @@ export class ChannelManager {
 
   private persistEnv(key: string, value: string) {
     try {
-      let content = '';
-      if (fs.existsSync(this.envPath)) {
-        content = fs.readFileSync(this.envPath, 'utf8');
-      }
-      const regex = new RegExp(`^${key}=.*`, 'm');
-      if (regex.test(content)) {
-        content = content.replace(regex, `${key}=${value}`);
-      } else {
-        content += `\n${key}=${value}\n`;
-      }
-      fs.writeFileSync(this.envPath, content, 'utf8');
+      upsertEnvVar(this.envPath, key, value);
     } catch (err: any) {
       console.error('[ChannelManager] 持久化 .env 失败:', err.message);
     }
