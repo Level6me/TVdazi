@@ -40,7 +40,12 @@ export class ResourceSearcher {
    * 计算匹配相关度得分：
    * 标题完全包含关键词 > 帖子正文包含关键词 > 模糊匹配
    */
-  private calculateScore(item: CloudResource, keyword: string, preferredQuality?: string): number {
+  private calculateScore(
+    item: CloudResource,
+    keyword: string,
+    preferredQuality?: string,
+    aliasKeywords?: string[]
+  ): number {
     const kw = keyword.toLowerCase().trim();
     const title = (item.title || '').toLowerCase();
     const raw = (item.rawText || '').toLowerCase();
@@ -49,17 +54,29 @@ export class ResourceSearcher {
     let score = 0;
 
     // 1. 标题完全包含完整关键词（最优先）
-    if (title.includes(kw)) {
+    if (kw && title.includes(kw)) {
       score += 1000;
-      // 标题越短且纯净，权重更高
       score += Math.max(0, 100 - title.length);
+    } else if (aliasKeywords && aliasKeywords.length > 0) {
+      const matchedAlias = aliasKeywords.find((a) => {
+        const ak = a.toLowerCase().trim();
+        return ak.length >= 2 && title.includes(ak);
+      });
+      if (matchedAlias) {
+        score += 750;
+        score += Math.max(0, 80 - title.length);
+      }
     }
 
-    // 2. 帖子正文前 100 字符内包含完整关键词
-    if (raw.slice(0, 100).includes(kw)) {
+    // 2. 帖子正文前 100 字符内包含完整关键词或别名
+    if (kw && raw.slice(0, 100).includes(kw)) {
       score += 300;
-    } else if (raw.includes(kw)) {
+    } else if (kw && raw.includes(kw)) {
       score += 100;
+    } else if (aliasKeywords && aliasKeywords.some((a) => a.trim().length >= 2 && raw.slice(0, 100).includes(a.toLowerCase().trim()))) {
+      score += 200;
+    } else if (aliasKeywords && aliasKeywords.some((a) => a.trim().length >= 2 && raw.includes(a.toLowerCase().trim()))) {
+      score += 70;
     }
 
     // 3. 夸克网盘优先加分（支持一键转存）
@@ -93,31 +110,23 @@ export class ResourceSearcher {
       .replace(/[《》〈〉「」『』【】\[\]()（）:：·.,，。！!？?、\s\-_\/\\]/g, '');
   }
 
-  /**
-   * 判断检索到的网盘资源是否与搜索词真实相关（拒绝完全无关的频道最新消息充数）
-   */
-  private isRelevantItem(item: CloudResource, keyword: string): boolean {
-    const kwNorm = this.normalizeForMatch(keyword);
-    if (!kwNorm) return true;
-
-    const hayRaw = `${item.title || ''} ${item.rawText || ''}`.toLowerCase();
-    const hayNorm = this.normalizeForMatch(hayRaw);
+  private isSingleTermRelevant(hayNorm: string, term: string): boolean {
+    const kwNorm = this.normalizeForMatch(term);
+    if (!kwNorm || kwNorm.length < 2) return false;
 
     if (hayNorm.includes(kwNorm)) {
       return true;
     }
 
-    // 支持空格分词的多关键词组合（如 "周星驰 功夫"、"沙丘 4K"）
-    const tokens = keyword
+    const tokens = term
       .toLowerCase()
       .split(/\s+/)
       .map((t) => this.normalizeForMatch(t))
-      .filter(Boolean);
+      .filter((t) => t.length >= 2);
     if (tokens.length > 1 && tokens.every((t) => hayNorm.includes(t))) {
       return true;
     }
 
-    // 若关键词带有季数/画质后缀（如 "庆余年第二季"、"流浪地球2 4K"），剥离后缀检查核心主片名
     const coreKw = kwNorm
       .replace(/(?:第[一二三四五六七八九十\d]+[季部]|season\d+|s\d+|4k|2160p|1080p|国语|中字|完结|全集|电影|电视剧|网剧|动漫)+$/g, '')
       .trim();
@@ -126,6 +135,67 @@ export class ResourceSearcher {
     }
 
     return false;
+  }
+
+  /**
+   * 判断检索到的网盘资源是否与搜索词或其跨语种别名真实相关
+   */
+  private isRelevantItem(item: CloudResource, keyword: string, aliasKeywords?: string[]): boolean {
+    if (!this.normalizeForMatch(keyword)) return true;
+
+    const hayRaw = `${item.title || ''} ${item.rawText || ''}`.toLowerCase();
+    const hayNorm = this.normalizeForMatch(hayRaw);
+
+    if (this.isSingleTermRelevant(hayNorm, keyword)) {
+      return true;
+    }
+
+    if (aliasKeywords && aliasKeywords.length > 0) {
+      for (const alias of aliasKeywords) {
+        if (this.isSingleTermRelevant(hayNorm, alias)) {
+          return true;
+        }
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * 合并多标题/多别名检索结果，按 shareUrl 去重并重新按主片名优先评分排序
+   */
+  public mergeResults(
+    base: SearchResult,
+    extras: SearchResult[],
+    primaryKeyword: string,
+    preferredQuality?: string,
+    aliasKeywords?: string[],
+    maxResults: number = 60
+  ): SearchResult {
+    const seen = new Set<string>();
+    const merged: CloudResource[] = [];
+
+    for (const batch of [base, ...extras]) {
+      for (const item of batch.items || []) {
+        if (!item.shareUrl || seen.has(item.shareUrl)) continue;
+        seen.add(item.shareUrl);
+        merged.push(item);
+      }
+    }
+
+    merged.sort((a, b) => {
+      const scoreA = this.calculateScore(a, primaryKeyword, preferredQuality, aliasKeywords);
+      const scoreB = this.calculateScore(b, primaryKeyword, preferredQuality, aliasKeywords);
+      return scoreB - scoreA;
+    });
+
+    const totalDuration = [base, ...extras].reduce((acc, r) => acc + (r.durationMs || 0), 0);
+    return {
+      keyword: primaryKeyword,
+      items: merged.slice(0, maxResults),
+      totalFound: merged.length,
+      durationMs: totalDuration,
+    };
   }
 
   /**
@@ -254,12 +324,12 @@ export class ResourceSearcher {
       await Promise.allSettled(batch.map((ch) => fetchChannel(ch)));
     }
 
-    // 严格过滤掉与搜索词完全无关的频道干扰项（绝不把无关结果降级充数返回）
-    const pool = results.filter((item) => this.isRelevantItem(item, keyword));
+    // 严格过滤掉与搜索词及其已知别名完全无关的频道干扰项
+    const pool = results.filter((item) => this.isRelevantItem(item, keyword, options.aliasKeywords));
 
     pool.sort((a, b) => {
-      const scoreA = this.calculateScore(a, keyword, options.quality);
-      const scoreB = this.calculateScore(b, keyword, options.quality);
+      const scoreA = this.calculateScore(a, keyword, options.quality, options.aliasKeywords);
+      const scoreB = this.calculateScore(b, keyword, options.quality, options.aliasKeywords);
       return scoreB - scoreA;
     });
 

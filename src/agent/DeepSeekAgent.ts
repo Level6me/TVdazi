@@ -8,6 +8,16 @@ import { SessionManager } from '../services/SessionManager';
 import { UserManager } from '../services/UserManager';
 import { SchedulerService } from '../services/SchedulerService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
+import { MetadataResolver } from '../services/MetadataResolver';
+
+export interface RecognizedImageResult {
+  standardTitle: string;
+  originalTitle?: string;
+  rawGuessTitle?: string;
+  aliases: string[];
+  year?: string;
+  source: 'tmdb' | 'bangumi' | 'douban' | 'llm' | 'raw';
+}
 
 export class DeepSeekAgent {
   private searcher: ResourceSearcher;
@@ -55,9 +65,12 @@ export class DeepSeekAgent {
   }
 
   /**
-   * 使用 DeepSeek 多模态模型识别图片中的影视剧名或电影（增强模糊推理与角色关联）
+   * 使用 DeepSeek 多模态模型提取海报/剧照原名、官方中文名与线索，并通过 MetadataResolver 对齐官方译名（支持 TMDB 方案 B / 无 Key 方案 A）
    */
-  async recognizeMovieFromImage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string | null> {
+  async recognizeMovieDetailFromImage(
+    imageBuffer: Buffer,
+    userId: string = 'default_user'
+  ): Promise<RecognizedImageResult | null> {
     const { client, visionModel, hasValidKey } = this.getClientForUser(userId, 25000);
     if (!hasValidKey) {
       console.warn('[DeepSeek 识图跳过] 未检测到有效的 DEEPSEEK_API_KEY');
@@ -80,48 +93,100 @@ export class DeepSeekAgent {
         messages: [
           {
             role: 'system',
-            content: `你是一个精通古今中外全部电影、电视剧、动漫、综艺、纪录片的影视百科专家。
-用户会发送剧照、海报、剧集截图、台词字幕截图、演员同框画面、动漫截图甚至略微模糊的翻拍/裁剪片段。
-任务要求：
-1. 仔细观察图片中的人物面孔（明星/演员特征）、角色造型装扮、场景构图、UI/水印、台词或画面任何文字线索；
-2. 即使没有直接出现剧名文字，也要根据演员组合、经典服化道或名场面大胆推断最可能对应的那一部作品中文标准片名；
-3. 输出格式要求：只输出【最可能的一部作品中文标准片名】，不要附加标点、书名号、演员名字或解释（例如直接输出：功夫之王、庆余年、繁花、海贼王）；
-4. 只有在图片完全属于纯风景、纯美食、日常证件/聊天记录等与任何影视动漫毫不相关的内容时，才输出「NONE」。`,
+            content: `你是一个精通古今中外电影、电视剧、动漫、综艺、纪录片的「多语种海报识片专家」。
+用户会发送剧照、外语海报、台词截图、演员同框画面或动漫截图。
+请严格输出合法 JSON 对象：
+{
+  "isMovieRelated": true,
+  "originalTitle": "海报或画面上出现的原始语言标题（如日文、韩文、英文原文，原样抄录，绝不翻译；无文字则留空）",
+  "officialChineseTitle": "中国大陆豆瓣或主流字幕组通用的正式官方中文片名（不带书名号；严禁按外语单词字面意思生硬直译！）",
+  "alternateTitles": ["常见港台译名或民间别名（最多2个）"],
+  "year": "画面或知识库对应的上映年份（4位数字，无则留空）",
+  "clues": "认出的演员、导演、角色名或剧情题材线索（用于二次反查中文正式片名）"
+}
+核心要求：
+1. 若海报是日文/韩文/英文，必须先把原语文字一字不差填到 originalTitle；
+2. officialChineseTitle 必须尽量对应国内正式中文片名，切忌自己字面直译（例如日文海报切勿按字面直译成非官方中文词）；
+3. 若画面完全是纯风景、美食、日常生活照等与影视动漫无关的图片，设 isMovieRelated 为 false。`,
           },
           {
             role: 'user',
             content: [
-              { type: 'text', text: '请识别或根据画面/演员/台词推断这部影视动漫作品的中文片名，直接给出片名：' },
+              { type: 'text', text: '请识别图中影视动漫作品的原语言标题、官方中文片名及线索，并严格返回 JSON：' },
               { type: 'image_url', image_url: { url: base64Data } },
             ],
           },
         ],
-        temperature: 0.2,
+        response_format: { type: 'json_object' },
+        temperature: 0.15,
       });
 
-      const reply = res.choices[0]?.message?.content?.trim() || '';
-      console.log(`[DeepSeek 识图] model=${visionModel}, bytes=${imageBuffer.length}, mime=${mimeType}, rawReply=${reply.slice(0, 80)}`);
+      const rawReply = (res.choices[0]?.message?.content || '').trim();
+      console.log(
+        `[DeepSeek 识图] model=${visionModel}, bytes=${imageBuffer.length}, mime=${mimeType}, rawReply=${rawReply.slice(0, 140)}`
+      );
 
-      if (!reply || reply.toUpperCase() === 'NONE') {
+      if (!rawReply || rawReply.toUpperCase() === 'NONE') {
         return null;
       }
 
-      // 若模型附带了《片名》说明句，优先提取首个书名号内的片名
-      const quotedMatch = reply.match(/《([^》\n]{1,40})》/);
-      if (quotedMatch && quotedMatch[1]?.trim()) {
-        return quotedMatch[1].trim();
+      let originalTitle = '';
+      let officialChineseTitle = '';
+      let alternateTitles: string[] = [];
+      let year = '';
+      let clues = '';
+
+      const jsonCleaned = rawReply.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
+      try {
+        const parsed = JSON.parse(jsonCleaned);
+        if (parsed.isMovieRelated === false) {
+          return null;
+        }
+        originalTitle = String(parsed.originalTitle || '').trim();
+        officialChineseTitle = String(parsed.officialChineseTitle || parsed.chineseTitle || '').trim();
+        alternateTitles = Array.isArray(parsed.alternateTitles)
+          ? parsed.alternateTitles.map((x: any) => String(x || '').trim()).filter(Boolean)
+          : [];
+        year = String(parsed.year || '').trim();
+        clues = String(parsed.clues || '').trim();
+      } catch {
+        // 兼容非 JSON 纯文本回复降级提取
+        if (rawReply.includes('无法识别') || rawReply.includes('无法查看') || rawReply.includes('无法确定')) {
+          return null;
+        }
+        const quotedMatch = rawReply.match(/《([^》\n]{1,40})》/);
+        officialChineseTitle = (quotedMatch?.[1] || rawReply.split(/\r?\n/)[0] || '')
+          .replace(/^(?:片名|作品名|电影|电视剧|动漫)[：:\s]*/i, '')
+          .replace(/[《》""''「」。，,!！?？]/g, '')
+          .trim();
       }
 
-      if (reply.includes('无法识别') || reply.includes('无法查看') || reply.includes('无法确定')) {
+      if (!originalTitle && !officialChineseTitle) {
         return null;
       }
 
-      const firstLine = reply.split(/\r?\n/)[0] || '';
-      const cleanTitle = firstLine
-        .replace(/^(?:片名|作品名|电影|电视剧|动漫)[：:\s]*/i, '')
-        .replace(/[《》""''「」。，,!！?？]/g, '')
-        .trim();
-      return cleanTitle || null;
+      // 通过 MetadataResolver 自动执行：有 TMDB_API_KEY 走方案 B，无 Key 走方案 A（豆瓣/Bangumi + 大模型反直译实体对齐）
+      const resolved = await MetadataResolver.getInstance().resolveMedia({
+        originalTitle: originalTitle || undefined,
+        guessTitle: officialChineseTitle || undefined,
+        alternateTitles,
+        year: year || undefined,
+        clues: clues || undefined,
+        userId,
+        forceLlm: Boolean(originalTitle),
+      });
+
+      const finalTitle = resolved.standardTitle || officialChineseTitle || originalTitle;
+      if (!finalTitle) return null;
+
+      return {
+        standardTitle: finalTitle,
+        originalTitle: resolved.originalTitle || originalTitle || undefined,
+        rawGuessTitle: officialChineseTitle || undefined,
+        aliases: resolved.aliases,
+        year: resolved.year || year || undefined,
+        source: resolved.source,
+      };
     } catch (err: any) {
       console.error(`[DeepSeek 多模态识别异常] model=${visionModel}:`, err.message);
       return null;
@@ -129,17 +194,37 @@ export class DeepSeekAgent {
   }
 
   /**
-   * 处理用户发送的图片（识图搜剧闭环，呈现精简排版）
+   * 兼容接口：返回识别对齐后的中文片名
+   */
+  async recognizeMovieFromImage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string | null> {
+    const detail = await this.recognizeMovieDetailFromImage(imageBuffer, userId);
+    return detail?.standardTitle || null;
+  }
+
+  /**
+   * 处理用户发送的图片（识图 -> 官方译名对齐 -> 多别名搜剧闭环）
    */
   async handleImageMessage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string> {
-    const detectedTitle = await this.recognizeMovieFromImage(imageBuffer, userId);
+    const detail = await this.recognizeMovieDetailFromImage(imageBuffer, userId);
 
-    if (detectedTitle) {
-      const searchResultText = await this.commandHandler.renderSearch(detectedTitle, userId);
-      return [
-        `📸 收到图片！AI 识别出影视片名：【《${detectedTitle}》】`,
-        searchResultText,
-      ].join('\n');
+    if (detail) {
+      const searchResultText = await this.commandHandler.renderSearch(detail.standardTitle, userId, {
+        initialAliases: detail.aliases,
+        originalTitle: detail.originalTitle,
+        year: detail.year,
+      });
+
+      const titleLineParts = [`📸 收到图片！识别片名：【《${detail.standardTitle}》】`];
+      if (detail.originalTitle && detail.originalTitle.toLowerCase() !== detail.standardTitle.toLowerCase()) {
+        titleLineParts.push(`（原名：${detail.originalTitle}${detail.year ? ` / ${detail.year}` : ''}）`);
+      } else if (detail.year) {
+        titleLineParts.push(`（${detail.year}）`);
+      }
+
+      const aliasHint =
+        detail.aliases.length > 0 ? `🔀 同步扩展关联别名检索：${detail.aliases.slice(0, 3).join(' / ')}` : '';
+
+      return [titleLineParts.join(''), aliasHint, searchResultText].filter(Boolean).join('\n');
     }
 
     return [

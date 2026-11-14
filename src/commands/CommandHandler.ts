@@ -8,6 +8,7 @@ import { AiCorrector } from '../services/AiCorrector';
 import { AiRecommender } from '../services/AiRecommender';
 import { CategoryClassifier, ResourceCategory } from '../services/CategoryClassifier';
 import { SchedulerService } from '../services/SchedulerService';
+import { MetadataResolver, ResolvedMediaInfo } from '../services/MetadataResolver';
 import { CloudResource } from '../types';
 import axios from 'axios';
 import * as crypto from 'crypto';
@@ -827,15 +828,60 @@ export class CommandHandler {
     return msg.trim();
   }
 
-  async renderSearch(keyword: string, userId: string = 'default_user'): Promise<string> {
+  async renderSearch(
+    keyword: string,
+    userId: string = 'default_user',
+    searchMeta?: { initialAliases?: string[]; originalTitle?: string; year?: string }
+  ): Promise<string> {
     this.userManager.recordSearch(userId);
 
-    // AI 实体纠错与意图归一化（识别俗称/外号/错别字/缩写）
+    // 1. AI 实体纠错与意图归一化（识别俗称/外号/错别字/缩写）
     const correction = await this.aiCorrector.correct(keyword, userId);
     let searchWord = correction.correctedKeyword;
-    const standardTitle = correction.standardTitle || searchWord;
+    let standardTitle = correction.standardTitle || searchWord;
+    const resolver = MetadataResolver.getInstance();
 
-    // 优先使用标准片名拉取豆瓣评分与元数据
+    const mergeUniqueTerms = (primary: string, list: Array<string | undefined>): string[] => {
+      const seen = new Set<string>([primary.toLowerCase()]);
+      const out: string[] = [];
+      for (const item of list) {
+        const clean = (item || '').trim();
+        if (!clean || clean.length < 2) continue;
+        const key = clean.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(clean);
+      }
+      return out;
+    };
+
+    let resolvedInfo: ResolvedMediaInfo | null = null;
+    // 若用户直接输入外语原片名（如日/韩/英文）且非识图已对齐，先通过 TMDB / 方案 A 转为官方中文片名
+    if (!searchMeta && MetadataResolver.hasForeignScript(searchWord)) {
+      resolvedInfo = await resolver.resolveMedia({
+        query: keyword,
+        guessTitle: standardTitle,
+        alternateTitles: correction.candidateKeywords,
+        userId,
+        forceLlm: true,
+      });
+      if (resolvedInfo.standardTitle) {
+        searchWord = resolvedInfo.standardTitle;
+        standardTitle = resolvedInfo.standardTitle;
+      }
+    }
+
+    let allAliases = mergeUniqueTerms(standardTitle, [
+      ...(searchMeta?.initialAliases || []),
+      searchMeta?.originalTitle,
+      ...(resolvedInfo?.aliases || []),
+      resolvedInfo?.originalTitle,
+      ...(correction.candidateKeywords || []),
+      searchWord,
+      this.aiCorrector.cleanQuery(keyword),
+    ]);
+
+    // 2. 组装影视元数据与提示头
     const metaHeaders: string[] = [];
     if (correction.isCorrected && correction.explanation) {
       if (correction.isPlotInferred) {
@@ -843,6 +889,10 @@ export class CommandHandler {
       } else {
         metaHeaders.push(`🤖 AI 纠错：识别到「${this.aiCorrector.cleanQuery(keyword)}」➜ ${correction.explanation}`);
       }
+    } else if (resolvedInfo && resolvedInfo.standardTitle.toLowerCase() !== this.aiCorrector.cleanQuery(keyword).toLowerCase()) {
+      metaHeaders.push(
+        `🌐 跨语种片名对齐（${resolvedInfo.source.toUpperCase()}）：「${this.aiCorrector.cleanQuery(keyword)}」➜《${resolvedInfo.standardTitle}》`
+      );
     }
 
     try {
@@ -855,40 +905,102 @@ export class CommandHandler {
       }
     } catch {}
 
-    const metaHeader = metaHeaders.join('\n');
-
     const userPlan = this.userManager.getUserPlan(userId);
     const preferredQuality = userPlan.preferences?.preferredQuality;
 
-    // 智能多级检索尝试：先检索主词，无结果时最多顺延尝试 2 个备选词，防止冷门片名连续触发多轮全网检索拖死响应
-    let res = await this.searcher.search({ keyword: searchWord, quality: preferredQuality });
-    if ((!res.items || res.items.length === 0) && correction.candidateKeywords && correction.candidateKeywords.length > 0) {
-      const candidatesToTry = correction.candidateKeywords.filter((c) => c && c !== searchWord).slice(0, 2);
-      for (const candidate of candidatesToTry) {
-        const candidateRes = await this.searcher.search({ keyword: candidate, quality: preferredQuality });
-        if (candidateRes.items && candidateRes.items.length > 0) {
-          res = candidateRes;
-          searchWord = candidate;
-          break;
+    // 3. 首轮主片名检索（帖子正文/标题匹配任一已知别名均保留）
+    let res = await this.searcher.search({
+      keyword: searchWord,
+      aliasKeywords: allAliases,
+      quality: preferredQuality,
+    });
+
+    // 4. 结果稀疏（< 4 条）或有明确外语/别名扩展需求时，触发 TMDB(方案B) / 大模型+公开片库(方案A) 多标题合并检索
+    const shouldExpandAliases =
+      res.items.length < 4 ||
+      (resolver.hasTmdbConfigured() && res.items.length < 6 && (Boolean(searchMeta?.originalTitle) || !resolvedInfo));
+
+    if (shouldExpandAliases) {
+      if (!resolvedInfo) {
+        resolvedInfo = await resolver.resolveMedia({
+          query: keyword,
+          originalTitle: searchMeta?.originalTitle,
+          guessTitle: standardTitle,
+          alternateTitles: allAliases,
+          year: searchMeta?.year,
+          userId,
+          forceLlm: res.items.length === 0,
+        });
+      }
+
+      if (resolvedInfo.standardTitle && resolvedInfo.standardTitle.toLowerCase() !== searchWord.toLowerCase()) {
+        const prevPrimary = searchWord;
+        standardTitle = resolvedInfo.standardTitle;
+        if (!metaHeaders.some((h) => h.includes(standardTitle))) {
+          metaHeaders.push(
+            `🔄 官方译名对齐（${resolvedInfo.source.toUpperCase()}）：「${prevPrimary}」➜《${standardTitle}》`
+          );
+        }
+      }
+
+      allAliases = mergeUniqueTerms(standardTitle, [
+        ...allAliases,
+        ...resolvedInfo.aliases,
+        resolvedInfo.originalTitle,
+      ]);
+
+      // 待补搜词：若主词已切换为对齐后的新官方名，优先补搜它；再补搜最多 2 个未搜过的别名/外语原名
+      const alreadySearched = new Set<string>([searchWord.toLowerCase()]);
+      const expansionTerms: string[] = [];
+      if (!alreadySearched.has(standardTitle.toLowerCase())) {
+        expansionTerms.push(standardTitle);
+        alreadySearched.add(standardTitle.toLowerCase());
+      }
+      for (const alias of allAliases) {
+        if (expansionTerms.length >= 2) break;
+        if (!alreadySearched.has(alias.toLowerCase())) {
+          expansionTerms.push(alias);
+          alreadySearched.add(alias.toLowerCase());
+        }
+      }
+
+      if (expansionTerms.length > 0 && (res.items.length < 5 || expansionTerms[0] === standardTitle)) {
+        const extraResults = await Promise.all(
+          expansionTerms.map((term) =>
+            this.searcher.search({
+              keyword: term,
+              aliasKeywords: [standardTitle, ...allAliases],
+              quality: preferredQuality,
+            })
+          )
+        );
+        res = this.searcher.mergeResults(res, extraResults, standardTitle, preferredQuality, allAliases);
+        const hitExtraCount = extraResults.reduce((acc, r) => acc + (r.items?.length || 0), 0);
+        if (hitExtraCount > 0) {
+          metaHeaders.push(`🔀 多译名/别名联合检索：${[searchWord, ...expansionTerms].join(' / ')}`);
         }
       }
     }
 
+    const metaHeader = metaHeaders.join('\n');
+
     if (!res.items || res.items.length === 0) {
-      const displayWord = correction.isCorrected ? `${standardTitle}（原词：${keyword}）` : searchWord;
+      const displayWord = correction.isCorrected ? `${standardTitle}（原词：${keyword}）` : standardTitle;
       const cleanName = standardTitle || searchWord;
+      const triedHint = allAliases.length > 0 ? `\n（已自动扩展尝试关联别名：${allAliases.slice(0, 3).join(' / ')}）` : '';
       return [
-        `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢~`,
+        `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢~${triedHint}`,
         `💡 还没出资源？直接回复「蹲守《${cleanName}》」，一旦全网出资源我第一时间微信通知你并自动存进网盘！`,
       ].join('\n');
     }
 
     // 每页精简显示 8 条，避免微信端单条消息过长
-    this.sessionManager.setSearch(userId, searchWord, res.items, 8);
+    const sessionKeyword = standardTitle || searchWord;
+    this.sessionManager.setSearch(userId, sessionKeyword, res.items, 8);
     const pageData = this.sessionManager.getSearchPage(userId, 1)!;
     return this.formatSearchResultPage({
       ...pageData,
-      keyword: standardTitle || searchWord,
+      keyword: sessionKeyword,
       metaHeader,
     });
   }

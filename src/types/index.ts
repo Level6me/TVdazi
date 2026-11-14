@@ -23,6 +23,7 @@ export interface CloudResource {
 
 export interface SearchOptions {
   keyword: string;
+  aliasKeywords?: string[];
   actors?: string[];
   year?: string;
   quality?: string;

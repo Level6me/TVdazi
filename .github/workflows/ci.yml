@@ -54,6 +54,8 @@ jobs:
           require('./dist/commands/CommandHandler');
           require('./dist/agent/DeepSeekAgent');
           require('./dist/wechat/WeixinBot');
+          const { MetadataResolver } = require('./dist/services/MetadataResolver');
+          const { ResourceSearcher } = require('./dist/services/Searcher');
 
           // 2. CategoryClassifier tests
           assert.strictEqual(CategoryClassifier.classify('沙丘2 2024 4K电影'), '电影');
@@ -87,6 +89,22 @@ jobs:
           const { WeixinBot } = require('./dist/wechat/WeixinBot');
           const chunks = WeixinBot.prototype.splitMessageChunks('line\n'.repeat(600), 1800);
           assert(chunks.length >= 2 && chunks.every((c) => c.length > 0 && c.length <= 1800));
+
+          // 7. MetadataResolver & Searcher multi-title merge checks
+          assert.strictEqual(MetadataResolver.hasForeignScript('君の名は'), true);
+          assert.strictEqual(MetadataResolver.hasForeignScript('Inception'), true);
+          assert.strictEqual(MetadataResolver.hasForeignScript('庆余年 4K'), false);
+          assert.strictEqual(MetadataResolver.getInstance().hasTmdbConfigured(), false);
+          const searcher = new ResourceSearcher(['Quark_Movies']);
+          const merged = searcher.mergeResults(
+            { keyword: '突如其来', items: [{ title: '突然身体不适 4K', shareUrl: 'https://pan.quark.cn/s/dup1', shareId: 'dup1', panType: 'quark', rawText: 'alias match' }], totalFound: 1, durationMs: 10 },
+            [{ keyword: '突如其来', items: [{ title: '突如其来 1080P', shareUrl: 'https://pan.quark.cn/s/main2', shareId: 'main2', panType: 'quark', rawText: '' }, { title: '突然身体不适', shareUrl: 'https://pan.quark.cn/s/dup1', shareId: 'dup1', panType: 'quark', rawText: '' }], totalFound: 2, durationMs: 12 }],
+            '突如其来',
+            undefined,
+            ['突然身体不适']
+          );
+          assert.strictEqual(merged.items.length, 2);
+          assert.strictEqual(merged.items[0].shareId, 'main2');
 
           console.log('ALL_CI_CHECKS_PASSED');
           EOF
