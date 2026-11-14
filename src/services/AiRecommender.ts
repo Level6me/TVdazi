@@ -2,16 +2,19 @@ import OpenAI from 'openai';
 import { UserManager } from './UserManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
 
-export type TimeScope = 'current_season' | 'this_year' | 'last_year' | 'classic' | 'mixed';
+export type TimeScope = 'current_season' | 'this_year' | 'last_year' | 'custom_year' | 'classic' | 'mixed';
 
 export interface IntentSlots {
   count: number;
   isExplicitCount: boolean;
   timeScope: TimeScope;
+  yearRange?: [number, number];
+  dateHint?: string;
   mediaType: 'movie' | 'tv';
   doubanTag: string;
   country?: string;
   genre?: string;
+  subTheme?: string;
   excludeGenres: string[];
   rawQuery: string;
 }
@@ -135,65 +138,150 @@ export class AiRecommender {
       isExplicitCount = true;
     }
 
-    // 2. 解析细粒度时效性约束 (timeScope)
+    // 2. 解析细粒度时效性约束、指定年份/年代区间与月份档期 (timeScope, yearRange, dateHint)
+    const { year: currentYear } = this.getCurrentYearAndMonth();
     let timeScope: TimeScope = isFollowUp && prevSlots ? prevSlots.timeScope : 'mixed';
-    if (
+    let yearRange: [number, number] | undefined = isFollowUp && prevSlots ? prevSlots.yearRange : undefined;
+    let dateHint: string | undefined = isFollowUp && prevSlots ? prevSlots.dateHint : undefined;
+
+    // 提取档期与具体月份提示 (如“暑期档”、“春节档”、“下半年”、“10月”)
+    const dateHintMatch = text.match(
+      /(?:春节档|暑期档|国庆档|贺岁档|五一档|跨年|上半年|下半年|年初|年底|春天|春季|夏天|夏季|秋天|秋季|冬天|冬季|(?:1[0-2]|[1-9])月份?)/
+    );
+    if (dateHintMatch) {
+      dateHint = dateHintMatch[0];
+    }
+
+    // 2.1 匹配明确年份区间：如 "2018到2022"、"2015-2020年"、"2010至2015"
+    const rangeMatch = text.match(/(19[7-9]\d|20[0-2]\d)\s*(?:年)?\s*(?:到|至|-|~|—|～)\s*(19[7-9]\d|20[0-2]\d)/);
+    // 2.2 匹配年代：如 "90年代"、"80年代"、"00年代"
+    const decadeMatch = text.match(/([789012]0)\s*年代/);
+    // 2.3 匹配明确单一年份：如 "2019年"、"2023的"、"1994"
+    const singleYearMatch = text.match(/(?:^|[^0-9])(19[7-9]\d|20[0-2]\d)\s*(?:年|年度|的)?/);
+    // 2.4 匹配两位数年份简称：如 "19年的"、"21年"、"94年"
+    const shortYearMatch = text.match(/(?:^|[^0-9])([89]\d|0\d|1\d|2[0-6])\s*年/);
+
+    if (rangeMatch) {
+      const y1 = parseInt(rangeMatch[1], 10);
+      const y2 = parseInt(rangeMatch[2], 10);
+      yearRange = [Math.min(y1, y2), Math.max(y1, y2)];
+      timeScope = 'custom_year';
+    } else if (decadeMatch) {
+      const dec = decadeMatch[1];
+      const startY = dec.startsWith('0') || dec.startsWith('1') || dec.startsWith('2') ? 2000 + parseInt(dec, 10) : 1900 + parseInt(dec, 10);
+      yearRange = [startY, Math.min(currentYear, startY + 9)];
+      timeScope = 'custom_year';
+    } else if (
       /(?:这两个月|近两个月|最近一两个月|这阵子|这个月|上个月|最近正在播|正在热播|正在播|刚出|刚播|新出|最新|现在最火|最近比较火|最近最火|近期比较火|近期最火|最近火|近期火|院线|正在上映)/.test(
         text
       )
     ) {
       timeScope = 'current_season';
-    } else if (/(?:今年|2026|本年度)/.test(text)) {
-      timeScope = 'this_year';
-    } else if (/(?:去年|2025)/.test(text)) {
+      yearRange = [currentYear, currentYear];
+    } else if (singleYearMatch) {
+      const y = parseInt(singleYearMatch[1], 10);
+      if (y === currentYear && !dateHint) {
+        timeScope = 'this_year';
+        yearRange = [currentYear, currentYear];
+      } else {
+        timeScope = 'custom_year';
+        yearRange = [y, y];
+      }
+    } else if (shortYearMatch) {
+      const sy = parseInt(shortYearMatch[1], 10);
+      const fullY = sy >= 70 ? 1900 + sy : 2000 + sy;
+      timeScope = fullY === currentYear && !dateHint ? 'this_year' : 'custom_year';
+      yearRange = [fullY, fullY];
+    } else if (/(?:近三年|最近三年|这三年)/.test(text)) {
+      timeScope = 'custom_year';
+      yearRange = [currentYear - 2, currentYear];
+    } else if (/(?:近五年|最近五年|这五年)/.test(text)) {
+      timeScope = 'custom_year';
+      yearRange = [currentYear - 4, currentYear];
+    } else if (/(?:前年)/.test(text)) {
+      timeScope = 'custom_year';
+      yearRange = [currentYear - 2, currentYear - 2];
+    } else if (/(?:前两年|前几年)/.test(text)) {
+      timeScope = 'custom_year';
+      yearRange = [currentYear - 3, currentYear - 1];
+    } else if (/(?:今年|本年度)/.test(text)) {
+      timeScope = dateHint ? 'custom_year' : 'this_year';
+      yearRange = [currentYear, currentYear];
+    } else if (/(?:去年)/.test(text)) {
       timeScope = 'last_year';
+      yearRange = [currentYear - 1, currentYear - 1];
     } else if (/(?:经典|老片|以前|影史|封神|必看榜|天花板|高分经典)/.test(text)) {
       timeScope = 'classic';
+      yearRange = undefined;
     } else if (/(?:最近|近期)/.test(text)) {
       timeScope = 'current_season';
+      yearRange = [currentYear, currentYear];
+    } else if (dateHint && !yearRange) {
+      timeScope = 'custom_year';
+      yearRange = [currentYear, currentYear];
     }
 
     // 3. 解析载体类型 (mediaType & doubanTag)
     let mediaType: 'movie' | 'tv' = isFollowUp && prevSlots ? prevSlots.mediaType : fallbackType;
     let doubanTag = isFollowUp && prevSlots ? prevSlots.doubanTag : mediaType === 'movie' ? '电影' : '电视剧';
 
-    if (/(?:电影|大片|院线|影院|高分片|科幻片|动作片|恐怖片|喜剧片|爱情片)/.test(text)) {
+    if (/(?:电影|大片|院线|影院|高分片|科幻片|动作片|恐怖片|喜剧片|爱情片|悬疑片|犯罪片|战争片|灾难片|港片)/.test(text)) {
       mediaType = 'movie';
       doubanTag = '电影';
     } else if (/(?:动漫|动画|番剧|日漫|国漫)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '动画';
-    } else if (/(?:综艺|真人秀)/.test(text)) {
+    } else if (/(?:综艺|真人秀|脱口秀|恋综)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '综艺';
     } else if (/(?:纪录片)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '纪录片';
-    } else if (/(?:剧|韩剧|美剧|英剧|日剧|国产剧|连续剧|网剧)/.test(text)) {
+    } else if (/(?:剧|韩剧|美剧|英剧|日剧|国产剧|港剧|台剧|泰剧|连续剧|网剧)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '电视剧';
     }
 
-    // 4. 解析国家/地区偏好 (country)
+    // 4. 解析国家/地区偏好 (country，支持豆瓣 14+ 常见国家地区)
     let country: string | undefined = isFollowUp && prevSlots ? prevSlots.country : undefined;
     const combined = `${text} ${fallbackTag}`;
-    if (/韩剧|韩国/.test(combined)) country = '韩国';
+    if (/韩剧|韩国|韩影/.test(combined)) country = '韩国';
     else if (/美剧|美国|好莱坞/.test(combined)) country = '美国';
     else if (/英剧|英国/.test(combined)) country = '英国';
-    else if (/日剧|日本|日漫/.test(combined)) country = '日本';
+    else if (/日剧|日本|日漫|日影/.test(combined)) country = '日本';
     else if (/国产|华语|大陆|内地|国剧|国漫/.test(combined)) country = '中国大陆';
     else if (/港片|港剧|香港/.test(combined)) country = '中国香港';
+    else if (/台剧|台湾/.test(combined)) country = '中国台湾';
+    else if (/泰剧|泰国/.test(combined)) country = '泰国';
+    else if (/法国|法剧/.test(combined)) country = '法国';
+    else if (/印度/.test(combined)) country = '印度';
+    else if (/西班牙/.test(combined)) country = '西班牙';
+    else if (/德国/.test(combined)) country = '德国';
+    else if (/意大利/.test(combined)) country = '意大利';
+    else if (/俄罗斯|苏联/.test(combined)) country = '俄罗斯';
 
-    // 5. 解析否定题材约束 (excludeGenres) 与正向题材偏好 (genre)
+    // 5. 解析否定题材约束 (excludeGenres)、豆瓣标准类型 (genre) 与细分题材标签 (subTheme)
     const excludeGenres: string[] = isFollowUp && prevSlots ? [...prevSlots.excludeGenres] : [];
     const allGenres = [
       { key: '古装', pattern: /古装|仙侠|古偶|宫斗/ },
       { key: '爱情', pattern: /爱情|甜宠|恋爱|偶像/ },
-      { key: '悬疑', pattern: /悬疑|推理|烧脑|破案|刑侦|犯罪/ },
-      { key: '恐怖', pattern: /惊悚|恐怖|吓人|灵异/ },
-      { key: '喜剧', pattern: /喜剧|搞笑|沙雕/ },
-      { key: '科幻', pattern: /科幻|太空|赛博/ },
-      { key: '历史', pattern: /历史|战争|主旋律/ },
+      { key: '悬疑', pattern: /悬疑|推理|烧脑|破案|刑侦/ },
+      { key: '犯罪', pattern: /犯罪|黑帮|警匪|扫黑/ },
+      { key: '恐怖', pattern: /惊悚|恐怖|吓人|灵异|鬼片/ },
+      { key: '喜剧', pattern: /喜剧|搞笑|沙雕|无厘头/ },
+      { key: '科幻', pattern: /科幻|太空|赛博|外星|机甲/ },
+      { key: '动作', pattern: /动作|打斗|格斗|爽片/ },
+      { key: '武侠', pattern: /武侠|江湖/ },
+      { key: '奇幻', pattern: /奇幻|魔幻|玄幻/ },
+      { key: '冒险', pattern: /冒险|探险|盗墓/ },
+      { key: '灾难', pattern: /灾难|末日|丧尸/ },
+      { key: '历史', pattern: /历史|年代|朝代/ },
+      { key: '战争', pattern: /战争|抗战|军旅|谍战/ },
+      { key: '传记', pattern: /传记|真实事件|真实改编/ },
+      { key: '家庭', pattern: /家庭|亲情|生活|伦理/ },
+      { key: '运动', pattern: /运动|体育|竞技|热血/ },
+      { key: '音乐', pattern: /音乐|歌舞/ },
+      { key: '动画', pattern: /动画|动漫/ },
     ];
 
     for (const g of allGenres) {
@@ -207,24 +295,33 @@ export class AiRecommender {
     }
 
     let genre: string | undefined;
-    if (/悬疑|推理|烧脑|破案|刑侦|侦探|犯罪/.test(combined) && !excludeGenres.includes('悬疑')) genre = '悬疑';
-    else if (/科幻|太空|未来|赛博/.test(combined) && !excludeGenres.includes('科幻')) genre = '科幻';
-    else if (/喜剧|搞笑|下饭|轻松|沙雕/.test(combined) && !excludeGenres.includes('喜剧')) genre = '喜剧';
-    else if (/爱情|甜宠|恋爱|浪漫|情侣/.test(combined) && !excludeGenres.includes('爱情')) genre = '爱情';
-    else if (/动作|爽片|打斗|黑帮/.test(combined)) genre = '动作';
-    else if (/惊悚|恐怖|吓人|灵异/.test(combined) && !excludeGenres.includes('恐怖')) genre = '惊悚';
-    else if (/古装|武侠|权谋/.test(combined) && !excludeGenres.includes('古装')) genre = '古装';
-    else if (/治愈|温情|感人|催泪|家庭|生活|群像|烟火气/.test(combined)) genre = '剧情';
-    else if (/奇幻|魔幻|仙侠/.test(combined) && !excludeGenres.includes('古装')) genre = '奇幻';
+    for (const g of allGenres) {
+      if (g.pattern.test(combined) && !excludeGenres.includes(g.key)) {
+        genre = g.key;
+        break;
+      }
+    }
+    if (!genre && /治愈|温情|感人|催泪|群像|烟火气|人性|女性|职场|医疗|律政|校园|青春/.test(combined)) {
+      genre = '剧情';
+    }
+
+    // 提取细分微题材（用于提示词精准引导与短评匹配加权）
+    const subThemeMatch = text.match(
+      /(?:无限流|时间循环|穿越|重生|丧尸|末日|权谋|宫斗|宅斗|刑侦|破案|法医|扫黑|缉毒|盗墓|谍战|职场|医疗|律政|校园|青春|暗恋|破镜重圆|先婚后爱|电竞|年代剧|大女主|女性群像|家庭群像|复仇|爽剧|下饭|治愈|催泪|赛博朋克|克苏鲁)/
+    );
+    const subTheme = subThemeMatch ? subThemeMatch[0] : undefined;
 
     const slots: IntentSlots = {
       count,
       isExplicitCount,
       timeScope,
+      yearRange,
+      dateHint,
       mediaType,
       doubanTag,
       country,
       genre,
+      subTheme,
       excludeGenres,
       rawQuery: text,
     };
@@ -352,6 +449,43 @@ export class AiRecommender {
         }),
         weight: 1.8,
       });
+    } else if (slots.timeScope === 'custom_year' && slots.yearRange) {
+      const [yStart, yEnd] = slots.yearRange;
+      tasks.push({
+        promise: this.doubanService.getAdvancedCandidates({
+          tags: slots.doubanTag,
+          sort: 'T',
+          countries: slots.country,
+          genres: slots.genre,
+          yearRange: `${yStart},${yEnd}`,
+          limit: 18,
+        }),
+        weight: 2.0,
+      });
+      tasks.push({
+        promise: this.doubanService.getAdvancedCandidates({
+          tags: slots.doubanTag,
+          sort: 'S',
+          countries: slots.country,
+          genres: slots.genre,
+          yearRange: `${yStart},${yEnd}`,
+          limit: 15,
+        }),
+        weight: 1.6,
+      });
+      if (yEnd >= currentYear - 1) {
+        tasks.push({
+          promise: this.doubanService.getAdvancedCandidates({
+            tags: slots.doubanTag,
+            sort: 'U',
+            countries: slots.country,
+            genres: slots.genre,
+            yearRange: `${yStart},${yEnd}`,
+            limit: 14,
+          }),
+          weight: 1.5,
+        });
+      }
     } else if (slots.timeScope === 'classic') {
       tasks.push({
         promise: this.doubanService.getAdvancedCandidates({
@@ -461,12 +595,20 @@ export class AiRecommender {
       const itemYear = sub.year ? parseInt(sub.year, 10) : currentYear;
       const types = sub.types || [];
 
-      // 1. 严格年份过滤：如果用户要求“这两个月/最近/今年”，绝不允许混入 2025 及以前的旧剧！
+      // 1. 严格年份过滤：
+      // - 如果用户要求“这两个月/最近/今年”，绝不允许混入 2025 及以前的旧剧！
+      // - 如果用户指定了明确年份或年代区间 (custom_year)，严格过滤在该年份区间内！
       if ((slots.timeScope === 'current_season' || slots.timeScope === 'this_year') && itemYear < currentYear) {
         continue;
       }
       if (slots.timeScope === 'last_year' && itemYear !== currentYear - 1) {
         continue;
+      }
+      if (slots.timeScope === 'custom_year' && slots.yearRange && sub.year) {
+        const [yStart, yEnd] = slots.yearRange;
+        if (itemYear < yStart || itemYear > yEnd) {
+          continue;
+        }
       }
 
       // 2. 严格载体过滤：如果用户搜的是电视剧（如国产剧/韩剧/美剧），自动剔除混在热榜里的真人秀/综艺
@@ -482,12 +624,15 @@ export class AiRecommender {
         continue;
       }
 
-      // 4. 正向题材匹配加分
+      // 4. 正向题材与细分微题材匹配加分
       if (slots.genre && types.includes(slots.genre)) {
         entry.score += 25;
       }
+      if (slots.subTheme && (sub.shortComment?.includes(slots.subTheme) || sub.title.includes(slots.subTheme))) {
+        entry.score += 20;
+      }
 
-      // 5. 当季有真实高分 (≥7.5) 且有短评的剧集优先排在最前，保证推荐质量与说服力
+      // 5. 有真实高分 (≥7.5) 且有短评的剧集优先排在最前，保证推荐质量与说服力
       const rNum = parseFloat(sub.rate) || 0;
       if (rNum >= 7.5) {
         entry.score += 10;
@@ -540,7 +685,7 @@ export class AiRecommender {
       topCandidates.length > 0
         ? topCandidates
             .map((c, i) => {
-              const yearStr = c.year || String(currentYear);
+              const yearStr = c.year || (slots.yearRange ? String(slots.yearRange[0]) : String(currentYear));
               const rateStr = c.rate ? `豆瓣 ${c.rate}分` : '刚开播热播中(暂未出分)';
               const typeStr = c.types && c.types.length > 0 ? c.types.join('/') : slots.doubanTag;
               const actorStr = c.actors ? `主演: ${c.actors}` : '';
@@ -557,33 +702,49 @@ export class AiRecommender {
       chatHistory.length > 0
         ? chatHistory
             .slice(-4)
-            .map((m: any) => `${m.role === 'user' ? '用户' : '助手'}: ${String(m.content || '').slice(0, 120)}`)
+            .map((m: any) => `${m.role === 'user' ? 'user' : 'assistant'}: ${String(m.content || '').slice(0, 120)}`)
             .join('\n')
         : '';
 
+    const customYearLabel = slots.yearRange
+      ? slots.yearRange[0] === slots.yearRange[1]
+        ? `${slots.yearRange[0]}年`
+        : `${slots.yearRange[0]}~${slots.yearRange[1]}年`
+      : '';
+
     const timeDescMap: Record<TimeScope, string> = {
       current_season: `【当前当季正在热播 / 近一两个月（${currentYear}年${Math.max(1, currentMonth - 1)}~${currentMonth}月）最火新作】`,
-      this_year: `【今年（${currentYear}年）热门佳作】`,
-      last_year: `【去年（${currentYear - 1}年）热门作品】`,
+      this_year: `【今年（${currentYear}年）${slots.dateHint || ''}热门佳作】`,
+      last_year: `【去年（${currentYear - 1}年）${slots.dateHint || ''}热门作品】`,
+      custom_year: `【用户明确指定的年份/档期：${customYearLabel}${slots.dateHint ? ` ${slots.dateHint}` : ''}】`,
       classic: `【高分经典必看口碑作】`,
       mixed: `【近期热门与高口碑佳作】`,
     };
+
+    const genreAndThemeHint = [
+      slots.country ? `地区:${slots.country}` : '',
+      slots.genre ? `类型:${slots.genre}` : '',
+      slots.subTheme ? `细分题材:${slots.subTheme}` : '',
+      slots.dateHint ? `档期/月份:${slots.dateHint}` : '',
+    ]
+      .filter(Boolean)
+      .join(' | ');
 
     try {
       const prompt = `你是一个真正能听懂人话、懂影视、像微信好友一样自然聊天的影视达人。
 请仔细理解用户的这句话，并结合下方【豆瓣实时核验片单】给出最贴合他心意的回复！
 
-【当前真实时间】：${currentYear}年${currentMonth}月（注意：今年是 ${currentYear} 年！“这两个月/最近/近期”指的是 ${currentYear} 年近一两个月正在热播的新剧/新片，绝对不是 2025 年！）
+【当前真实时间】：${currentYear}年${currentMonth}月（注意：今年是 ${currentYear} 年！）
 ${recentHistoryText ? `【近期对话上下文】：\n${recentHistoryText}\n` : ''}
 【用户当前说的原话】："${slots.rawQuery}"
-
+${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` : ''}
 【你必须遵守的核心原则】：
 1. **真正理解用户的意思，拒绝机械式套格式**：
    - 绝对不要输出冷冰冰的表单卡片！**严禁**出现“🎯 为你精选...”、“----”分割线、“🎬 片名：”、“🏷️ 标签：”、“⭐ 评分：”、“🔥 推荐理由：”这种机械模板前缀！
-   - 要顺着用户的原话自然接话。比如用户问“推荐一部这两个月比较火的国产剧”，你就直接像朋友聊天一样说：“这两个月最火、口碑也最稳的国产剧，首推刚播的《xxx》（2026，豆瓣 x.x分），由 xxx 主演……”
-2. **严格遵守数量与时间要求**：
+   - 要顺着用户的原话自然接话（例如用户指定了年份、月份档期或特定类型，就在聊天中自然点出该年份/档期/类型的特点）。
+2. **严格遵守数量、年份与类型要求**：
    - 用户要求的推荐数量：**${slots.count} 部**（如果 count=1，正文中重点只推荐 1 部最匹配的，绝不要罗列五六部！如果 count>1，用清爽的 1. 《片名》... 2. 《片名》... 自然分段介绍 ${slots.count} 部）。
-   - 用户要求的时间范围：${timeDescMap[slots.timeScope]}。必须只从下方【豆瓣实时核验片单】中挑选，年份以片单中标注的“${currentYear}年”为准，**严禁把 ${currentYear} 年的作品写成年份 2025，也严禁自己编造不在候选池里的 2025 老剧**！
+   - 用户要求的时间范围：${timeDescMap[slots.timeScope]}。必须只从下方【豆瓣实时核验片单】中挑选（若用户指定了具体月份/档期如“春节档/暑期档/10月”，优先挑选片单中最契合该档期與细分题材的作品），年份严格以片单中标注的真实年份为准！
 3. **剧情与看点真实不瞎编**：
    - 必须严格根据候选池里提供的【主演、类型、豆瓣真实热评】来聊这部剧为什么好看、是什么氛围，严禁胡乱编造人物关系或假剧情！
 4. **结尾自然引导转存**：
