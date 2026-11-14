@@ -374,15 +374,17 @@ export class WeixinBot {
               // 异步入队处理：不阻塞长轮询心跳，同时保证同一用户连发消息按顺序执行
               this.enqueueUserTask(userQueueKey, async () => {
                 try {
+                  let searchHintSent = false;
+                  const sendSearchHintOnce = async (hintMsg: string) => {
+                    if (searchHintSent) return;
+                    searchHintSent = true;
+                    await this.sendTextMessageWithAuth(auth, fromUser, hintMsg, contextToken);
+                  };
+
                   if (this.agent.isPendingImageSearchConfirm(fromUser, userText)) {
-                    await this.sendTextMessageWithAuth(
-                      auth,
-                      fromUser,
-                      '🔍 收到！正在全网搜索并通过 AI 精筛匹配资源，请稍候...',
-                      contextToken
-                    );
+                    await sendSearchHintOnce('🔍 收到！正在全网搜索并通过 AI 精筛匹配资源，请稍候...');
                   }
-                  const reply = await this.agent.chat(userText, [], fromUser);
+                  const reply = await this.agent.chat(userText, [], fromUser, sendSearchHintOnce);
                   await this.sendTextMessageWithAuth(auth, fromUser, reply, contextToken);
                 } catch (chatErr: any) {
                   console.error(`[Weixin 消息处理异常] [Bot:${auth.botId}]`, chatErr.message);

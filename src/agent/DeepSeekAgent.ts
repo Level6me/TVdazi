@@ -271,7 +271,12 @@ export class DeepSeekAgent {
     ].join('\n');
   }
 
-  async chat(userMessage: string, chatHistoryOrUserId?: any[] | string, maybeUserId?: string): Promise<string> {
+  async chat(
+    userMessage: string,
+    chatHistoryOrUserId?: any[] | string,
+    maybeUserId?: string,
+    onProgress?: (msg: string) => Promise<void>
+  ): Promise<string> {
     const trimmed = userMessage.trim();
 
     let chatHistory: any[] = [];
@@ -354,7 +359,7 @@ export class DeepSeekAgent {
 
     // 1. 仅对确定性交互（/斜杠指令、翻页/选号、网盘链接、系统配置命令、明确任务管理指令）走 0ms 快路径
     if (this.commandHandler.isCommand(trimmed, userId)) {
-      const reply = await this.commandHandler.handle(trimmed, userId);
+      const reply = await this.commandHandler.handle(trimmed, userId, onProgress);
       appendUserHistory(trimmed, reply);
       return reply;
     }
@@ -363,7 +368,7 @@ export class DeepSeekAgent {
     const { client, model, hasValidKey } = this.getClientForUser(userId, 12000);
 
     if (!hasValidKey) {
-      return this.fallbackDirectSearch(trimmed, userId, false);
+      return this.fallbackDirectSearch(trimmed, userId, false, onProgress);
     }
 
     try {
@@ -595,6 +600,7 @@ export class DeepSeekAgent {
             mediaType,
             year,
             skipAiCorrector: Boolean(args.keyword && String(args.keyword).trim()),
+            onProgress,
           });
           appendUserHistory(trimmed, searchReply);
           return searchReply;
@@ -651,7 +657,7 @@ export class DeepSeekAgent {
       return defaultReply;
     } catch (err: any) {
       console.error('[DeepSeekAgent 调用异常]', err?.message || err);
-      const fallbackReply = await this.fallbackDirectSearch(trimmed, userId, true);
+      const fallbackReply = await this.fallbackDirectSearch(trimmed, userId, true, onProgress);
       appendUserHistory(trimmed, fallbackReply);
       return fallbackReply;
     }
@@ -660,7 +666,8 @@ export class DeepSeekAgent {
   private async fallbackDirectSearch(
     text: string,
     userId: string = 'default_user',
-    isApiError: boolean = false
+    isApiError: boolean = false,
+    onProgress?: (msg: string) => Promise<void>
   ): Promise<string> {
     const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '早', '晚上好', '在么', '你是谁', '你叫什么'];
     const lower = text.toLowerCase().replace(/[？?！!。，,\s]/g, '');
@@ -676,6 +683,6 @@ export class DeepSeekAgent {
       return '哎呀，AI 助手刚刚开了个小差 😅\n如果是想找影视资源，可以直接发送「搜 片名」（如：搜 庆余年），或者发送 /help 查看快捷指令！';
     }
 
-    return await this.commandHandler.renderSearch(text, userId);
+    return await this.commandHandler.renderSearch(text, userId, { onProgress });
   }
 }

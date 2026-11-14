@@ -103,7 +103,11 @@ export class CommandHandler {
     return false;
   }
 
-  async handle(text: string, userId: string = 'default_user'): Promise<string> {
+  async handle(
+    text: string,
+    userId: string = 'default_user',
+    onProgress?: (msg: string) => Promise<void>
+  ): Promise<string> {
     const trimmed = text.trim();
 
     // 0. 处理取消/退出指令
@@ -246,7 +250,7 @@ export class CommandHandler {
       if (!keyword) {
         return '想搜什么片子呀？直接告诉我片名就可以，例如发送：庆余年 或 /search 周星驰功夫';
       }
-      return await this.renderSearch(keyword, userId);
+      return await this.renderSearch(keyword, userId, { onProgress });
     }
 
     if (cmd === '/transfer-quark') {
@@ -839,9 +843,14 @@ export class CommandHandler {
       overview?: string;
       enableAiFilter?: boolean;
       skipAiCorrector?: boolean;
+      onProgress?: (msg: string) => Promise<void>;
     }
   ): Promise<string> {
     this.userManager.recordSearch(userId);
+
+    if (searchMeta?.onProgress) {
+      await searchMeta.onProgress('🔍 收到！正在全网搜索并通过 AI 精筛匹配资源，请稍候...').catch(() => {});
+    }
 
     // 1. AI 实体纠错与意图归一化（若上层 AI 意图路由器已完成片名提炼，直接跳过避免二次误改）
     const cleanedRawKeyword = this.aiCorrector.cleanQuery(keyword) || keyword.trim();

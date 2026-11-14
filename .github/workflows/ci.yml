@@ -201,6 +201,17 @@ jobs:
             assert.strictEqual(cmdHandler.isCommand('搜索电影 突如其来'), false);
             assert.strictEqual(cmdHandler.isCommand('/search 突如其来'), true);
 
+            // 12. Search progress hint callback check
+            const hints = [];
+            const origSearchMany = cmdHandler['searcher'].searchMany;
+            cmdHandler['searcher'].searchMany = async () => ({ keyword: '庆余年', items: [], totalFound: 0, durationMs: 1 });
+            await cmdHandler.renderSearch('庆余年', 'ci_u1', {
+              skipAiCorrector: true,
+              onProgress: async (msg) => { hints.push(msg); },
+            }).finally(() => { cmdHandler['searcher'].searchMany = origSearchMany; });
+            assert.strictEqual(hints.length, 1);
+            assert(hints[0].includes('正在全网搜索并通过 AI 精筛匹配资源'));
+
             console.log('ALL_CI_CHECKS_PASSED');
             process.exit(0);
           })().catch((err) => {
