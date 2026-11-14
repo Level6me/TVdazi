@@ -7,6 +7,7 @@ import { UserManager } from '../services/UserManager';
 import { AiCorrector } from '../services/AiCorrector';
 import { AiRecommender } from '../services/AiRecommender';
 import { CategoryClassifier, ResourceCategory } from '../services/CategoryClassifier';
+import { SchedulerService } from '../services/SchedulerService';
 import { CloudResource } from '../types';
 import axios from 'axios';
 import * as crypto from 'crypto';
@@ -34,6 +35,10 @@ export class CommandHandler {
     const trimmed = text.trim();
 
     if (this.userManager.getPendingSharePrompt(userId)) {
+      return true;
+    }
+
+    if (SchedulerService.getInstance().isScheduleIntent(trimmed)) {
       return true;
     }
 
@@ -163,6 +168,11 @@ export class CommandHandler {
         '----------------------------------------',
         '💬 回复「共享」或「独立」就可以啦！',
       ].join('\n');
+    }
+
+    // 4.5 定时任务、全网蹲守、连载追更与智能监控指令处理
+    if (SchedulerService.getInstance().isScheduleIntent(trimmed)) {
+      return await SchedulerService.getInstance().handleNaturalLanguageCommand(trimmed, userId);
     }
 
     const parts = trimmed.split(/\s+/);
@@ -741,7 +751,11 @@ export class CommandHandler {
 
     if (!res.items || res.items.length === 0) {
       const displayWord = correction.isCorrected ? `${standardTitle}（原词：${keyword}）` : searchWord;
-      return `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢，可以试试换个更通用的片名重新搜搜看~`;
+      const cleanName = standardTitle || searchWord;
+      return [
+        `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢~`,
+        `💡 还没出资源？直接回复「蹲守《${cleanName}》」，一旦全网出资源我第一时间微信通知你并自动存进网盘！`,
+      ].join('\n');
     }
 
     // 每页精简显示 8 条，避免微信端单条消息过长
@@ -833,12 +847,18 @@ export class CommandHandler {
       '• 回复“换一批”刷新推荐',
       '',
       '⚙️ 【常用指令】',
+      '• /tasks         查看/管理定时任务与追更',
       '• /status        查看网盘空间与状态',
       '• /config        查看当前个人配置',
       '• /set-dir 路径   修改保存目录(如 /影视)',
       '• /clean-names   一键清洗网盘火星文剧名',
       '• /追剧          查看追剧清单与历史',
       '• /share         邀请微信好友一起使用',
+      '',
+      '⏰ 【定时与智能追更（直接发文字即可）】',
+      '• 发“每天早上8点推一部科幻电影”',
+      '• 发“《片名》有资源了通知我”或“蹲守《片名》”',
+      '• 发“帮我追更《剧名》”或“开启全套智能守护”',
       '',
       '🔑 【高级与账号绑定】',
       '• /set-quark Cookie   绑定私有夸克网盘',

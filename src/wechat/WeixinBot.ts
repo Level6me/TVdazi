@@ -8,12 +8,14 @@ import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 
 import { downloadAndDecryptWechatImage } from './CdnDecrypt';
 import { uploadImageToWechatCdn } from './CdnUpload';
+import { SchedulerService } from '../services/SchedulerService';
 
 const FIXED_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const BOT_TYPE = '3';
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const AUTH_FILE = path.resolve(DATA_DIR, 'weixin_auth.json');
 const SYNC_FILE = path.resolve(DATA_DIR, 'weixin_sync.dat');
+const USER_ROUTES_FILE = path.resolve(DATA_DIR, 'user_routes.json');
 const QR_IMG_PATH = path.resolve(__dirname, '../../wechat_login_qr.png');
 
 interface AuthData {
@@ -23,12 +25,19 @@ interface AuthData {
   userId?: string;
 }
 
+interface UserRouteInfo {
+  botId: string;
+  contextToken?: string;
+  updatedAt: number;
+}
+
 const ACCOUNTS_DIR = path.resolve(DATA_DIR, 'accounts');
 
 export class WeixinBot {
   private static instance: WeixinBot;
   private agent: DeepSeekAgent;
   private activeBots: Map<string, { auth: AuthData; isRunning: boolean; syncBuf: string }> = new Map();
+  private userRoutes: Record<string, UserRouteInfo> = {};
   private authData: AuthData | null = null;
   private isRunning: boolean = false;
   private syncBuf: string = '';
@@ -38,6 +47,7 @@ export class WeixinBot {
     this.ensureDataDir();
     this.loadAuth();
     this.loadSyncBuf();
+    this.loadUserRoutes();
     WeixinBot.instance = this;
   }
 
@@ -293,6 +303,7 @@ export class WeixinBot {
           if (msg.message_type === 1 && msg.from_user_id) {
             const fromUser = msg.from_user_id;
             const contextToken = msg.context_token;
+            this.recordUserRoute(fromUser, auth.botId, contextToken);
             const textItem = msg.item_list?.find((i: any) => i.type === 1);
             const imageItem = msg.item_list?.find((i: any) => i.type === 2);
             const userText = textItem?.text_item?.text?.trim();
@@ -369,6 +380,55 @@ export class WeixinBot {
         });
       }
     }
+
+    // 启动全局智能定时与资源监控引擎
+    SchedulerService.getInstance().start(async (userId, text) => {
+      return await this.pushMessageToUser(userId, text);
+    });
+  }
+
+  private loadUserRoutes() {
+    try {
+      if (fs.existsSync(USER_ROUTES_FILE)) {
+        this.userRoutes = JSON.parse(fs.readFileSync(USER_ROUTES_FILE, 'utf-8'));
+      }
+    } catch {
+      this.userRoutes = {};
+    }
+  }
+
+  private recordUserRoute(userId: string, botId: string, contextToken?: string) {
+    this.userRoutes[userId] = {
+      botId,
+      contextToken: contextToken || this.userRoutes[userId]?.contextToken,
+      updatedAt: Date.now(),
+    };
+    try {
+      fs.writeFileSync(USER_ROUTES_FILE, JSON.stringify(this.userRoutes, null, 2), 'utf-8');
+    } catch {}
+  }
+
+  /**
+   * 主动向指定微信用户推送文本消息（供定时荐片、追更入库、全网蹲守等后台任务调用）
+   */
+  public async pushMessageToUser(toUserId: string, text: string): Promise<boolean> {
+    const accounts = this.getAllAccounts();
+    const route = this.userRoutes[toUserId];
+    let targetAuth: AuthData | undefined;
+
+    if (route?.botId) {
+      targetAuth = accounts.find((a) => a.botId === route.botId);
+    }
+    if (!targetAuth) {
+      targetAuth = accounts.find((a) => a.userId === toUserId) || this.authData || accounts[0];
+    }
+    if (!targetAuth) {
+      console.error(`[WeixinBot 主动推送失败] 未找到可用的 Bot 账号凭证 (目标用户: ${toUserId})`);
+      return false;
+    }
+
+    await this.sendTextMessageWithAuth(targetAuth, toUserId, text, route?.contextToken);
+    return true;
   }
 
   public getAllAccounts(): AuthData[] {

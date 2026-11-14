@@ -6,6 +6,7 @@ import { ChannelManager } from '../services/ChannelManager';
 import { CommandHandler } from '../commands/CommandHandler';
 import { SessionManager } from '../services/SessionManager';
 import { UserManager } from '../services/UserManager';
+import { SchedulerService } from '../services/SchedulerService';
 
 export class DeepSeekAgent {
   private globalClient: OpenAI;
@@ -337,6 +338,23 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'manage_scheduled_task',
+            description: '当用户希望设置定时荐片（如每天早上8点推一部电影）、新片蹲守监控（如某部电影有资源了通知我）、连载剧集自动追更、4K洗版监控、周末观影周报、网盘巡检或自定义计划任务时调用',
+            parameters: {
+              type: 'object',
+              properties: {
+                instruction: {
+                  type: 'string',
+                  description: '用户的完整定时或监控需求指令原文，如“每天早上8点准时推送一部科幻电影给我”、“《流浪地球3》有资源了通知我”、“帮我追更《今天是太阳雨》”',
+                },
+              },
+              required: ['instruction'],
+            },
+          },
+        },
       ];
 
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
@@ -410,6 +428,13 @@ export class DeepSeekAgent {
           const dirReply = await this.commandHandler.handle(`/set-dir ${args.directory || ''}`, userId);
           appendUserHistory(trimmed, dirReply);
           return dirReply;
+        } else if (toolCall.function.name === 'manage_scheduled_task') {
+          const schedReply = await SchedulerService.getInstance().handleNaturalLanguageCommand(
+            args.instruction || trimmed,
+            userId
+          );
+          appendUserHistory(trimmed, schedReply);
+          return schedReply;
         }
       }
 

@@ -1,0 +1,1430 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { ResourceSearcher } from './Searcher';
+import { QuarkService } from './QuarkService';
+import { DoubanService } from './DoubanService';
+import { AiRecommender } from './AiRecommender';
+import { SessionManager } from './SessionManager';
+import { UserManager } from './UserManager';
+import { CategoryClassifier, ResourceCategory } from './CategoryClassifier';
+
+export type TaskType =
+  | 'daily_recommend'   // 场景1：每日/周期定时推送指定类型影视推荐
+  | 'resource_watch'    // 场景2：新片/未出资源全网蹲守监控（出资源通知或自动转存）
+  | 'episode_chase'     // 扩展A：连载热播剧全自动追更入库 + 防和谐洗白
+  | 'quality_upgrade'   // 扩展D：4K / REMUX / 杜比高画质洗版监控
+  | 'friday_weekly'     // 扩展B：每周五晚周末观影片单周报
+  | 'disk_guard'        // 扩展C：夸克网盘容量预警 + 定时防和谐静默巡检
+  | 'watchlist_remind'  // 扩展E：个人待看片单周末温馨提醒
+  | 'custom_reminder';  // 场景3：自定义计划任务（定时提醒/定时搜索/自定义周期任务）
+
+export interface ScheduledTask {
+  id: string;
+  userId: string;
+  type: TaskType;
+  title: string;
+  enabled: boolean;
+  createdAt: number;
+  lastRunAt?: number;
+  lastTriggeredDate?: string; // YYYY-MM-DD HH:mm 防同一分钟重复触发
+
+  // 定时触发配置（适用于时间驱动型任务）
+  scheduleTime?: string;      // "HH:mm" 格式，如 "08:00", "20:30"
+  daysOfWeek?: number[];      // 0(周日)~6(周六)，不填或空数组表示每天
+  oneShotDate?: string;       // "YYYY-MM-DD" 单次提醒日期（执行后自动标记完成）
+  intervalMinutes?: number;   // 轮询间隔分钟数（适用于蹲守/追更/4K监控，默认 30 分钟）
+
+  // 业务参数
+  keyword?: string;           // 监控或搜索的影视片名
+  mediaType?: 'movie' | 'tv'; // 推荐类型
+  tag?: string;               // 推荐标签（如 科幻、悬疑、韩剧、喜剧）
+  query?: string;             // 推荐原始自然语言需求
+  autoSave?: boolean;         // 命中后是否自动转存至夸克网盘
+  lastEpisode?: number;       // 追更任务已转存/已知的最高集数
+  knownShareIds?: string[];   // 已通知或已转存过的网盘 shareId 列表
+  targetQualities?: string[]; // 洗版目标画质关键字（如 ['4K', '2160P', 'REMUX', '杜比']）
+  minFreeGb?: number;         // 网盘低容量预警阈值（默认 5GB）
+  customAction?: 'remind' | 'search' | 'recommend';
+  customPayload?: string;     // 自定义提醒文案或指令内容
+  status?: 'active' | 'completed' | 'paused';
+}
+
+export type PushMessageCallback = (userId: string, message: string) => Promise<boolean>;
+
+export class SchedulerService {
+  private static instance: SchedulerService;
+  private tasksFilePath: string;
+  private tasks: ScheduledTask[] = [];
+  private timer: NodeJS.Timeout | null = null;
+  private pushCallback: PushMessageCallback | null = null;
+  private isTickRunning = false;
+
+  private searcher: ResourceSearcher;
+  private quarkService: QuarkService;
+  private doubanService: DoubanService;
+  private sessionManager: SessionManager;
+  private userManager: UserManager;
+
+  private constructor() {
+    const dataDir = path.resolve(process.cwd(), 'data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    this.tasksFilePath = path.join(dataDir, 'schedules.json');
+    this.searcher = new ResourceSearcher();
+    this.quarkService = new QuarkService();
+    this.doubanService = new DoubanService();
+    this.sessionManager = SessionManager.getInstance();
+    this.userManager = UserManager.getInstance();
+    this.loadTasks();
+  }
+
+  public static getInstance(): SchedulerService {
+    if (!SchedulerService.instance) {
+      SchedulerService.instance = new SchedulerService();
+    }
+    return SchedulerService.instance;
+  }
+
+  private loadTasks(): void {
+    try {
+      if (fs.existsSync(this.tasksFilePath)) {
+        const raw = fs.readFileSync(this.tasksFilePath, 'utf-8');
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed)) {
+          this.tasks = parsed;
+        }
+      }
+    } catch (err: any) {
+      console.error('[SchedulerService] 加载定时任务失败:', err.message);
+      this.tasks = [];
+    }
+  }
+
+  private saveTasks(): void {
+    try {
+      fs.writeFileSync(this.tasksFilePath, JSON.stringify(this.tasks, null, 2), 'utf-8');
+    } catch (err: any) {
+      console.error('[SchedulerService] 保存定时任务失败:', err.message);
+    }
+  }
+
+  /**
+   * 启动后台定时轮询引擎（每 30 秒检查一次时间触发与资源轮询）
+   */
+  public start(pushCallback: PushMessageCallback): void {
+    this.pushCallback = pushCallback;
+    if (this.timer) {
+      clearInterval(this.timer);
+    }
+
+    console.log(`[SchedulerService] ⏰ 智能定时与监控引擎已启动（当前共加载 ${this.tasks.length} 个任务）`);
+    this.timer = setInterval(() => {
+      this.tick().catch((err) => {
+        console.error('[SchedulerService] tick 执行异常:', err.message);
+      });
+    }, 30 * 1000);
+  }
+
+  public stop(): void {
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  }
+
+  private getCurrentTimeParts(): { dateStr: string; timeStr: string; dayOfWeek: number; minuteKey: string } {
+    // 强制使用北京时间 (UTC+8)
+    const now = new Date();
+    const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+    const bjNow = new Date(utcMs + 8 * 3600000);
+
+    const year = bjNow.getFullYear();
+    const month = String(bjNow.getMonth() + 1).padStart(2, '0');
+    const day = String(bjNow.getDate()).padStart(2, '0');
+    const hours = String(bjNow.getHours()).padStart(2, '0');
+    const minutes = String(bjNow.getMinutes()).padStart(2, '0');
+    const dayOfWeek = bjNow.getDay();
+
+    const dateStr = `${year}-${month}-${day}`;
+    const timeStr = `${hours}:${minutes}`;
+    return {
+      dateStr,
+      timeStr,
+      dayOfWeek,
+      minuteKey: `${dateStr} ${timeStr}`,
+    };
+  }
+
+  /**
+   * 核心调度 Tick：检查所有启用中的定时任务与资源轮询任务
+   */
+  public async tick(): Promise<void> {
+    if (this.isTickRunning) return;
+    this.isTickRunning = true;
+
+    try {
+      const { dateStr, timeStr, dayOfWeek, minuteKey } = this.getCurrentTimeParts();
+      const nowMs = Date.now();
+
+      for (const task of this.tasks) {
+        if (!task.enabled || task.status === 'completed' || task.status === 'paused') {
+          continue;
+        }
+
+        // 1. 时间定点触发型任务（含 daily_recommend, friday_weekly, disk_guard, watchlist_remind, custom_reminder，或者带 scheduleTime 的任务）
+        if (task.scheduleTime) {
+          if (task.scheduleTime === timeStr && task.lastTriggeredDate !== minuteKey) {
+            if (task.oneShotDate && task.oneShotDate !== dateStr) {
+              continue;
+            }
+            if (task.daysOfWeek && task.daysOfWeek.length > 0 && !task.daysOfWeek.includes(dayOfWeek)) {
+              continue;
+            }
+
+            task.lastTriggeredDate = minuteKey;
+            task.lastRunAt = nowMs;
+            this.saveTasks();
+
+            const msg = await this.executeTask(task, false);
+            if (msg && this.pushCallback) {
+              await this.pushCallback(task.userId, msg);
+            }
+          }
+          continue;
+        }
+
+        // 2. 周期轮询监控型任务（resource_watch, episode_chase, quality_upgrade）
+        if (['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
+          const intervalMs = (task.intervalMinutes || 30) * 60 * 1000;
+          const lastRun = task.lastRunAt || 0;
+          if (nowMs - lastRun >= intervalMs) {
+            task.lastRunAt = nowMs;
+            this.saveTasks();
+
+            const msg = await this.executeTask(task, false);
+            if (msg && this.pushCallback) {
+              await this.pushCallback(task.userId, msg);
+            }
+          }
+        }
+      }
+    } finally {
+      this.isTickRunning = false;
+    }
+  }
+
+  /**
+   * 立即执行指定任务（用于用户手动测试 `/task-run 1` 或刚创建监控任务时的首次即时巡检）
+   * @param task 任务对象
+   * @param isManual 是否为用户手动触发（手动触发时若暂未出资源也会返回当前检测进展报告）
+   */
+  public async executeTask(task: ScheduledTask, isManual: boolean = true): Promise<string | null> {
+    try {
+      switch (task.type) {
+        case 'daily_recommend':
+          return await this.runDailyRecommend(task);
+        case 'resource_watch':
+          return await this.runResourceWatch(task, isManual);
+        case 'episode_chase':
+          return await this.runEpisodeChase(task, isManual);
+        case 'quality_upgrade':
+          return await this.runQualityUpgrade(task, isManual);
+        case 'friday_weekly':
+          return await this.runFridayWeekly(task);
+        case 'disk_guard':
+          return await this.runDiskGuard(task, isManual);
+        case 'watchlist_remind':
+          return await this.runWatchlistRemind(task);
+        case 'custom_reminder':
+          return await this.runCustomReminder(task);
+        default:
+          return null;
+      }
+    } catch (err: any) {
+      console.error(`[SchedulerService] 执行任务 ${task.id} (${task.title}) 异常:`, err.message);
+      return isManual ? `⚠️ 执行任务「${task.title}」时遇到一点小波动：${err.message}` : null;
+    }
+  }
+
+  /**
+   * 场景 1：每日/周期定时荐片
+   */
+  private async runDailyRecommend(task: ScheduledTask): Promise<string> {
+    const recommender = AiRecommender.getInstance();
+    const mediaType = task.mediaType || 'movie';
+    const tag = task.tag || '热门';
+    const randomPage = Math.floor(Math.random() * 3) + 1;
+    const query = task.query || `推荐一部高分好看的${tag}${mediaType === 'movie' ? '电影' : '电视剧'}`;
+
+    const result = await recommender.generateXiaohongshuNote({
+      query,
+      type: mediaType,
+      tag,
+      page: randomPage,
+      userId: task.userId,
+    });
+
+    this.sessionManager.setHot(task.userId, mediaType, result.subjects, tag, randomPage, 6, query);
+
+    let autoSaveNotice = '';
+    if (task.autoSave && result.subjects && result.subjects.length > 0) {
+      const topSubject = result.subjects[0];
+      const saveInfo = await this.tryAutoSaveByTitle(task.userId, topSubject.title, mediaType === 'movie' ? '电影' : '国产剧');
+      if (saveInfo) {
+        autoSaveNotice = `\n\n${saveInfo}`;
+      }
+    }
+
+    return [
+      `⏰ 【定时荐片 · ${task.title}】`,
+      `─────────────────────────`,
+      result.formattedNote,
+      autoSaveNotice,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  /**
+   * 检查搜索结果条目是否真实匹配目标片名（过滤掉搜索引擎降级返回的无关凑数结果）
+   */
+  private isStrictTitleMatch(item: { title: string; rawText?: string }, keyword: string): boolean {
+    const cleanKey = keyword.replace(/[《》\s:：·.,，。！!？?]/g, '').toLowerCase();
+    if (!cleanKey) return true;
+    const hay = `${item.title} ${item.rawText || ''}`.replace(/[《》\s:：·.,，。！!？?]/g, '').toLowerCase();
+    return hay.includes(cleanKey);
+  }
+
+  /**
+   * 场景 2：新片/未出资源全网蹲守监控
+   */
+  private async runResourceWatch(task: ScheduledTask, isManual: boolean): Promise<string | null> {
+    const keyword = task.keyword || task.title;
+    const res = await this.searcher.search({ keyword });
+    const rawItems = res.items || [];
+    const items = rawItems.filter((i) => this.isStrictTitleMatch(i, keyword));
+
+    if (items.length === 0) {
+      if (isManual) {
+        return [
+          `🛰️ 【全网蹲守巡检报告】《${keyword}》`,
+          `─────────────────────────`,
+          `📡 刚刚已轮询 50+ 资源频道，目前暂未发现《${keyword}》的有效网盘活链。`,
+          `✅ 蹲守任务持续运行中（每 ${task.intervalMinutes || 30} 分钟自动巡检一次），一旦全网出资源我会在第一时间微信通知你${task.autoSave ? '并自动转存进你的夸克网盘' : ''}！`,
+        ].join('\n');
+      }
+      return null;
+    }
+
+    // 优先选夸克资源
+    const quarkItems = items.filter((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
+    const bestItem = quarkItems[0] || items[0];
+
+    this.sessionManager.setSearch(task.userId, keyword, items, 8);
+
+    let saveMsg = '';
+    if (task.autoSave && (bestItem.panType === 'quark' || bestItem.shareUrl.includes('pan.quark.cn'))) {
+      const userPlan = this.userManager.getUserPlan(task.userId);
+      const category = bestItem.category || CategoryClassifier.classify(bestItem.title, bestItem.rawText);
+      const saveRes = await this.quarkService.saveShareFiles(bestItem.shareId, '', category, {
+        customCookie: userPlan.quarkCookie,
+        rootDir: userPlan.saveRootDir,
+        standardTitle: keyword,
+        userId: task.userId,
+      });
+      if (saveRes.success) {
+        this.userManager.recordSave(task.userId, keyword, bestItem.shareUrl, category);
+        saveMsg = `\n🎉 已按你的预约，全自动转存至夸克网盘：【${saveRes.targetPath}】！\n${saveRes.message}`;
+      } else {
+        saveMsg = `\n💡 自动转存尝试提示：${saveRes.message}（可直接回复数字 1~${Math.min(5, items.length)} 尝试其他候选活链）`;
+      }
+    }
+
+    // 蹲守命中后标记为已完成，防止重复轰炸
+    task.status = 'completed';
+    task.enabled = false;
+    this.saveTasks();
+
+    const previewList = items
+      .slice(0, 4)
+      .map((item, idx) => `${idx + 1}. [${item.panType === 'quark' ? '夸克' : '网盘'}] ${item.title}`)
+      .join('\n');
+
+    return [
+      `🎉 【蹲守命中提醒】你预约的《${keyword}》出资源啦！`,
+      `─────────────────────────`,
+      `🔍 全网共检索到 ${items.length} 条有效活链：`,
+      previewList,
+      saveMsg,
+      `─────────────────────────`,
+      `💬 直接回复数字序号（如「1」或「2」）即可一键转存对应版本！`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  /**
+   * 扩展 A：连载热播剧全自动追更入库
+   */
+  public static extractEpisodeInfo(text: string): { maxEp: number; isComplete: boolean; label: string } {
+    // 剔除 URL 链接与年份（如 2024/2025/2026）及分辨率（1080P/2160P/4K/60帧），防止把链接 hash（如 e496）或年份误判为集数
+    const cleanText = text
+      .replace(/https?:\/\/[^\s]+/gi, ' ')
+      .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+      .replace(/\b(?:1080|2160|720|480)[pP]?\b/g, ' ');
+
+    let maxEp = 0;
+    let isComplete = false;
+
+    if (/(?:全集|完结|全\s*\d+\s*集)/i.test(cleanText)) {
+      isComplete = true;
+    }
+
+    const patterns = [
+      /(?:更至|更新至|更新到|更到|至)\s*(?:第)?\s*(\d{1,3})\s*[集话期]/gi,
+      /第\s*(\d{1,3})\s*-\s*(\d{1,3})\s*[集话期]/gi,
+      /(?:0?1)\s*-\s*(\d{1,3})\s*[集话期]?/gi,
+      /第\s*(\d{1,3})\s*[集话期]/gi,
+      /[Ss]\d{1,2}\s*[Ee]\d{1,3}\s*-\s*[Ee]?(\d{1,3})/g,
+      /[Ss]\d{1,2}\s*[Ee](\d{1,3})/g,
+      /(?:^|[\s\[\(【\-_])[Ee][Pp]?(\d{1,2})(?=$|[\s\]\)】\-_])/g,
+      /全\s*(\d{1,3})\s*[集话期]/gi,
+    ];
+
+    for (const reg of patterns) {
+      let m: RegExpExecArray | null;
+      while ((m = reg.exec(cleanText)) !== null) {
+        const numStr = m[2] || m[1];
+        const ep = parseInt(numStr, 10);
+        if (!isNaN(ep) && ep > 0 && ep < 300 && ep > maxEp) {
+          maxEp = ep;
+        }
+      }
+    }
+
+    const label = maxEp > 0 ? `第 ${maxEp} 集${isComplete ? '（已完结）' : ''}` : isComplete ? '全集完结版' : '最新资源';
+    return { maxEp, isComplete, label };
+  }
+
+  private async runEpisodeChase(task: ScheduledTask, isManual: boolean): Promise<string | null> {
+    const keyword = task.keyword || task.title;
+    const res = await this.searcher.search({ keyword });
+    const rawItems = res.items || [];
+    const items = rawItems.filter((i) => this.isStrictTitleMatch(i, keyword));
+
+    if (items.length === 0) {
+      if (isManual) {
+        return `📺 【智能追更巡检】《${keyword}》目前暂未检索到网盘资源，后台将每 ${task.intervalMinutes || 30} 分钟持续为你盯梢更新！`;
+      }
+      return null;
+    }
+
+    const quarkItems = items.filter((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
+    const candidates = quarkItems.length > 0 ? quarkItems : items;
+
+    let bestCandidate = candidates[0];
+    let highestEp = 0;
+    let completeFlag = false;
+
+    for (const item of candidates) {
+      const info = SchedulerService.extractEpisodeInfo(`${item.title} ${item.rawText || ''}`);
+      if (info.maxEp > highestEp) {
+        highestEp = info.maxEp;
+        bestCandidate = item;
+      }
+      if (info.isComplete) {
+        completeFlag = true;
+      }
+    }
+
+    const prevEp = task.lastEpisode || 0;
+    const knownIds = new Set(task.knownShareIds || []);
+
+    // 判断是否有新集数更新
+    const hasNewEpisode = highestEp > prevEp || (prevEp === 0 && !knownIds.has(bestCandidate.shareId));
+
+    if (!hasNewEpisode) {
+      if (isManual) {
+        this.sessionManager.setSearch(task.userId, keyword, items, 8);
+        return [
+          `📺 【智能追更状态】《${keyword}》`,
+          `─────────────────────────`,
+          `📌 当前全网最新进度：${highestEp > 0 ? `更至第 ${highestEp} 集` : '暂无明确集数标号（已为你备好当前活链）'}`,
+          `✅ 你已同步过该进度（上次记录：${prevEp > 0 ? `第 ${prevEp} 集` : '已收录'}）。`,
+          `💡 一旦后续放出第 ${highestEp + 1} 集或新更新包，我会自动为你转存网盘并推送微信消息！`,
+        ].join('\n');
+      }
+      return null;
+    }
+
+    // 发现新集数更新！
+    task.lastEpisode = Math.max(prevEp, highestEp);
+    task.knownShareIds = [...Array.from(knownIds), bestCandidate.shareId].slice(-20);
+    if (completeFlag && highestEp > 0) {
+      // 完结剧集追更圆满完成
+      task.status = 'completed';
+    }
+    this.saveTasks();
+
+    this.sessionManager.setSearch(task.userId, keyword, items, 8);
+
+    let saveDetail = '';
+    if (task.autoSave !== false && (bestCandidate.panType === 'quark' || bestCandidate.shareUrl.includes('pan.quark.cn'))) {
+      const userPlan = this.userManager.getUserPlan(task.userId);
+      const category = bestCandidate.category || CategoryClassifier.classify(bestCandidate.title, bestCandidate.rawText || '');
+      const saveRes = await this.quarkService.saveShareFiles(bestCandidate.shareId, '', category, {
+        customCookie: userPlan.quarkCookie,
+        rootDir: userPlan.saveRootDir,
+        standardTitle: keyword,
+        userId: task.userId,
+      });
+      if (saveRes.success) {
+        this.userManager.recordSave(task.userId, keyword, bestCandidate.shareUrl, category);
+        saveDetail = `\n📂 已自动转存至夸克网盘：【${saveRes.targetPath}】\n${saveRes.message}`;
+      } else {
+        saveDetail = `\n🔗 最新分享链接：${bestCandidate.shareUrl}（回复「1」可手动转存）`;
+      }
+    }
+
+    const epText = highestEp > 0 ? `最新第 ${highestEp} 集${completeFlag ? '（全集完结）' : ''}` : '最新资源包';
+    return [
+      `📣 【热播追更提醒】你追的《${keyword}》更新啦！`,
+      `─────────────────────────`,
+      `🆕 最新进度：${epText}`,
+      `🎬 资源版本：${bestCandidate.title}`,
+      saveDetail,
+      `─────────────────────────`,
+      `💡 回复「1」可再次手动转存，发送「/tasks」可管理追更列表。`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  /**
+   * 扩展 D：4K / REMUX / 杜比高画质洗版监控
+   */
+  private async runQualityUpgrade(task: ScheduledTask, isManual: boolean): Promise<string | null> {
+    const keyword = task.keyword || task.title;
+    const res = await this.searcher.search({ keyword });
+    const rawItems = res.items || [];
+    const items = rawItems.filter((i) => this.isStrictTitleMatch(i, keyword));
+
+    const qualityRegex = /(?:4K|2160[pP]|REMUX|杜比|Dolby|HDR|高码|原盘|BluRay|蓝光)/i;
+    const hqItems = items.filter((item) => qualityRegex.test(`${item.title} ${item.rawText || ''}`));
+
+    if (hqItems.length === 0) {
+      if (isManual) {
+        return [
+          `💎 【4K 高画质洗版监控】《${keyword}》`,
+          `─────────────────────────`,
+          `🔍 当前共检索到 ${items.length} 条普通资源，暂未发现标注有「4K / 2160P / REMUX / 杜比视界」的高规格洗版片源。`,
+          `⏳ 后台将继续为你蹲守高码率 4K 版本，出片即刻自动入库并通知你！`,
+        ].join('\n');
+      }
+      return null;
+    }
+
+    const bestHq = hqItems.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn')) || hqItems[0];
+    this.sessionManager.setSearch(task.userId, keyword, hqItems, 8);
+
+    let saveDetail = '';
+    if (task.autoSave !== false && (bestHq.panType === 'quark' || bestHq.shareUrl.includes('pan.quark.cn'))) {
+      const userPlan = this.userManager.getUserPlan(task.userId);
+      const category = bestHq.category || CategoryClassifier.classify(bestHq.title, bestHq.rawText || '');
+      const saveRes = await this.quarkService.saveShareFiles(bestHq.shareId, '', category, {
+        customCookie: userPlan.quarkCookie,
+        rootDir: userPlan.saveRootDir,
+        standardTitle: `${keyword} (4K收藏版)`,
+        userId: task.userId,
+      });
+      if (saveRes.success) {
+        this.userManager.recordSave(task.userId, keyword, bestHq.shareUrl, category);
+        saveDetail = `\n📂 已自动为你洗版转存至夸克网盘：【${saveRes.targetPath}】\n${saveRes.message}`;
+      }
+    }
+
+    task.status = 'completed';
+    task.enabled = false;
+    this.saveTasks();
+
+    return [
+      `💎 【4K 洗版命中】《${keyword}》高规格画质出炉啦！`,
+      `─────────────────────────`,
+      `🎬 命中片源：${bestHq.title}`,
+      `🔗 资源链接：${bestHq.shareUrl}`,
+      saveDetail,
+      `─────────────────────────`,
+      `💬 已为你放入当前搜索会话，直接回复「1」也可以一键操作！`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+  }
+
+  /**
+   * 扩展 B：每周五晚周末观影片单周报
+   */
+  private async runFridayWeekly(task: ScheduledTask): Promise<string> {
+    const recommender = AiRecommender.getInstance();
+    const query = '推荐3部适合周末放松看的近期高分热门电影或口碑好剧';
+    const result = await recommender.generateXiaohongshuNote({
+      query,
+      type: 'movie',
+      tag: '热门',
+      page: 1,
+      userId: task.userId,
+    });
+
+    this.sessionManager.setHot(task.userId, 'movie', result.subjects, '热门', 1, 6, query);
+
+    return [
+      `🍿 【周五下班 · 周末观影精选周报】`,
+      `辛苦一周啦！为你挑好了这周末最值得窝在沙发里看的好片：`,
+      `─────────────────────────`,
+      result.formattedNote,
+    ].join('\n');
+  }
+
+  /**
+   * 扩展 C：夸克网盘容量预警 + 定时防和谐静默巡检
+   */
+  private async runDiskGuard(task: ScheduledTask, isManual: boolean): Promise<string | null> {
+    const userPlan = this.userManager.getUserPlan(task.userId);
+    const customCookie = userPlan.quarkCookie;
+
+    if (!this.quarkService.isConfigured(customCookie)) {
+      return isManual
+        ? '⚠️ 尚未配置夸克网盘 Cookie，请先发送 `/set-quark <Cookie>` 绑定后再执行网盘守护巡检哦！'
+        : null;
+    }
+
+    const info = await this.quarkService.getUserInfo(customCookie);
+    const rootRes = await this.quarkService.cleanAntiCensorFilesInFolder('0', {
+      userId: task.userId,
+      customCookie,
+    });
+
+    const userRootDir = userPlan.saveRootDir || this.quarkService.getDefaultRootDir();
+    let subRenamed: Array<{ original: string; restored: string; reason?: string }> = [];
+    let subScanned = 0;
+
+    try {
+      const catRes = await this.quarkService.getCategoryDir('电影', userRootDir, customCookie);
+      if (catRes.fid && catRes.fid !== '0') {
+        const subRes = await this.quarkService.cleanAntiCensorFilesInFolder(catRes.fid, {
+          userId: task.userId,
+          customCookie,
+        });
+        subScanned = subRes.scannedCount;
+        subRenamed = subRes.renamedItems;
+      }
+    } catch {}
+
+    const allRenamed = [...rootRes.renamedItems, ...subRenamed];
+    const totalScanned = rootRes.scannedCount + subScanned;
+
+    // 解析剩余空间是否低于阈值
+    let isLowSpace = false;
+    const minFreeGb = task.minFreeGb || 5;
+    if (info && info.freeCapacity) {
+      const gbMatch = info.freeCapacity.match(/([\d.]+)\s*GB/i);
+      const mbMatch = info.freeCapacity.match(/([\d.]+)\s*MB/i);
+      const tbMatch = info.freeCapacity.match(/([\d.]+)\s*TB/i);
+      if (mbMatch && !tbMatch && !gbMatch) {
+        isLowSpace = true;
+      } else if (gbMatch && parseFloat(gbMatch[1]) < minFreeGb) {
+        isLowSpace = true;
+      }
+    }
+
+    // 如果是后台静默运行，且空间充足、也没有新和谐文件被改名，则保持安静或仅在有动作时推送
+    if (!isManual && !isLowSpace && allRenamed.length === 0) {
+      return null;
+    }
+
+    const lines: string[] = [
+      `🛡️ 【夸克网盘定时守护巡检报告】`,
+      `─────────────────────────`,
+    ];
+
+    if (info) {
+      lines.push(`👤 账号昵称：${info.nickname}`);
+      lines.push(`💾 容量状态：剩余 ${info.freeCapacity} / 总计 ${info.totalCapacity}`);
+      if (isLowSpace) {
+        lines.push(`🚨 【低容量预警】你的网盘剩余空间已不足 ${minFreeGb}GB，建议清理看过的旧片以免影响后续自动追更转存哦！`);
+      } else {
+        lines.push(`🟢 空间充裕，可随时放心自动追更转存。`);
+      }
+    }
+
+    lines.push(`🔍 防和谐巡检：共扫描 ${totalScanned} 个目录/文件`);
+    if (allRenamed.length > 0) {
+      lines.push(`✨ 已自动为你洗白还原 ${allRenamed.length} 处混淆剧名：`);
+      for (const item of allRenamed.slice(0, 5)) {
+        lines.push(`  • 「${item.original}」➜ 《${item.restored}》`);
+      }
+    } else {
+      lines.push(`✅ 当前网盘内剧名均十分规整，无火星文或拼音缩写混淆。`);
+    }
+
+    return lines.join('\n');
+  }
+
+  /**
+   * 扩展 E：个人待看片单周末温馨翻牌提醒
+   */
+  private async runWatchlistRemind(task: ScheduledTask): Promise<string> {
+    const plan = this.userManager.getUserPlan(task.userId);
+    const list = plan.watchlist || [];
+
+    if (list.length === 0) {
+      // 如果追剧清单为空，自动降级为推送一部周末高分佳片
+      return await this.runFridayWeekly(task);
+    }
+
+    // 优先选 planned / saving 状态或最近加入的一部
+    const pendingList = list.filter((w) => w.status !== 'completed');
+    const targetPool = pendingList.length > 0 ? pendingList : list;
+    const picked = targetPool[Math.floor(Math.random() * targetPool.length)];
+
+    const searchRes = await this.searcher.search({ keyword: picked.title });
+    const items = searchRes.items || [];
+    if (items.length > 0) {
+      this.sessionManager.setSearch(task.userId, picked.title, items, 8);
+    }
+
+    return [
+      `📌 【你的待看片单 · 周末翻牌提醒】`,
+      `─────────────────────────`,
+      `还记得你之前收藏进片单的《${picked.title}》吗？今天正好有空，不如把它刷完吧！🎬`,
+      items.length > 0
+        ? `✅ 已为你备好 ${items.length} 条有效网盘活链，直接回复「1」即可一键转存到夸克网盘观看~`
+        : `💡 直接发片名给我即可随时搜寻最新片源！`,
+      `📋 你当前片单共有 ${list.length} 部作品，发送「/追剧」可查看完整片单。`,
+    ].join('\n');
+  }
+
+  /**
+   * 场景 3：自定义计划任务 / 定时提醒 / 定时搜片
+   */
+  private async runCustomReminder(task: ScheduledTask): Promise<string> {
+    if (task.oneShotDate) {
+      task.status = 'completed';
+      task.enabled = false;
+      this.saveTasks();
+    }
+
+    const payload = task.customPayload || task.title;
+
+    if (task.customAction === 'search' && task.keyword) {
+      const res = await this.searcher.search({ keyword: task.keyword });
+      const items = res.items || [];
+      if (items.length > 0) {
+        this.sessionManager.setSearch(task.userId, task.keyword, items, 8);
+        const topList = items
+          .slice(0, 4)
+          .map((i, idx) => `${idx + 1}. [${i.panType === 'quark' ? '夸克' : '网盘'}] ${i.title}`)
+          .join('\n');
+        return [
+          `⏰ 【定时搜片任务】《${task.keyword}》`,
+          `─────────────────────────`,
+          topList,
+          `─────────────────────────`,
+          `💬 回复数字序号（如「1」）即可一键转存！`,
+        ].join('\n');
+      }
+    }
+
+    // 检查提醒内容里是否带有《片名》，如果有则顺便帮用户把片源准备好
+    const bookMatch = payload.match(/《([^》]+)》/);
+    let extraResourceTip = '';
+    if (bookMatch && bookMatch[1]) {
+      const movieTitle = bookMatch[1].trim();
+      const res = await this.searcher.search({ keyword: movieTitle });
+      if (res.items && res.items.length > 0) {
+        this.sessionManager.setSearch(task.userId, movieTitle, res.items, 8);
+        extraResourceTip = `\n\n🎬 我还顺手帮你搜好了《${movieTitle}》的 ${res.items.length} 条网盘活链，直接回复「1」就能一键转存到网盘看啦！`;
+      }
+    }
+
+    return [
+      `⏰ 【WeSaver 贴心定时提醒】`,
+      `─────────────────────────`,
+      `🔔 ${payload}${extraResourceTip}`,
+    ].join('\n');
+  }
+
+  private async tryAutoSaveByTitle(userId: string, title: string, defaultCategory: ResourceCategory): Promise<string | null> {
+    const searchRes = await this.searcher.search({ keyword: title });
+    if (!searchRes.items || searchRes.items.length === 0) return null;
+
+    const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
+    if (!bestQuark) return null;
+
+    const userPlan = this.userManager.getUserPlan(userId);
+    const saveRes = await this.quarkService.saveShareFiles(bestQuark.shareId, '', defaultCategory, {
+      customCookie: userPlan.quarkCookie,
+      rootDir: userPlan.saveRootDir,
+      standardTitle: title,
+      userId,
+    });
+
+    if (saveRes.success) {
+      this.userManager.recordSave(userId, title, bestQuark.shareUrl, defaultCategory);
+      return `⚡ 已顺便为你把《${title}》自动转存进夸克网盘：【${saveRes.targetPath}】！`;
+    }
+    return null;
+  }
+
+  // ==================== 任务增删改查管理 API ====================
+
+  public getUserTasks(userId: string): ScheduledTask[] {
+    return this.tasks.filter((t) => t.userId === userId);
+  }
+
+  public addTask(taskData: Omit<ScheduledTask, 'id' | 'createdAt'>): ScheduledTask {
+    // 防止完全重复的同类型任务叠加，若存在同名同类型任务则更新它
+    const existing = this.tasks.find(
+      (t) =>
+        t.userId === taskData.userId &&
+        t.type === taskData.type &&
+        t.title === taskData.title &&
+        t.status !== 'completed'
+    );
+    if (existing) {
+      Object.assign(existing, taskData, { enabled: true, status: 'active' });
+      this.saveTasks();
+      return existing;
+    }
+
+    const newTask: ScheduledTask = {
+      ...taskData,
+      id: `task_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      createdAt: Date.now(),
+      status: taskData.status || 'active',
+    };
+    this.tasks.push(newTask);
+    this.saveTasks();
+    return newTask;
+  }
+
+  public deleteUserTaskByIndex(userId: string, index1Based: number): { success: boolean; task?: ScheduledTask; message: string } {
+    const userTasks = this.getUserTasks(userId);
+    if (index1Based < 1 || index1Based > userTasks.length) {
+      return {
+        success: false,
+        message: `序号【${index1Based}】超出范围啦，你当前共有 ${userTasks.length} 个定时任务（发送 /tasks 可查看序号）。`,
+      };
+    }
+    const target = userTasks[index1Based - 1];
+    this.tasks = this.tasks.filter((t) => t.id !== target.id);
+    this.saveTasks();
+    return {
+      success: true,
+      task: target,
+      message: `🗑️ 已为你删除第 ${index1Based} 个定时任务：【${target.title}】`,
+    };
+  }
+
+  public clearUserTasks(userId: string): number {
+    const before = this.tasks.length;
+    this.tasks = this.tasks.filter((t) => t.userId !== userId);
+    this.saveTasks();
+    return before - this.tasks.length;
+  }
+
+  public toggleUserTaskByIndex(
+    userId: string,
+    index1Based: number,
+    enable: boolean
+  ): { success: boolean; message: string } {
+    const userTasks = this.getUserTasks(userId);
+    if (index1Based < 1 || index1Based > userTasks.length) {
+      return {
+        success: false,
+        message: `序号【${index1Based}】超出范围啦，你当前共有 ${userTasks.length} 个任务。`,
+      };
+    }
+    const target = userTasks[index1Based - 1];
+    target.enabled = enable;
+    target.status = enable ? 'active' : 'paused';
+    this.saveTasks();
+    return {
+      success: true,
+      message: enable
+        ? `▶️ 已恢复开启任务 #${index1Based}：【${target.title}】`
+        : `⏸️ 已暂停任务 #${index1Based}：【${target.title}】`,
+    };
+  }
+
+  public async runUserTaskByIndex(userId: string, index1Based: number): Promise<string> {
+    const userTasks = this.getUserTasks(userId);
+    if (index1Based < 1 || index1Based > userTasks.length) {
+      return `序号【${index1Based}】超出范围啦，你当前共有 ${userTasks.length} 个定时任务，发送「/tasks」查看任务序号吧！`;
+    }
+    const target = userTasks[index1Based - 1];
+    target.lastRunAt = Date.now();
+    this.saveTasks();
+    const res = await this.executeTask(target, true);
+    return res || `✅ 已执行任务 #${index1Based}：【${target.title}】`;
+  }
+
+  /**
+   * 格式化展示用户的全部定时与监控任务列表
+   */
+  public renderUserTasks(userId: string): string {
+    const userTasks = this.getUserTasks(userId);
+    if (userTasks.length === 0) {
+      return [
+        '⏰ 【你的智能定时与监控中心】',
+        '─────────────────────────',
+        '你目前还没有创建定时或监控任务哦！可以直接像平时聊天一样对我说：',
+        '',
+        '🎬 1. 每日定时荐片：',
+        '  • 「每天早上8点推送一部科幻电影给我」',
+        '  • 「每天晚上9点推一部轻松韩剧」',
+        '🛰️ 2. 新片资源全网蹲守：',
+        '  • 「《流浪地球3》有资源了通知我」',
+        '  • 「等《蛮好的人生》有资源了自动存进网盘」',
+        '📺 3. 热播剧全自动追更：',
+        '  • 「帮我追更《今天是太阳雨》」',
+        '💎 4. 4K 高画质洗版监控：',
+        '  • 「等《奥德赛》出4K了帮我存一下」',
+        '🛡️ 5. 周报 / 网盘巡检 / 任意自定义任务：',
+        '  • 「开启全套智能守护」（一键配齐早报+周报+网盘巡检+周末提醒）',
+        '  • 「每天晚上10点提醒我看《小城良方》」',
+      ].join('\n');
+    }
+
+    const typeBadges: Record<TaskType, string> = {
+      daily_recommend: '🌅 每日荐片',
+      resource_watch: '🛰️ 资源蹲守',
+      episode_chase: '📺 自动追更',
+      quality_upgrade: '💎 4K洗版',
+      friday_weekly: '🍿 周五周报',
+      disk_guard: '🛡️ 网盘守护',
+      watchlist_remind: '📌 片单提醒',
+      custom_reminder: '🔔 计划提醒',
+    };
+
+    const lines: string[] = [
+      `⏰ 【你的智能定时与监控任务 (${userTasks.length}个)】`,
+      `─────────────────────────`,
+    ];
+
+    userTasks.forEach((t, idx) => {
+      const badge = typeBadges[t.type] || '⏰ 定时任务';
+      const stateIcon =
+        t.status === 'completed' ? '✅已完成' : t.enabled ? '🟢运行中' : '⏸️已暂停';
+      let scheduleDesc = '';
+      if (t.scheduleTime) {
+        if (t.oneShotDate) {
+          scheduleDesc = `${t.oneShotDate} ${t.scheduleTime}`;
+        } else if (t.daysOfWeek && t.daysOfWeek.length > 0) {
+          const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+          scheduleDesc = `每${t.daysOfWeek.map((d) => dayNames[d]).join('/')} ${t.scheduleTime}`;
+        } else {
+          scheduleDesc = `每天 ${t.scheduleTime}`;
+        }
+      } else {
+        scheduleDesc = `每 ${t.intervalMinutes || 30} 分钟巡检`;
+      }
+
+      const extraInfo =
+        t.type === 'episode_chase' && t.lastEpisode
+          ? ` (已追至第${t.lastEpisode}集)`
+          : t.autoSave
+          ? ' [自动转存]'
+          : '';
+
+      lines.push(`${idx + 1}. [${badge}] ${t.title}${extraInfo}`);
+      lines.push(`   ⏱️ 触发：${scheduleDesc} | 状态：${stateIcon}`);
+    });
+
+    lines.push(`─────────────────────────`);
+    lines.push(`💡 快捷操作指令：`);
+    lines.push(`• 发「执行任务 1」或「/task-run 1」：立即测试触发第1个任务`);
+    lines.push(`• 发「删除任务 1」或「/task-del 1」：删除对应任务`);
+    lines.push(`• 发「暂停任务 1」/「恢复任务 1」：暂停或恢复任务`);
+    return lines.join('\n');
+  }
+
+  /**
+   * 一键开启全套推荐智能定时方案（当用户说“开启全套智能守护”或“我全都要”时）
+   */
+  public setupFullSuiteForUser(userId: string): ScheduledTask[] {
+    const created: ScheduledTask[] = [];
+
+    // 1. 每天早上 08:00 晨间高分电影推荐
+    created.push(
+      this.addTask({
+        userId,
+        type: 'daily_recommend',
+        title: '每天早上08:00精选高分电影推送',
+        enabled: true,
+        scheduleTime: '08:00',
+        mediaType: 'movie',
+        tag: '豆瓣高分',
+        query: '推荐一部适合今天看的豆瓣高分口碑电影',
+        autoSave: false,
+      })
+    );
+
+    // 2. 每周五晚上 19:00 周末观影片单周报
+    created.push(
+      this.addTask({
+        userId,
+        type: 'friday_weekly',
+        title: '每周五19:00周末观影热播片单周报',
+        enabled: true,
+        scheduleTime: '19:00',
+        daysOfWeek: [5],
+      })
+    );
+
+    // 3. 每天早上 09:00 夸克网盘容量预警与防和谐静默巡检
+    created.push(
+      this.addTask({
+        userId,
+        type: 'disk_guard',
+        title: '每日夸克网盘容量预警与防和谐洗白巡检',
+        enabled: true,
+        scheduleTime: '09:00',
+        minFreeGb: 5,
+      })
+    );
+
+    // 4. 每周六晚上 20:00 个人待看片单温馨翻牌提醒
+    created.push(
+      this.addTask({
+        userId,
+        type: 'watchlist_remind',
+        title: '每周六20:00个人待看片单温馨提醒',
+        enabled: true,
+        scheduleTime: '20:00',
+        daysOfWeek: [6],
+      })
+    );
+
+    return created;
+  }
+
+  // ==================== 自然语言识别与解析器 ====================
+
+  /**
+   * 快速嗅探用户输入是否属于定时/蹲守/追更/任务管理意图
+   */
+  public isScheduleIntent(text: string): boolean {
+    const trimmed = text.trim();
+    if (
+      /^(?:\/tasks|\/schedule|\/定时|\/watch|\/追更|\/蹲守|\/task-run|\/task-del|\/task-all|定时任务|我的任务|我的定时|查看任务|任务列表|执行任务\s*\d+|测试任务\s*\d+|删除任务\s*\d+|取消任务\s*\d+|暂停任务\s*\d+|恢复任务\s*\d+|清空任务|开启全套)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+
+    // 场景1 & 场景3：每天/每周/明早/今晚 + 几点 + 推送/推荐/提醒/发/搜
+    if (
+      /(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|周[一二三四五六日天末]|明天|明早|今晚|今天).*?(?:(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)|早上|上午|中午|下午|晚上|凌晨).*?(?:推|发|荐|提醒|叫我|通知|搜|检查|巡检)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+
+    // 场景2：有资源了通知我 / 蹲守 / 出资源了帮我存
+    if (
+      /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(
+        trimmed
+      ) ||
+      /^(?:帮我|给我)?(?:蹲守|蹲一下|蹲一个|蹲|监控)\s*《?[^》]+》?/i.test(trimmed)
+    ) {
+      return true;
+    }
+
+    // 扩展A：连载追更
+    if (/^(?:帮我|给我|自动)?(?:追更|订阅更新)\s*《?[^》]+》?/i.test(trimmed)) {
+      return true;
+    }
+
+    // 扩展D：4K 洗版监控
+    if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|高画质|洗版|原盘).*?(?:通知|提醒|帮我存|自动存|转存|告诉我)/i.test(trimmed)) {
+      return true;
+    }
+
+    // 扩展 B / C / E 快捷开启
+    if (
+      /(?:开启|打开|设置|订阅).*?(?:周末.*?周报|观影.*?周报|片单.*?周报|网盘.*?巡检|防和谐.*?巡检|容量.*?预警|网盘.*?守护|待看.*?提醒|片单.*?提醒|全套.*?定时|全套.*?守护)/i.test(
+        trimmed
+      )
+    ) {
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * 从自然语言文本中解析时间（支持 "早上8点"、"晚上9点半"、"20:30"、"下午3点15" 等）
+   */
+  public static parseTimeFromText(text: string): { timeStr: string; daysOfWeek?: number[]; oneShotDate?: string } {
+    const cnNums: Record<string, number> = {
+      零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
+      十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16, 十七: 17, 十八: 18, 十九: 19, 二十: 20,
+      二十一: 21, 二十二: 22, 二十三: 23, 三十: 30, 四十五: 45,
+    };
+
+    const parseNum = (s: string): number => {
+      if (/^\d+$/.test(s)) return parseInt(s, 10);
+      return cnNums[s] ?? 8;
+    };
+
+    let hour = 8;
+    let minute = 0;
+
+    // 匹配 HH:mm 或 X点Y分 / X点半
+    const colonMatch = text.match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);
+    const pointMatch = text.match(
+      /(早上|早晨|上午|中午|下午|傍晚|晚上|夜里|凌晨)?\s*(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:(\d{1,2}|半|[一二三四五六七八九十]{1,3})\s*分?)?/
+    );
+
+    if (colonMatch) {
+      hour = parseInt(colonMatch[1], 10);
+      minute = parseInt(colonMatch[2], 10);
+      if (/(?:下午|傍晚|晚上|夜里)/.test(text) && hour < 12) {
+        hour += 12;
+      }
+    } else if (pointMatch) {
+      const period = pointMatch[1] || '';
+      hour = parseNum(pointMatch[2]);
+      if (pointMatch[3]) {
+        minute = pointMatch[3] === '半' ? 30 : parseNum(pointMatch[3]);
+      }
+      if (/(?:下午|傍晚|晚上|夜里)/.test(period) && hour < 12) {
+        hour += 12;
+      } else if (period === '中午' && hour < 11) {
+        hour += 12;
+      } else if (period === '凌晨' && hour === 12) {
+        hour = 0;
+      }
+    } else if (/早上|早晨|明早/.test(text)) {
+      hour = 8;
+    } else if (/中午/.test(text)) {
+      hour = 12;
+    } else if (/下午/.test(text)) {
+      hour = 15;
+    } else if (/晚上|今晚|每晚/.test(text)) {
+      hour = 20;
+    }
+
+    hour = Math.max(0, Math.min(23, hour));
+    minute = Math.max(0, Math.min(59, minute));
+    const timeStr = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+
+    // 解析星期几
+    let daysOfWeek: number[] | undefined;
+    if (/周末|周六周日/.test(text)) {
+      daysOfWeek = [6, 0];
+    } else if (/工作日|周一到周五/.test(text)) {
+      daysOfWeek = [1, 2, 3, 4, 5];
+    } else {
+      const dayMap: Record<string, number> = { 一: 1, 二: 2, 三: 3, 四: 4, 五: 5, 六: 6, 日: 0, 天: 0 };
+      const weekMatches = text.match(/周([一二三四五六日天])/g);
+      if (weekMatches && weekMatches.length > 0) {
+        daysOfWeek = weekMatches.map((w) => dayMap[w.replace('周', '')]).filter((n) => n !== undefined);
+      }
+    }
+
+    // 解析单次日期（明天/今天）
+    let oneShotDate: string | undefined;
+    if (!/每天|每日|每晚|每早|每周/.test(text) && /(?:明天|明早|明晚|今天|今晚)/.test(text)) {
+      const now = new Date();
+      const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
+      const bjDate = new Date(utcMs + 8 * 3600000);
+      if (/明天|明早|明晚/.test(text)) {
+        bjDate.setDate(bjDate.getDate() + 1);
+      }
+      const y = bjDate.getFullYear();
+      const m = String(bjDate.getMonth() + 1).padStart(2, '0');
+      const d = String(bjDate.getDate()).padStart(2, '0');
+      oneShotDate = `${y}-${m}-${d}`;
+    }
+
+    return { timeStr, daysOfWeek, oneShotDate };
+  }
+
+  /**
+   * 提取自然语言中的目标片名
+   */
+  public static extractCleanMovieTitle(text: string): string {
+    const bookMatch = text.match(/《([^》]+)》/);
+    if (bookMatch && bookMatch[1]) {
+      return bookMatch[1].trim();
+    }
+
+    return text
+      .replace(/^(?:请|帮我|给我|麻烦|我想|我要|自动|全网)*/g, '')
+      .replace(/(?:蹲守|蹲一下|蹲一个|蹲|追更|订阅更新|监控|看看|查查)/g, '')
+      .replace(/(?:如果|要是|等|当)?(.+?)(?:有4K资源了|出4K资源了|出4K了|有4K了|有资源了|出资源了|更新了|出了).*$/i, '$1')
+      .replace(/(?:推送消息给我|推送给我|通知我|告诉我|发给我|自动帮我存.*|帮我存.*|存进网盘.*)$/g, '')
+      .replace(/^[，,。！!？?\s]+|[，,。！!？?\s]+$/g, '')
+      .trim();
+  }
+
+  /**
+   * 统一处理自然语言定时任务创建与管理
+   */
+  public async handleNaturalLanguageCommand(text: string, userId: string): Promise<string> {
+    const trimmed = text.trim();
+
+    // 1. 查看任务列表
+    if (/^(?:\/tasks|\/schedule|\/定时|定时任务|我的任务|我的定时|查看任务|任务列表)$/i.test(trimmed)) {
+      return this.renderUserTasks(userId);
+    }
+
+    // 2. 立即执行测试某条任务
+    const runMatch = trimmed.match(/^(?:\/task-run|执行任务|测试任务|运行任务)\s*(\d+)$/i);
+    if (runMatch) {
+      const idx = parseInt(runMatch[1], 10);
+      return await this.runUserTaskByIndex(userId, idx);
+    }
+
+    // 3. 删除某条任务或清空任务
+    const delMatch = trimmed.match(/^(?:\/task-del|删除任务|取消任务|移除任务)\s*(\d+)$/i);
+    if (delMatch) {
+      const idx = parseInt(delMatch[1], 10);
+      return this.deleteUserTaskByIndex(userId, idx).message;
+    }
+    if (/^(?:清空任务|清空定时任务|删除所有任务)$/i.test(trimmed)) {
+      const count = this.clearUserTasks(userId);
+      return `🗑️ 已为你清空全部 ${count} 个定时与监控任务！`;
+    }
+
+    // 4. 暂停 / 恢复任务
+    const pauseMatch = trimmed.match(/^(?:暂停任务)\s*(\d+)$/i);
+    if (pauseMatch) {
+      return this.toggleUserTaskByIndex(userId, parseInt(pauseMatch[1], 10), false).message;
+    }
+    const resumeMatch = trimmed.match(/^(?:恢复任务|开启任务)\s*(\d+)$/i);
+    if (resumeMatch) {
+      return this.toggleUserTaskByIndex(userId, parseInt(resumeMatch[1], 10), true).message;
+    }
+
+    // 5. 一键开启全套智能守护
+    if (/^(?:\/task-all|开启全套|开启全套智能守护|开启全部定时)$/i.test(trimmed)) {
+      this.setupFullSuiteForUser(userId);
+      return [
+        `🎉 已为你一键配齐【WeSaver 全套智能定时守护】！`,
+        `─────────────────────────`,
+        this.renderUserTasks(userId),
+      ].join('\n\n');
+    }
+
+    const wantAutoSave = /(?:自动存|自动转存|帮我存|存进网盘|存入网盘|存到网盘|直接存)/i.test(trimmed);
+
+    // 6. 扩展 D：4K / 高画质洗版监控
+    if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|4[kK]\s*原盘|高画质|洗版)/i.test(trimmed)) {
+      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed);
+      if (movieTitle) {
+        const task = this.addTask({
+          userId,
+          type: 'quality_upgrade',
+          title: `《${movieTitle}》4K高画质洗版监控`,
+          keyword: movieTitle,
+          enabled: true,
+          intervalMinutes: 30,
+          autoSave: true,
+          targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'],
+        });
+        const firstCheck = await this.runQualityUpgrade(task, true);
+        return [
+          `💎 已为你创建【4K 高画质洗版监控】任务！`,
+          `📺 监控目标：《${movieTitle}》（匹配 4K / 2160P / REMUX / 杜比）`,
+          `⚡ 动作设定：一旦出 4K 洗版资源，自动转存至你的夸克网盘并微信通知你`,
+          `─────────────────────────`,
+          firstCheck || '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+      }
+    }
+
+    // 7. 扩展 A：连载热播剧全自动追更入库
+    if (/^(?:\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed)) {
+      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/追更\s*/i, ''));
+      if (!movieTitle) {
+        return '请告诉我要追更哪部剧呀，例如发送：「帮我追更《今天是太阳雨》」或「/追更 小城良方」~';
+      }
+      const task = this.addTask({
+        userId,
+        type: 'episode_chase',
+        title: `追更《${movieTitle}》`,
+        keyword: movieTitle,
+        enabled: true,
+        intervalMinutes: 30,
+        autoSave: true,
+        lastEpisode: 0,
+        knownShareIds: [],
+      });
+      // 同时加入个人追剧片单
+      this.userManager.addToWatchlist(userId, movieTitle);
+      const firstCheck = await this.runEpisodeChase(task, true);
+      return [
+        `📺 已为你开启【连载热播剧全自动追更】：《${movieTitle}》！`,
+        `🔄 巡检频率：每 30 分钟自动检测全网最新集数，发现新集数将自动转存夸克网盘 + 防和谐改名 + 微信推送通知你！`,
+        `─────────────────────────`,
+        firstCheck || '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    }
+
+    // 8. 场景 2：某部未出资源电影/剧集全网蹲守监控
+    if (
+      /^(?:\/watch|\/蹲守|帮我蹲守|蹲守|蹲一下|蹲一个|蹲)/i.test(trimmed) ||
+      /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
+    ) {
+      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/(?:watch|蹲守)\s*/i, ''));
+      if (!movieTitle) {
+        return '请告诉我要蹲守哪部电影或剧集呀，例如：「《流浪地球3》有资源了通知我」或「/蹲守 奥德赛」~';
+      }
+      const task = this.addTask({
+        userId,
+        type: 'resource_watch',
+        title: `蹲守《${movieTitle}》全网首发资源`,
+        keyword: movieTitle,
+        enabled: true,
+        intervalMinutes: 30,
+        autoSave: wantAutoSave || true,
+      });
+      const firstCheck = await this.runResourceWatch(task, true);
+      return [
+        `🛰️ 已为你挂载【全网资源雷达蹲守】：《${movieTitle}》！`,
+        `⚡ 触发动作：后台每 30 分钟轮询 50+ 频道，一旦出资源立即微信推送给你${task.autoSave ? '并自动转存至你的夸克网盘' : ''}！`,
+        `─────────────────────────`,
+        firstCheck || '',
+      ]
+        .filter(Boolean)
+        .join('\n');
+    }
+
+    // 9. 扩展 B / C / E 专项开启
+    if (/(?:周末周报|观影周报|片单周报|周五片单)/i.test(trimmed)) {
+      const { timeStr } = SchedulerService.parseTimeFromText(trimmed.includes('点') ? trimmed : '晚上7点');
+      const task = this.addTask({
+        userId,
+        type: 'friday_weekly',
+        title: `每周五${timeStr}周末观影精选周报`,
+        enabled: true,
+        scheduleTime: timeStr,
+        daysOfWeek: [5],
+      });
+      return `🍿 已开启【${task.title}】！每周五下班准时为你推送当周豆瓣高分新片与热剧榜单（发送「/tasks」可随时管理或发「执行任务 1」立即预览）。`;
+    }
+
+    if (/(?:网盘.*?巡检|防和谐.*?巡检|容量.*?预警|网盘.*?守护)/i.test(trimmed)) {
+      const { timeStr } = SchedulerService.parseTimeFromText(trimmed.includes('点') ? trimmed : '早上9点');
+      const task = this.addTask({
+        userId,
+        type: 'disk_guard',
+        title: `每天${timeStr}夸克网盘容量预警与防和谐巡检`,
+        enabled: true,
+        scheduleTime: timeStr,
+        minFreeGb: 5,
+      });
+      return `🛡️ 已开启【${task.title}】！每天定时为你检查网盘剩余容量并自动清洗火星文混淆剧名。`;
+    }
+
+    if (/(?:待看提醒|片单提醒)/i.test(trimmed)) {
+      const { timeStr } = SchedulerService.parseTimeFromText(trimmed.includes('点') ? trimmed : '晚上8点');
+      const task = this.addTask({
+        userId,
+        type: 'watchlist_remind',
+        title: `每周末${timeStr}个人待看片单温馨提醒`,
+        enabled: true,
+        scheduleTime: timeStr,
+        daysOfWeek: [6, 0],
+      });
+      return `📌 已开启【${task.title}】！每逢周末准时从你的「/追剧」片单中挑出好片提醒你观看。`;
+    }
+
+    // 10. 场景 1：每天/周期指定时间推送某类型电影或剧集推荐
+    if (/(?:推荐|推送|推一部|推几部|发一部|来一部|安利)/i.test(trimmed)) {
+      const { timeStr, daysOfWeek, oneShotDate } = SchedulerService.parseTimeFromText(trimmed);
+      const isMovie = /(?:电影|大片|院线|影史|片)/i.test(trimmed) && !/(?:电视剧|剧集|韩剧|美剧|日剧|国产剧)/i.test(trimmed);
+      const mediaType: 'movie' | 'tv' = isMovie ? 'movie' : 'tv';
+
+      // 提取类型标签
+      const tagCandidates = [
+        '科幻', '悬疑', '喜剧', '动作', '爱情', '犯罪', '恐怖', '惊悚', '治愈', '动画', '动漫',
+        '纪录片', '家庭', '历史', '战争', '奇幻', '武侠', '古装', '韩剧', '美剧', '英剧', '日剧', '国产剧', '港片', '豆瓣高分',
+      ];
+      let matchedTag = '热门';
+      for (const t of tagCandidates) {
+        if (trimmed.includes(t)) {
+          matchedTag = t;
+          break;
+        }
+      }
+
+      const typeLabel = matchedTag !== '热门' ? `${matchedTag}${mediaType === 'movie' ? '电影' : '剧集'}` : mediaType === 'movie' ? '高分电影' : '热门好剧';
+      const cleanQuery = `推荐一部好看的${typeLabel}`;
+
+      const task = this.addTask({
+        userId,
+        type: 'daily_recommend',
+        title: `每天 ${timeStr} 推送一部${typeLabel}`,
+        enabled: true,
+        scheduleTime: timeStr,
+        daysOfWeek,
+        oneShotDate,
+        mediaType,
+        tag: matchedTag,
+        query: cleanQuery,
+        autoSave: wantAutoSave,
+      });
+
+      return [
+        `⏰ 已为你设定好【每日定时荐片任务】！`,
+        `─────────────────────────`,
+        `📌 任务名称：${task.title}`,
+        `🕒 推送时间：${oneShotDate ? `${oneShotDate} ${timeStr}` : `每天 ${timeStr} 准时推送`}`,
+        `🎬 推荐偏好：${typeLabel}${wantAutoSave ? '（并自动转存至夸克网盘）' : '（收到推送后回复 1 即可一键转存）'}`,
+        `─────────────────────────`,
+        `💡 发送「/tasks」可查看全部定时任务，或发送「执行任务 ${this.getUserTasks(userId).length}」现在立即体验一次推送效果！`,
+      ].join('\n');
+    }
+
+    // 11. 场景 3：自定义计划任务 / 定时提醒 / 定时搜片
+    const { timeStr, daysOfWeek, oneShotDate } = SchedulerService.parseTimeFromText(trimmed);
+    const isSearchAction = /(?:帮我搜|搜一下|搜索)/i.test(trimmed);
+    const extractedTitle = SchedulerService.extractCleanMovieTitle(trimmed);
+    const cleanReminder = trimmed
+      .replace(/^(?:请|帮我|给我|麻烦)?(?:设置|创建一个|定个|加个)?(?:定时任务|计划任务)?[：:\s]*/i, '')
+      .replace(/^(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|明天|明早|今晚|今天)\s*(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)(?:\d{1,2}|半)?\s*分?\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
+      .trim() || trimmed;
+
+    const task = this.addTask({
+      userId,
+      type: 'custom_reminder',
+      title: `定时任务：${cleanReminder}`,
+      enabled: true,
+      scheduleTime: timeStr,
+      daysOfWeek,
+      oneShotDate,
+      customAction: isSearchAction ? 'search' : 'remind',
+      keyword: isSearchAction ? extractedTitle : undefined,
+      customPayload: cleanReminder,
+    });
+
+    return [
+      `🔔 已为你创建【自定义计划任务】！`,
+      `─────────────────────────`,
+      `📌 任务内容：${cleanReminder}`,
+      `🕒 触发时间：${oneShotDate ? `${oneShotDate} ${timeStr}（单次触发）` : `每天 ${timeStr} 准时执行`}`,
+      `─────────────────────────`,
+      `💡 发送「/tasks」可管理你的全部任务，发送「执行任务 ${this.getUserTasks(userId).length}」可立即触发测试！`,
+    ].join('\n');
+  }
+}
