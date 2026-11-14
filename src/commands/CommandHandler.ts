@@ -705,7 +705,11 @@ export class CommandHandler {
     // 优先使用标准片名拉取豆瓣评分与元数据
     const metaHeaders: string[] = [];
     if (correction.isCorrected && correction.explanation) {
-      metaHeaders.push(`🤖 AI 纠错：识别到「${this.aiCorrector.cleanQuery(keyword)}」➜ ${correction.explanation}`);
+      if (correction.isPlotInferred) {
+        metaHeaders.push(`💡 剧情识片：${correction.explanation}`);
+      } else {
+        metaHeaders.push(`🤖 AI 纠错：识别到「${this.aiCorrector.cleanQuery(keyword)}」➜ ${correction.explanation}`);
+      }
     }
 
     try {

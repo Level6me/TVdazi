@@ -7,6 +7,7 @@ export interface CorrectionResult {
   standardTitle: string;
   candidateKeywords: string[];
   isCorrected: boolean;
+  isPlotInferred?: boolean;
   explanation?: string;
 }
 
@@ -266,32 +267,32 @@ export class AiCorrector {
     }
 
     try {
-      // 设定 4 秒超时的 LLM 纠错请求
-      const systemPrompt = `你是一个精通中外全部影视作品的影视实体识别与纠错专家。
-用户会输入影视搜索词，其中可能包含：
-1. 演员俗称/外号（例如：荷兰弟、小李子、甜茶、阿汤哥、星爷、大表姐、抖森等）
-2. 错别字/同音字（例如：真环传 -> 甄嬛传、狂彪 -> 狂飙）
-3. 缩写简称（例如：球2 -> 流浪地球2、妇联4 -> 复仇者联盟4、权游 -> 权力的游戏）
-4. 口语化/角色特征描述（例如：我想看荷兰弟演的那个蜘蛛侠、张译演的扫黑剧 -> 狂飙）
+      const systemPrompt = `你是一个精通古今中外全部电影、电视剧、动漫、综艺的「剧情细节识片与实体推理专家」。
+用户输入的搜索词可能是：
+1. **具体的影视剧情细节 / 名场面 / 结局反转 / 人物设定 / 经典台词**（例如：“男女主在公交车上遇到高压锅炸弹一直时间循环的剧” -> 《开端》、“一家四口穷人挨个混进富豪别墅打工寄生的韩国电影” -> 《寄生虫》、“印度少年和一只孟加拉虎在海上漂流” -> 《少年派的奇幻漂流》、“卖鱼小贩高启强一步步黑化当老大的剧” -> 《狂飙》）
+2. **演员俗称 / 外号 / 导演代称**（例如：荷兰弟、小李子、甜茶、阿汤哥、星爷、诺兰拍的太空穿越电影 -> 《星际穿越》）
+3. **错别字 / 同音字 / 缩写简称**（例如：真环传 -> 《甄嬛传》、球2 -> 《流浪地球2》、妇联4 -> 《复仇者联盟4》）
 
 任务要求：
-1. 分析用户真实想看的影视作品；
-2. 给出权威正规的【官方标准中文片名】（如：蜘蛛侠：英雄归来、甄嬛传、流浪地球2）；
-3. 提取最适合在网盘资源库检索的【核心检索词】（尽量简短通用，如“蜘蛛侠”、“甄嬛传”、“流浪地球2”，避免过于冗长导致网盘无结果）；
-4. 提供备选检索词列表（candidateKeywords）；
-5. 给出简短纠错说明（不超过20字，说明俗称或纠错原因）；
-6. 如果输入本身已经是标准正确的作品名，isCorrected 设为 false。
+1. 深度推理用户描述的剧情细节或线索對應哪一部影视作品；
+2. 给出最匹配的【官方标准中文片名】（standardTitle，不带书名号，如 "开端"、"少年派的奇幻漂流"）；
+3. 提取最适合在网盘资源库检索的【核心检索词】（searchKeyword，尽量精炼准确）；
+4. 提供 2~3 个备选检索词或高度吻合该剧情的候选片名（candidateKeywords）；
+5. 判断是否为通过剧情细节/线索推理出的片名（isPlotInferred: true/false）；
+6. 给出自然简短的识别说明（explanation，35字以内，如“根据公交车爆炸时间循环的剧情细节，为您定位到白敬亭、赵今麦主演的《开端》”）；
+7. 如果输入本身已经是标准短片名且无需推理纠错，isCorrected 设为 false。
 
-必须直接输出严格合法的 JSON 对象，不要包含 markdown 代码块包裹，格式如下：
+请输出严格合法的 JSON 对象：
 {
   "isCorrected": true,
-  "standardTitle": "蜘蛛侠：英雄归来",
-  "searchKeyword": "蜘蛛侠",
-  "candidateKeywords": ["蜘蛛侠：英雄归来", "蜘蛛侠：英雄无归", "蜘蛛侠"],
-  "explanation": "荷兰弟指汤姆·赫兰德，对应其主演的《蜘蛛侠》系列"
+  "isPlotInferred": true,
+  "standardTitle": "开端",
+  "searchKeyword": "开端",
+  "candidateKeywords": ["开端"],
+  "explanation": "根据公交车爆炸时间循环的剧情细节，为您定位到白敬亭、赵今麦主演的《开端》"
 }`;
 
-      const userContent = `用户搜索词: "${cleaned}"`;
+      const userContent = `用户输入描述或搜索词: "${cleaned}"`;
 
       const responsePromise = client.chat.completions.create({
         model: model,
@@ -299,30 +300,32 @@ export class AiCorrector {
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userContent },
         ],
+        response_format: { type: 'json_object' },
         temperature: 0.1,
       });
 
-      // 4 秒超时
+      // 7 秒超时保障复杂剧情推理
       const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error('AI纠错超时')), 4000)
+        setTimeout(() => reject(new Error('AI识片超时')), 7000)
       );
 
       const completion = await Promise.race([responsePromise, timeoutPromise]);
       let rawJson = completion.choices[0]?.message?.content?.trim() || '';
 
-      // 清理可能带有的 markdown 代码块标记
       rawJson = rawJson.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/i, '').trim();
 
       const parsed = JSON.parse(rawJson);
 
       const result: CorrectionResult = {
         originalKeyword: rawKeyword,
-        correctedKeyword: parsed.searchKeyword || cleaned,
-        standardTitle: parsed.standardTitle || cleaned,
-        candidateKeywords: Array.isArray(parsed.candidateKeywords) && parsed.candidateKeywords.length > 0
-          ? parsed.candidateKeywords
-          : [parsed.searchKeyword || cleaned],
+        correctedKeyword: parsed.searchKeyword || parsed.standardTitle || cleaned,
+        standardTitle: parsed.standardTitle || parsed.searchKeyword || cleaned,
+        candidateKeywords:
+          Array.isArray(parsed.candidateKeywords) && parsed.candidateKeywords.length > 0
+            ? parsed.candidateKeywords
+            : [parsed.searchKeyword || parsed.standardTitle || cleaned],
         isCorrected: Boolean(parsed.isCorrected),
+        isPlotInferred: Boolean(parsed.isPlotInferred),
         explanation: parsed.explanation,
       };
 

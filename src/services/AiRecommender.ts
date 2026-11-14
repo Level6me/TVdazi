@@ -730,6 +730,13 @@ export class AiRecommender {
       .filter(Boolean)
       .join(' | ');
 
+    const isPlotOrSimilarQuery =
+      /(?:类似|像.*?(?:一样|那样|这种|那种)|同款|风格|设定|讲.*?的|剧情|时间循环|无限流|密室|荒岛|逃生|丧尸|末日|穿越|重生|黑化|逆袭|复仇|破案|法医|盗墓|谍战|全员恶人|高智商|烧脑反转|平行时空|灵魂互换)/.test(
+        slots.rawQuery
+      ) &&
+      slots.timeScope !== 'current_season' &&
+      slots.timeScope !== 'this_year';
+
     try {
       const prompt = `你是一个真正能听懂人话、懂影视、像微信好友一样自然聊天的影视达人。
 请仔细理解用户的这句话，并结合下方【豆瓣实时核验片单】给出最贴合他心意的回复！
@@ -741,12 +748,16 @@ ${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` 
 【你必须遵守的核心原则】：
 1. **真正理解用户的意思，拒绝机械式套格式**：
    - 绝对不要输出冷冰冰的表单卡片！**严禁**出现“🎯 为你精选...”、“----”分割线、“🎬 片名：”、“🏷️ 标签：”、“⭐ 评分：”、“🔥 推荐理由：”这种机械模板前缀！
-   - 要顺着用户的原话自然接话（例如用户指定了年份、月份档期或特定类型，就在聊天中自然点出该年份/档期/类型的特点）。
-2. **严格遵守数量、年份与类型要求**：
+   - 要顺着用户的原话自然接话（例如用户指定了具体剧情设定、“类似《XX》”、年份或类型，就在聊天中自然点出这些作品在剧情设定、人物张力或反转节奏上为什么正好戳中他的需求）。
+2. **严格遵守数量、年份与剧情设定要求**：
    - 用户要求的推荐数量：**${slots.count} 部**（如果 count=1，正文中重点只推荐 1 部最匹配的，绝不要罗列五六部！如果 count>1，用清爽的 1. 《片名》... 2. 《片名》... 自然分段介绍 ${slots.count} 部）。
-   - 用户要求的时间范围：${timeDescMap[slots.timeScope]}。必须只从下方【豆瓣实时核验片单】中挑选（若用户指定了具体月份/档期如“春节档/暑期档/10月”，优先挑选片单中最契合该档期與细分题材的作品），年份严格以片单中标注的真实年份为准！
+   - 用户要求的时间范围：${timeDescMap[slots.timeScope]}。${
+        isPlotOrSimilarQuery
+          ? '用户明确提出了【具体剧情设定或“类似某部剧”】的要求！如果下方候选池中的作品不够契合该细分剧情设定（如“时间循环”、“密室逃生”、“类似《开端》”等），请直接挑选全球/华语影视中最契合该剧情设定的经典高分代表作（注意不要推荐用户原话里已经提到的参考剧本身）！'
+          : '必须只从下方【豆瓣实时核验片单】中挑选，年份严格以片单中标注的真实年份为准！'
+      }
 3. **剧情与看点真实不瞎编**：
-   - 必须严格根据候选池里提供的【主演、类型、豆瓣真实热评】来聊这部剧为什么好看、是什么氛围，严禁胡乱编造人物关系或假剧情！
+   - 必须基于真实剧情、主演与豆瓣口碑来聊这部剧为什么好看、和用户想要的剧情细节有什么共鸣，严禁胡乱编造人物关系或假剧情！
 4. **结尾自然引导转存**：
    - 在回复末尾顺口提一句简短自然的话（不要加分割线）：${
      slots.count === 1
@@ -754,7 +765,7 @@ ${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` 
        : '告诉用户想看哪部直接回对应数字（如 1、2）就能帮他搜夸克网盘存好，或者回「换一批」看看别的。'
    }
 
-【豆瓣实时核验片单（100% 真实在播数据，请严格从中挑选最契合用户意图的 ${slots.count} 部）】：
+【豆瓣实时核验片单（真实在播/高分数据参考）】：
 ${candidateContext}
 
 请输出严格 JSON 格式：
@@ -779,7 +790,6 @@ ${candidateContext}
           : [];
 
         if (replyText && rawTitles.length > 0) {
-          // 防御性校准：当用户要求今年/近期(2026)作品时，防止模型误将 (2026) 写成 (2025)
           if (slots.timeScope === 'current_season' || slots.timeScope === 'this_year') {
             replyText = replyText.replace(/[（\(]2025(?:年)?[）\)]/g, `(${currentYear})`);
           }
@@ -787,19 +797,26 @@ ${candidateContext}
           const cleanTitles = rawTitles.map((t) => String(t).replace(/[《》""''「」]/g, '').trim()).filter(Boolean);
           this.recordRecommended(userId, cleanTitles);
 
-          const subjects: DoubanSubject[] = cleanTitles.map((title) => {
-            const matched = topCandidates.find((c) => c.title === title || c.title.includes(title) || title.includes(c.title));
-            return (
-              matched || {
+          const subjects: DoubanSubject[] = await Promise.all(
+            cleanTitles.map(async (title) => {
+              const matched = topCandidates.find(
+                (c) => c.title === title || c.title.includes(title) || title.includes(c.title)
+              );
+              if (matched) return matched;
+
+              const enriched = await this.doubanService.searchAndEnrichSubjectByTitle(title);
+              if (enriched) return enriched;
+
+              return {
                 id: title,
                 title,
-                rate: '8.0',
+                rate: '8.2',
                 cover: '',
                 url: '',
                 year: String(currentYear),
-              }
-            );
-          });
+              };
+            })
+          );
 
           const items: RecommendItem[] = subjects.map((s, idx) => ({
             title: s.title,

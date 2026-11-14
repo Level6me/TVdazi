@@ -96,9 +96,9 @@ export class DoubanService {
   }
 
   /**
-   * 根据片名检索豆瓣信息，获取准确年份、评分、原名与演员
+   * 根据片名检索豆瓣信息，获取准确 ID、年份、评分、原名与演员
    */
-  async getMovieMeta(keyword: string): Promise<{ title: string; year?: string; rate?: string; subTitle?: string } | null> {
+  async getMovieMeta(keyword: string): Promise<{ id?: string; title: string; year?: string; rate?: string; subTitle?: string } | null> {
     const clean = keyword.replace(/^(电影|电视剧|网剧|动漫)\s*/, '').trim();
     if (!clean) return null;
 
@@ -109,13 +109,16 @@ export class DoubanService {
           'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
           Referer: 'https://movie.douban.com/',
         },
-        timeout: 5000,
+        timeout: 4500,
       });
 
       if (Array.isArray(resp.data) && resp.data.length > 0) {
-        // 优先匹配标题相近的条目
-        const matched = resp.data.find((item: any) => clean.includes(item.title) || item.title.includes(clean)) || resp.data[0];
+        const matched =
+          resp.data.find((item: any) => item.title === clean) ||
+          resp.data.find((item: any) => clean.includes(item.title) || item.title.includes(clean)) ||
+          resp.data[0];
         return {
+          id: matched.id ? String(matched.id) : undefined,
           title: matched.title,
           year: matched.year,
           subTitle: matched.sub_title,
@@ -125,6 +128,30 @@ export class DoubanService {
     } catch {
       return null;
     }
+  }
+
+  /**
+   * 根据片名直接查询豆瓣并补全真实详情摘要（用于特定剧情/相似剧集精准核验）
+   */
+  async searchAndEnrichSubjectByTitle(title: string): Promise<DoubanSubject | null> {
+    const meta = await this.getMovieMeta(title);
+    if (!meta || !meta.id) return null;
+
+    const abs = await this.getSubjectAbstract(meta.id);
+    return {
+      id: meta.id,
+      title: meta.title || title,
+      rate: abs?.rate || '',
+      cover: '',
+      url: `https://movie.douban.com/subject/${meta.id}/`,
+      year: abs?.year || meta.year,
+      types: abs?.types || [],
+      region: abs?.region,
+      actors: abs?.actors,
+      directors: abs?.directors,
+      episodesCount: abs?.episodesCount,
+      shortComment: abs?.shortComment,
+    };
   }
 
   /**
