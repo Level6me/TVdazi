@@ -831,7 +831,14 @@ export class CommandHandler {
   async renderSearch(
     keyword: string,
     userId: string = 'default_user',
-    searchMeta?: { initialAliases?: string[]; originalTitle?: string; year?: string }
+    searchMeta?: {
+      initialAliases?: string[];
+      originalTitle?: string;
+      year?: string;
+      mediaType?: 'movie' | 'tv';
+      overview?: string;
+      enableAiFilter?: boolean;
+    }
   ): Promise<string> {
     this.userManager.recordSearch(userId);
 
@@ -895,10 +902,12 @@ export class CommandHandler {
       );
     }
 
+    let doubanYear: string | undefined;
     try {
       const meta = (await this.doubanService.getMovieMeta(standardTitle)) ||
                    (await this.doubanService.getMovieMeta(searchWord));
       if (meta) {
+        doubanYear = meta.year;
         const yearPart = meta.year ? `(${meta.year})` : '';
         const subPart = meta.subTitle ? ` / ${meta.subTitle}` : '';
         metaHeaders.push(`⭐ 豆瓣影视：${meta.title} ${yearPart}${subPart}`);
@@ -982,11 +991,63 @@ export class CommandHandler {
       }
     }
 
+    // 5. AI 搜索结果语义精筛：剔除同名异作、年份/类型明显不符及无关推广帖
+    let interceptedAllByAi = false;
+    let interceptedReason: string | undefined;
+    const rawCountBeforeAi = res.items?.length || 0;
+
+    if (res.items && res.items.length > 0 && searchMeta?.enableAiFilter !== false) {
+      // 若配置了 TMDB 且此前未获取元数据（例如纯文本搜索直接命中足够条数），快速补充年份/原名给 AI 校验
+      if (!resolvedInfo && !searchMeta?.year && resolver.hasTmdbConfigured()) {
+        try {
+          resolvedInfo = await resolver.resolveMedia({
+            query: standardTitle,
+            guessTitle: standardTitle,
+            alternateTitles: allAliases,
+            userId,
+          });
+        } catch {}
+      }
+
+      const aiFilter = await resolver.filterRelevantResources({
+        items: res.items,
+        targetTitle: standardTitle || searchWord,
+        originalTitle: searchMeta?.originalTitle || resolvedInfo?.originalTitle,
+        aliases: allAliases,
+        year: searchMeta?.year || resolvedInfo?.year || doubanYear,
+        mediaType: searchMeta?.mediaType || resolvedInfo?.mediaType,
+        overview: searchMeta?.overview || resolvedInfo?.overview,
+        userId,
+      });
+
+      if (aiFilter.aiFiltered) {
+        res = {
+          ...res,
+          items: aiFilter.filteredItems,
+          totalFound: aiFilter.filteredItems.length,
+        };
+        if (aiFilter.filteredItems.length === 0 && rawCountBeforeAi > 0) {
+          interceptedAllByAi = true;
+          interceptedReason = aiFilter.reason;
+        } else if (aiFilter.droppedCount > 0) {
+          metaHeaders.push(
+            `🧹 AI 精筛：已剔除 ${aiFilter.droppedCount} 条同名异作或无关资源${aiFilter.reason ? `（${aiFilter.reason}）` : ''}`
+          );
+        }
+      }
+    }
+
     const metaHeader = metaHeaders.join('\n');
 
     if (!res.items || res.items.length === 0) {
       const displayWord = correction.isCorrected ? `${standardTitle}（原词：${keyword}）` : standardTitle;
       const cleanName = standardTitle || searchWord;
+      if (interceptedAllByAi) {
+        return [
+          `🔍 全网检索到 ${rawCountBeforeAi} 条含「${cleanName}」的候选帖，但经 AI 逐条核对均非目标作品本身${interceptedReason ? `（${interceptedReason}）` : ''}，已为您自动过滤误匹配资源。`,
+          `💡 如确认尚未流出资源，直接回复「蹲守《${cleanName}》」，出资源后第一时间微信通知你并自动入库！`,
+        ].join('\n');
+      }
       const triedHint = allAliases.length > 0 ? `\n（已自动扩展尝试关联别名：${allAliases.slice(0, 3).join(' / ')}）` : '';
       return [
         `🔍 暂时还没找到关于「${displayWord}」的有效网盘资源呢~${triedHint}`,

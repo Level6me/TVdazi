@@ -19,6 +19,16 @@ export interface HotSession {
   updatedAt: number;
 }
 
+export interface PendingImageSearch {
+  standardTitle: string;
+  originalTitle?: string;
+  aliases: string[];
+  year?: string;
+  mediaType?: 'movie' | 'tv';
+  overview?: string;
+  updatedAt: number;
+}
+
 export class SessionManager {
   private static instance: SessionManager;
   private static readonly SESSION_TTL_MS = 30 * 60 * 1000; // 30分钟会话超时，避免隔天回复数字误转存
@@ -26,6 +36,7 @@ export class SessionManager {
   private hotSessions: Map<string, HotSession> = new Map();
   private lastActiveSessionType: Map<string, 'search' | 'hot'> = new Map();
   private lastMentionedTitles: Map<string, { title: string; updatedAt: number }> = new Map();
+  private pendingImageSearches: Map<string, PendingImageSearch> = new Map();
 
   static getInstance(): SessionManager {
     if (!SessionManager.instance) {
@@ -151,6 +162,29 @@ export class SessionManager {
     if (candidates.length === 0) return undefined;
     candidates.sort((a, b) => b.updatedAt - a.updatedAt);
     return candidates[0].title;
+  }
+
+  setPendingImageSearch(userId: string, info: Omit<PendingImageSearch, 'updatedAt'>): PendingImageSearch {
+    const entry: PendingImageSearch = {
+      ...info,
+      updatedAt: Date.now(),
+    };
+    this.setBounded(this.pendingImageSearches, userId, entry);
+    return entry;
+  }
+
+  getPendingImageSearch(userId: string): PendingImageSearch | undefined {
+    const entry = this.pendingImageSearches.get(userId);
+    if (!entry) return undefined;
+    if (this.isExpired(entry.updatedAt)) {
+      this.pendingImageSearches.delete(userId);
+      return undefined;
+    }
+    return entry;
+  }
+
+  clearPendingImageSearch(userId: string): void {
+    this.pendingImageSearches.delete(userId);
   }
 
   /**

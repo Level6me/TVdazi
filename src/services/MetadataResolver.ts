@@ -1,6 +1,7 @@
 import axios from 'axios';
 import { DoubanService } from './DoubanService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
+import { CloudResource } from '../types';
 
 export interface MediaResolveInput {
   query?: string;
@@ -19,6 +20,7 @@ export interface ResolvedMediaInfo {
   aliases: string[];
   year?: string;
   mediaType?: 'movie' | 'tv';
+  overview?: string;
   source: 'tmdb' | 'bangumi' | 'douban' | 'llm' | 'raw';
 }
 
@@ -199,6 +201,7 @@ export class MetadataResolver {
           aliases: this.buildUniqueAliases(officialTitle, collectedAliases),
           year: year || undefined,
           mediaType,
+          overview: best.overview ? String(best.overview).trim() : undefined,
           source: 'tmdb',
         };
       } catch {
@@ -337,7 +340,19 @@ export class MetadataResolver {
       return cached.data;
     }
 
-    const rawCandidates = [cleanOrig, cleanGuess, cleanQuery, ...(input.alternateTitles || [])].filter(Boolean);
+    const splitOrigParts = cleanOrig
+      ? cleanOrig
+          .split(/\s*[\/|｜]\s*/)
+          .map((s) => this.normalizeCleanTitle(s))
+          .filter((s) => s.length >= 2)
+      : [];
+    const rawCandidates = [
+      ...splitOrigParts,
+      cleanOrig,
+      cleanGuess,
+      cleanQuery,
+      ...(input.alternateTitles || []),
+    ].filter(Boolean);
 
     // 1. 方案 B：若配置了 TMDB_API_KEY，优先调用 TMDB 对齐官方中文译名与多语言别名
     if (this.hasTmdbConfigured()) {
@@ -452,5 +467,117 @@ export class MetadataResolver {
     };
     this.setCache(cacheKey, rawResult);
     return rawResult;
+  }
+
+  /**
+   * AI 检索结果精准筛选：剔除同名异作（例如搜索《突如其来》误命中《突如其来的幸福》/其他年份同名片）、
+   * 仅在推广页脚提及关键词的无关合集、以及短剧/电子书/音频资源
+   */
+  public async filterRelevantResources(params: {
+    items: CloudResource[];
+    targetTitle: string;
+    originalTitle?: string;
+    aliases?: string[];
+    year?: string;
+    mediaType?: 'movie' | 'tv';
+    overview?: string;
+    userId?: string;
+  }): Promise<{ filteredItems: CloudResource[]; aiFiltered: boolean; droppedCount: number; reason?: string }> {
+    const items = params.items || [];
+    if (items.length === 0) {
+      return { filteredItems: [], aiFiltered: false, droppedCount: 0 };
+    }
+
+    const { client, model, hasValidKey } = LlmClientFactory.getClientForUser(params.userId, 8000);
+    if (!hasValidKey) {
+      return { filteredItems: items, aiFiltered: false, droppedCount: 0 };
+    }
+
+    const candidates = items.slice(0, 25);
+    const serialized = candidates.map((item, idx) => {
+      const cleanRaw = (item.rawText || '')
+        .replace(/https?:\/\/\S+/g, '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 160);
+      return `[${idx}] 标题:${item.title} | 分类:${item.category || '未知'} | 摘要:${cleanRaw}`;
+    });
+
+    const targetDesc = [
+      `标准片名: 《${params.targetTitle}》`,
+      params.originalTitle ? `外语原名: ${params.originalTitle}` : '',
+      params.year ? `年份: ${params.year}` : '',
+      params.mediaType ? `类型: ${params.mediaType === 'movie' ? '电影' : '剧集'}` : '',
+      params.aliases && params.aliases.length > 0 ? `合法别名: ${params.aliases.slice(0, 5).join(' / ')}` : '',
+      params.overview ? `剧情梗概: ${params.overview.slice(0, 120)}` : '',
+    ]
+      .filter(Boolean)
+      .join('；');
+
+    const systemPrompt = `你是网盘影视资源精准审核专家。
+给定用户真正想找的目标影视作品元信息，以及从 Telegram 频道按关键词抓取到的候选网盘资源列表，请严格甄别每一条候选资源是否真正属于目标作品本身！
+
+剔除标准（务必严格）：
+1. **同名异作 / 局部撞词**：标题只是包含了目标词的一部分（例如目标为《突如其来》，候选却是《突如其来的幸福》《突如其来的大雨》《突然的喜欢》等另一部作品）；
+2. **年份/国家/类型明显不符**：例如目标为 2026 年日本电影，候选明确是 2010 年欧美片、国产微短剧、综艺、纪录片、小说电子书、音乐专辑、PPT 模板或频道广告合集；
+3. **仅顺带提及**：目标词仅出现在频道尾部推荐列表或标签广告中，本帖主资源并非该作品。
+
+保留标准：
+- 标题或正文主资源确实对应目标作品本身（或已知外语原名/官方港台译名），即便标题带了年份、画质(4K/1080P)、字幕组前缀也应保留。
+- 如果候选中没有任何条目是目标作品，请果断将 keepIndices 设为 []，宁缺毋滥，绝不放行错片！
+
+请严格输出合法 JSON：
+{
+  "keepIndices": [0, 2],
+  "reason": "用25字以内简述过滤或保留依据"
+}`;
+
+    try {
+      const resp = await client.chat.completions.create({
+        model,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: `【目标作品】\n${targetDesc}\n\n【候选资源(${candidates.length}条)】\n${serialized.join('\n')}` },
+        ],
+        response_format: { type: 'json_object' },
+        temperature: 0.1,
+      });
+
+      const raw = (resp.choices[0]?.message?.content || '')
+        .replace(/^```(?:json)?\s*/i, '')
+        .replace(/\s*```$/i, '')
+        .trim();
+      const parsed = JSON.parse(raw);
+
+      if (!Array.isArray(parsed.keepIndices)) {
+        return { filteredItems: items, aiFiltered: false, droppedCount: 0 };
+      }
+
+      const validSeen = new Set<number>();
+      const kept: CloudResource[] = [];
+      for (const rawIdx of parsed.keepIndices) {
+        const idx = Number(rawIdx);
+        if (Number.isInteger(idx) && idx >= 0 && idx < candidates.length && !validSeen.has(idx)) {
+          validSeen.add(idx);
+          kept.push(candidates[idx]);
+        }
+      }
+
+      const droppedCount = candidates.length - kept.length;
+      const reason = parsed.reason ? String(parsed.reason).trim() : undefined;
+      console.log(
+        `[AI 精筛] target=《${params.targetTitle}》, 候选=${candidates.length}, 保留=${kept.length}, 剔除=${droppedCount}, reason=${reason || '-'}`
+      );
+
+      return {
+        filteredItems: kept,
+        aiFiltered: true,
+        droppedCount,
+        reason,
+      };
+    } catch (err: any) {
+      console.warn('[AI 精筛降级] 跳过 AI 筛选，保留原检索结果:', err.message);
+      return { filteredItems: items, aiFiltered: false, droppedCount: 0 };
+    }
   }
 }

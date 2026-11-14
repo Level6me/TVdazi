@@ -16,6 +16,8 @@ export interface RecognizedImageResult {
   rawGuessTitle?: string;
   aliases: string[];
   year?: string;
+  mediaType?: 'movie' | 'tv';
+  overview?: string;
   source: 'tmdb' | 'bangumi' | 'douban' | 'llm' | 'raw';
 }
 
@@ -185,6 +187,8 @@ export class DeepSeekAgent {
         rawGuessTitle: officialChineseTitle || undefined,
         aliases: resolved.aliases,
         year: resolved.year || year || undefined,
+        mediaType: resolved.mediaType,
+        overview: resolved.overview,
         source: resolved.source,
       };
     } catch (err: any) {
@@ -202,29 +206,58 @@ export class DeepSeekAgent {
   }
 
   /**
-   * 处理用户发送的图片（识图 -> 官方译名对齐 -> 多别名搜剧闭环）
+   * 判断用户文本是否属于对“待确认识图搜索”的肯定确认
+   */
+  public isPendingImageSearchConfirm(userId: string, text: string): boolean {
+    if (!this.sessionManager.getPendingImageSearch(userId)) return false;
+    const clean = (text || '').trim();
+    return /^(?:搜索|搜|搜一下|搜一搜|搜吧|开始搜索|开始|好的|好|好呀|嗯|嗯嗯|要|要的|需要|是|是的|查一下|帮我搜|确认|可以|行|1|ok|yes)[!！。.~～]*$/i.test(
+      clean
+    );
+  }
+
+  /**
+   * 处理用户发送的图片：先回复识别到的详细片名信息，并询问是否开始全网搜索与 AI 精筛
    */
   async handleImageMessage(imageBuffer: Buffer, userId: string = 'default_user'): Promise<string> {
     const detail = await this.recognizeMovieDetailFromImage(imageBuffer, userId);
 
     if (detail) {
-      const searchResultText = await this.commandHandler.renderSearch(detail.standardTitle, userId, {
-        initialAliases: detail.aliases,
+      this.sessionManager.setPendingImageSearch(userId, {
+        standardTitle: detail.standardTitle,
         originalTitle: detail.originalTitle,
+        aliases: detail.aliases,
         year: detail.year,
+        mediaType: detail.mediaType,
+        overview: detail.overview,
       });
+      this.sessionManager.setLastMentionedTitle(userId, detail.standardTitle);
 
-      const titleLineParts = [`📸 收到图片！识别片名：【《${detail.standardTitle}》】`];
+      const typeLabel = detail.mediaType === 'tv' ? '剧集' : detail.mediaType === 'movie' ? '电影' : '';
+      const yearTypeLine = [detail.year ? `${detail.year}年` : '', typeLabel].filter(Boolean).join(' / ');
+
+      const lines = [
+        '✅ 识别完成！作品信息如下：',
+        `• 官方片名：《${detail.standardTitle}》`,
+      ];
       if (detail.originalTitle && detail.originalTitle.toLowerCase() !== detail.standardTitle.toLowerCase()) {
-        titleLineParts.push(`（原名：${detail.originalTitle}${detail.year ? ` / ${detail.year}` : ''}）`);
-      } else if (detail.year) {
-        titleLineParts.push(`（${detail.year}）`);
+        lines.push(`• 原语言名：${detail.originalTitle}`);
       }
+      if (yearTypeLine) {
+        lines.push(`• 年份类型：${yearTypeLine}`);
+      }
+      if (detail.aliases.length > 0) {
+        lines.push(`• 关联别名：${detail.aliases.slice(0, 4).join(' / ')}`);
+      }
+      if (detail.overview) {
+        const shortOverview = detail.overview.length > 90 ? `${detail.overview.slice(0, 90)}...` : detail.overview;
+        lines.push(`• 剧情简介：${shortOverview}`);
+      }
+      lines.push('----------------------------------------');
+      lines.push(`❓ 需要我立即为你全网搜索并 AI 筛选《${detail.standardTitle}》的网盘资源吗？`);
+      lines.push('💬 回复「搜索」、「好的」或「要」即可开始搜片（若片名有误，也可以直接发准确片名给我）。');
 
-      const aliasHint =
-        detail.aliases.length > 0 ? `🔀 同步扩展关联别名检索：${detail.aliases.slice(0, 3).join(' / ')}` : '';
-
-      return [titleLineParts.join(''), aliasHint, searchResultText].filter(Boolean).join('\n');
+      return lines.join('\n');
     }
 
     return [
@@ -286,6 +319,34 @@ export class DeepSeekAgent {
       }
       this.userHistories.set(userId, { messages: list, updatedAt: Date.now() });
     };
+
+    // 0. 优先处理识图完成后的“是否开始搜索资源”二次确认状态
+    const pendingImage = this.sessionManager.getPendingImageSearch(userId);
+    if (pendingImage && !trimmed.startsWith('/')) {
+      if (this.isPendingImageSearchConfirm(userId, trimmed)) {
+        this.sessionManager.clearPendingImageSearch(userId);
+        const searchReply = await this.commandHandler.renderSearch(pendingImage.standardTitle, userId, {
+          initialAliases: pendingImage.aliases,
+          originalTitle: pendingImage.originalTitle,
+          year: pendingImage.year,
+          mediaType: pendingImage.mediaType,
+          overview: pendingImage.overview,
+          enableAiFilter: true,
+        });
+        appendUserHistory(trimmed, searchReply);
+        return searchReply;
+      }
+
+      if (/^(?:不用|不用了|不需要|算了|取消|不要|不搜|先不搜|no|cancel)[!！。.~～]*$/i.test(trimmed)) {
+        this.sessionManager.clearPendingImageSearch(userId);
+        const cancelReply = '好的，已取消本次搜索~ 随时想搜哪部片子直接告诉我即可！';
+        appendUserHistory(trimmed, cancelReply);
+        return cancelReply;
+      }
+
+      // 用户未按确认词回复而是发了其他指令或新片名，清理旧的待确认态继续正常处理
+      this.sessionManager.clearPendingImageSearch(userId);
+    }
 
     // 1. 优先匹配原版指令、快捷翻页或序号选择
     if (this.commandHandler.isCommand(trimmed, userId)) {

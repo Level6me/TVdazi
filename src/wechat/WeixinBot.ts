@@ -374,6 +374,14 @@ export class WeixinBot {
               // 异步入队处理：不阻塞长轮询心跳，同时保证同一用户连发消息按顺序执行
               this.enqueueUserTask(userQueueKey, async () => {
                 try {
+                  if (this.agent.isPendingImageSearchConfirm(fromUser, userText)) {
+                    await this.sendTextMessageWithAuth(
+                      auth,
+                      fromUser,
+                      '🔍 收到！正在全网搜索并通过 AI 精筛匹配资源，请稍候...',
+                      contextToken
+                    );
+                  }
                   const reply = await this.agent.chat(userText, [], fromUser);
                   await this.sendTextMessageWithAuth(auth, fromUser, reply, contextToken);
                 } catch (chatErr: any) {
@@ -596,6 +604,14 @@ export class WeixinBot {
         await this.sendTextMessageWithAuth(auth, fromUser, '📸 收到图片啦，不过图片数据似乎有点损坏，再发一次试试看？', contextToken);
         return;
       }
+
+      // 立即给用户发送接收回执，避免识图期间长时间无反馈
+      await this.sendTextMessageWithAuth(
+        auth,
+        fromUser,
+        '📸 收到图片啦，正在识别图中影视作品，请稍候...',
+        contextToken
+      );
 
       const baseUrl = (auth.baseUrl || FIXED_BASE_URL).replace(/^https?:\/\/https?:\/\//, 'https://');
       const decryptedBuf = await downloadAndDecryptWechatImage(media, aeskeyHex, baseUrl);

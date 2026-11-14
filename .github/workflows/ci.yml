@@ -106,5 +106,23 @@ jobs:
           assert.strictEqual(merged.items.length, 2);
           assert.strictEqual(merged.items[0].shareId, 'main2');
 
+          // 8. PendingImageSearch state & confirmation matching check
+          const smGlobal = SessionManager.getInstance();
+          smGlobal.setPendingImageSearch('img_u1', {
+            standardTitle: '突如其来',
+            originalTitle: '急に具合が悪くなる',
+            aliases: ['All of a Sudden'],
+            year: '2026',
+            mediaType: 'movie',
+          });
+          assert.strictEqual(smGlobal.getPendingImageSearch('img_u1').standardTitle, '突如其来');
+          const { DeepSeekAgent } = require('./dist/agent/DeepSeekAgent');
+          const dummyAgent = new DeepSeekAgent('dummy');
+          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '搜索'), true);
+          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '好的'), true);
+          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '不用了'), false);
+          smGlobal.clearPendingImageSearch('img_u1');
+          assert.strictEqual(smGlobal.getPendingImageSearch('img_u1'), undefined);
+
           console.log('ALL_CI_CHECKS_PASSED');
           EOF
