@@ -18,6 +18,21 @@
 
 ---
 
+## 📸 运行效果与实操展示
+
+<p align="center">
+  <img src="docs/images/01_recommend_chat.jpg" alt="自然推荐与热评下饭" width="31%" />
+  <img src="docs/images/02_single_movie_rec.jpg" alt="单部深度种草" width="31%" />
+  <img src="docs/images/03_xiaohongshu_note.jpg" alt="小红书风格片单" width="31%" />
+</p>
+
+<p align="center">
+  <img src="docs/images/04_search_quark_save.jpg" alt="全网多源搜片与一键转存" width="46%" />
+  <img src="docs/images/05_status_and_help.jpg" alt="真实网盘容量与指令指南" width="46%" />
+</p>
+
+---
+
 ## 🌟 核心特性与亮点
 
 ### 🍿 1. 小红书沉浸式种草推荐引擎
