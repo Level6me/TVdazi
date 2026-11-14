@@ -77,8 +77,13 @@ jobs:
           assert.strictEqual(sm.getLastActiveType('u1'), 'search');
 
           // 5. LlmClientFactory defaults check
-          assert.strictEqual(LlmClientFactory.DEFAULT_MODEL, 'deepseek-flash');
-          assert.strictEqual(LlmClientFactory.VISION_MODEL, 'deepseek-flash');
+          assert.strictEqual(LlmClientFactory.getDefaultModel(), 'deepseek-flash');
+          assert.strictEqual(LlmClientFactory.getVisionModel(), 'deepseek-flash');
+
+          // 6. WeixinBot long-message chunking check
+          const { WeixinBot } = require('./dist/wechat/WeixinBot');
+          const chunks = WeixinBot.prototype.splitMessageChunks('line\n'.repeat(600), 1800);
+          assert(chunks.length >= 2 && chunks.every((c) => c.length > 0 && c.length <= 1800));
 
           console.log('ALL_CI_CHECKS_PASSED');
           EOF
