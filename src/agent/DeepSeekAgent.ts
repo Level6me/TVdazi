@@ -154,6 +154,14 @@ export class DeepSeekAgent {
     }
 
     const appendUserHistory = (userText: string, assistantReply: string) => {
+      // 从助手自由回复中提取《片名》，供“半小时后转存到网盘”等延时上下文任务嗅探使用
+      const bookMatches = assistantReply.match(/《([^》\n]{1,40})》/g);
+      if (bookMatches && bookMatches.length > 0) {
+        const lastMatch = bookMatches[bookMatches.length - 1].replace(/[《》]/g, '').trim();
+        if (lastMatch) {
+          this.sessionManager.setLastMentionedTitle(userId, lastMatch);
+        }
+      }
       let list = this.userHistories.get(userId) || [];
       list.push({ role: 'user', content: userText });
       list.push({ role: 'assistant', content: assistantReply });
@@ -342,13 +350,54 @@ export class DeepSeekAgent {
           type: 'function',
           function: {
             name: 'manage_scheduled_task',
-            description: '当用户希望设置定时或延时任务时调用。涵盖：相对延时任务（如两分钟后推荐一部电影、半小时后转存到网盘）、每日/周期定时荐片、新片蹲守监控、连载剧集追更、4K洗版监控、周末观影周报、网盘巡检、任意自定义计划任务，或指定/修改轮询间隔',
+            description: '当用户希望设置、查看或修改任何定时、延时或周期监控任务时必须调用。涵盖：相对延时（如“两分钟后推荐一部电影”、“半个小时后转存到网盘”、“10分钟提醒我”）、每日/指定日期定点任务、新片蹲守、连载追更、4K洗版、轮询间隔修改或任意自定义计划任务',
             parameters: {
               type: 'object',
               properties: {
                 instruction: {
                   type: 'string',
                   description: '用户的完整定时、延时、监控或轮询间隔指令原文，如“两分钟后给我推荐一部电影”、“半个小时后转存到网盘”、“每10分钟帮我蹲守《流浪地球3》”、“把任务1间隔改成15分钟”',
+                },
+                action_type: {
+                  type: 'string',
+                  enum: [
+                    'delayed_recommend',
+                    'delayed_transfer',
+                    'daily_recommend',
+                    'resource_watch',
+                    'episode_chase',
+                    'quality_upgrade',
+                    'custom_reminder',
+                  ],
+                  description: '任务类型：延时荐片(delayed_recommend)、延时转存(delayed_transfer)、定时荐片(daily_recommend)、新片蹲守(resource_watch)、连载追更(episode_chase)、4K洗版(quality_upgrade)、自定义提醒(custom_reminder)',
+                },
+                delay_minutes: {
+                  type: 'number',
+                  description: '相对延时触发的分钟数（支持小数，如0.5表示30秒、2表示2分钟、30表示半小时）',
+                },
+                schedule_time: {
+                  type: 'string',
+                  description: '每天或单次定点触发时间，24小时制 HH:mm（如 08:30、21:00）',
+                },
+                interval_minutes: {
+                  type: 'number',
+                  description: '周期循环轮询间隔分钟数（如 10 表示每10分钟执行一次）',
+                },
+                one_shot: {
+                  type: 'boolean',
+                  description: '是否为单次执行任务（相对延时任务默认为 true）',
+                },
+                keyword: {
+                  type: 'string',
+                  description: '关联的影视剧片名（如有）',
+                },
+                content: {
+                  type: 'string',
+                  description: '推荐要求或提醒内容描述',
+                },
+                auto_save: {
+                  type: 'boolean',
+                  description: '触发后是否自动转存至夸克网盘',
                 },
               },
               required: ['instruction'],
@@ -430,10 +479,10 @@ export class DeepSeekAgent {
           appendUserHistory(trimmed, dirReply);
           return dirReply;
         } else if (toolCall.function.name === 'manage_scheduled_task') {
-          const schedReply = await SchedulerService.getInstance().handleNaturalLanguageCommand(
-            args.instruction || trimmed,
-            userId
-          );
+          const schedReply = await SchedulerService.getInstance().createStructuredTask(userId, {
+            ...args,
+            instruction: args.instruction || trimmed,
+          });
           appendUserHistory(trimmed, schedReply);
           return schedReply;
         }

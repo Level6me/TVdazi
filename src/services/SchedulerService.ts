@@ -32,6 +32,7 @@ export interface ScheduledTask {
   scheduleTime?: string;      // "HH:mm" 格式，如 "08:00", "20:30"
   daysOfWeek?: number[];      // 0(周日)~6(周六)，不填或空数组表示每天
   oneShotDate?: string;       // "YYYY-MM-DD" 单次提醒日期（执行后自动标记完成）
+  triggerAt?: number;         // 精确毫秒级触发时间戳（适用于“2分钟后”、“半小时后”等相对延时单次任务）
   intervalMinutes?: number;   // 轮询间隔分钟数（适用于蹲守/追更/4K监控，默认 30 分钟）
 
   // 业务参数
@@ -110,7 +111,7 @@ export class SchedulerService {
   }
 
   /**
-   * 启动后台定时轮询引擎（每 30 秒检查一次时间触发与资源轮询）
+   * 启动后台定时轮询引擎（每 10 秒检查一次精准延时触发、定点时间触发与资源轮询）
    */
   public start(pushCallback: PushMessageCallback): void {
     this.pushCallback = pushCallback;
@@ -123,7 +124,7 @@ export class SchedulerService {
       this.tick().catch((err) => {
         console.error('[SchedulerService] tick 执行异常:', err.message);
       });
-    }, 30 * 1000);
+    }, 10 * 1000);
   }
 
   public stop(): void {
@@ -172,6 +173,23 @@ export class SchedulerService {
           continue;
         }
 
+        // 0. 精准相对延时单次任务（精确到秒级时间戳，确保绝不提前触发）
+        if (task.triggerAt) {
+          if (nowMs >= task.triggerAt) {
+            task.lastTriggeredDate = minuteKey;
+            task.lastRunAt = nowMs;
+            task.status = 'completed';
+            task.enabled = false;
+            this.saveTasks();
+
+            const msg = await this.executeTask(task, false);
+            if (msg && this.pushCallback) {
+              await this.pushCallback(task.userId, msg);
+            }
+          }
+          continue;
+        }
+
         // 1. 时间定点触发型任务（含 daily_recommend, friday_weekly, disk_guard, watchlist_remind, custom_reminder，或者带 scheduleTime 的任务）
         if (task.scheduleTime) {
           if (task.scheduleTime === timeStr && task.lastTriggeredDate !== minuteKey) {
@@ -184,6 +202,10 @@ export class SchedulerService {
 
             task.lastTriggeredDate = minuteKey;
             task.lastRunAt = nowMs;
+            if (task.oneShotDate) {
+              task.status = 'completed';
+              task.enabled = false;
+            }
             this.saveTasks();
 
             const msg = await this.executeTask(task, false);
@@ -777,8 +799,9 @@ export class SchedulerService {
     const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
     if (!bestQuark) return null;
 
+    const category = bestQuark.category || CategoryClassifier.classify(bestQuark.title, bestQuark.rawText || '') || defaultCategory;
     const userPlan = this.userManager.getUserPlan(userId);
-    const saveRes = await this.quarkService.saveShareFiles(bestQuark.shareId, '', defaultCategory, {
+    const saveRes = await this.quarkService.saveShareFiles(bestQuark.shareId, '', category, {
       customCookie: userPlan.quarkCookie,
       rootDir: userPlan.saveRootDir,
       standardTitle: title,
@@ -786,8 +809,8 @@ export class SchedulerService {
     });
 
     if (saveRes.success) {
-      this.userManager.recordSave(userId, title, bestQuark.shareUrl, defaultCategory);
-      return `⚡ 已顺便为你把《${title}》自动转存进夸克网盘：【${saveRes.targetPath}】！`;
+      this.userManager.recordSave(userId, title, bestQuark.shareUrl, category);
+      return `⚡ 已为你把《${title}》自动转存进夸克网盘：【${saveRes.targetPath}】！`;
     }
     return null;
   }
@@ -1193,14 +1216,15 @@ export class SchedulerService {
   // ==================== 自然语言识别与解析器 ====================
 
   /**
-   * 快速嗅探用户输入是否属于定时/蹲守/追更/任务管理意图
+   * 快速嗅探用户输入是否属于定时/延时/蹲守/追更/任务管理意图
    */
   public isScheduleIntent(text: string): boolean {
     const trimmed = text.trim();
     if (
-      /^(?:\/tasks|\/schedule|\/定时|\/watch|\/追更|\/蹲守|\/task-run|\/task-del|\/task-all|\/task-interval|定时任务|我的任务|我的定时|查看任务|任务列表|执行任务\s*\d+|测试任务\s*\d+|删除任务\s*\d+|取消任务\s*\d+|暂停任务\s*\d+|恢复任务\s*\d+|清空任务|开启全套)/i.test(
+      /^(?:\/tasks|\/schedule|\/定时|\/watch|\/追更|\/蹲守|\/task-run|\/task-del|\/task-all|\/task-interval|定时任务|计划任务|我的任务|我的定时|查看任务|任务列表|执行任务\s*\d+|测试任务\s*\d+|删除任务\s*\d+|取消任务\s*\d+|暂停任务\s*\d+|恢复任务\s*\d+|清空任务|开启全套)/i.test(
         trimmed
-      )
+      ) ||
+      /(?:设置|创建|新建|加个|定个|设个).*(?:定时任务|计划任务|定时提醒|闹钟)/i.test(trimmed)
     ) {
       return true;
     }
@@ -1219,42 +1243,83 @@ export class SchedulerService {
 
     // 带有“每X分钟 / 每隔X小时”的轮询创建意图
     if (
-      /(?:每|每隔|间隔)\s*(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时|min|m\b|h\b).*?(?:蹲|追更|订阅|监控|扫描|巡检|检测|查|搜|推|发|荐|提醒|叫我|通知)/i.test(
+      /(?:每|每隔|间隔)\s*(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b).*?(?:蹲|追更|订阅|监控|扫描|巡检|检测|查|搜|推|发|荐|提醒|叫我|通知)/i.test(
         trimmed
       )
     ) {
       return true;
     }
 
-    // 场景1 & 场景3：每天/每周/明早/今晚/X分钟后/半小时后 + 几点 + 推送/推荐/提醒/发/搜/转存
-    if (
-      /(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|周[一二三四五六日天末]|明天|明早|今晚|今天|(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时)\s*(?:之?后|再)).*?(?:(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)|早上|上午|中午|下午|晚上|凌晨|之?后|再).*?(?:推|发|荐|提醒|叫我|通知|搜|查|转存|存|入库|检查|巡检)/i.test(
+    // 相对延时意图（兼容省略“后”字的口语，如“两分钟给我推荐一部好看的电影”、“半小时转存到网盘”、“10分钟后提醒我”）
+    const hasDurationFilter = /(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时|秒)\s*(?:以内|以上|以下|左右|的(?:电影|剧|片|动漫))/i.test(
+      trimmed
+    );
+    if (!hasDurationFilter) {
+      if (
+        /^(?:请|麻烦)?(?:帮我|给我)?(?:等|过)?\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)\s*(?:个?\s*(?:小时|钟头)|分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|秒钟?|min|sec|h\b|m\b|s\b)\s*(?:之?后|再|内)?\s*(?:给我|帮我|替我|向我|为我)?.*?(?:推|发|荐|提醒|叫|通知|搜|查|转存|存|入库|看|来)/i.test(
+          trimmed
+        ) ||
+        /(?:等|过)?\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)\s*(?:个?\s*(?:小时|钟头)|分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|秒钟?|min|sec)\s*(?:之?后|再).*?(?:推|发|荐|提醒|叫|通知|搜|查|转存|存|入库|看|来)/i.test(
+          trimmed
+        ) ||
+        /(?:推|发|荐|提醒|叫|通知|搜|转存|存).*?(?:等|过)?\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]+)\s*(?:个?\s*(?:小时|钟头)|分钟|分|秒钟?|min|sec)\s*(?:之?后|再)/i.test(
+          trimmed
+        )
+      ) {
+        return true;
+      }
+    }
+
+    // 场景1 & 场景3：定点/周期/单日时间 + 动作（支持每天/每周/工作日/周末/明天/后天/今晚/今天，也支持直接写时刻如“8点半提醒我”、“晚上9点推荐一部电影”、“18:30帮我存”）
+    const hasExplicitDayPrefix =
+      /(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|周[一二三四五六日天末]|工作日|周末|明天|明早|明晚|后天|今晚|今早|今天)/i.test(
         trimmed
-      ) ||
-      /(?:\d+|[一二两三四五六七八九十半]+)\s*(?:分钟|分|个?小时)\s*(?:之?后|再)\s*(?:给我|帮我)?(?:推|发|荐|提醒|叫我|通知|搜|查|转存|存|看)/i.test(
+      );
+    const hasExplicitClock =
+      /(?:\d{1,2}\s*[:：]\s*\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:\s*(?:\d{1,2}|半|[一二三四五六七八九十]{1,3})\s*分?)?|(?:早上|早晨|上午|中午|下午|傍晚|晚上|夜里|凌晨)\s*(?:(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)?)?)/i.test(
         trimmed
-      )
-    ) {
+      );
+    const hasScheduleVerb = /(?:推|发|荐|提醒|叫我|通知|搜|查|转存|存|入库|检查|巡检)/i.test(trimmed);
+
+    if (hasExplicitDayPrefix && hasExplicitClock && hasScheduleVerb) {
+      return true;
+    }
+
+    // 省略“每天/今天”但带具体钟点+定时动作（如“晚上9点推荐一部悬疑剧”、“17:30提醒我下班”、“早上8点半帮我搜《三体》”）
+    const hasConcreteClock =
+      /\d{1,2}\s*[:：]\s*\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:半|\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*分?)?/i.test(
+        trimmed
+      );
+    if (hasConcreteClock && !/豆瓣\s*\d+\s*点|\d+\s*点\s*\d+\s*分制|几\s*点/.test(trimmed) && hasScheduleVerb) {
+      return true;
+    }
+
+    // 明确“提醒我/叫我/通知我”且不是纯提问（排除“怎么通知我”之类）
+    if (/(?:^|每天|每周|明天|今晚|后天|早上|晚上|点|后)\s*(?:提醒我|叫我|通知我)/i.test(trimmed) && !/[？?]$/.test(trimmed)) {
       return true;
     }
 
     // 场景2：有资源了通知我 / 蹲守 / 出资源了帮我存
     if (
-      /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(
+      /(?:有资源了|出资源了|出了资源|资源出了|有片源了|出片了|上线了|放出来了|有了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存|存一下)/i.test(
         trimmed
       ) ||
-      /^(?:帮我|给我)?(?:蹲守|蹲一下|蹲一个|蹲|监控)\s*《?[^》]+》?/i.test(trimmed)
+      /(?:帮我|给我|替我)?(?:蹲守|蹲一下|蹲一个|盯着|监控)\s*《?[^》]+》?/i.test(trimmed) ||
+      /^蹲\s*《?[^》]+》?/i.test(trimmed)
     ) {
       return true;
     }
 
     // 扩展A：连载追更
-    if (/^(?:帮我|给我|自动)?(?:追更|订阅更新)\s*《?[^》]+》?/i.test(trimmed)) {
+    if (
+      /(?:^|请|帮我|给我|我要|自动)(?:追更|订阅更新)/i.test(trimmed) ||
+      /(?:更新了|有更新|出新集|更了).*?(?:通知|提醒|存|转存|推|告诉)/i.test(trimmed)
+    ) {
       return true;
     }
 
     // 扩展D：4K 洗版监控
-    if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|高画质|洗版|原盘).*?(?:通知|提醒|帮我存|自动存|转存|告诉我)/i.test(trimmed)) {
+    if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|高画质|洗版|原盘|杜比).*?(?:通知|提醒|帮我存|自动存|转存|告诉我|蹲|监控)/i.test(trimmed)) {
       return true;
     }
 
@@ -1271,9 +1336,15 @@ export class SchedulerService {
   }
 
   /**
-   * 从自然语言文本中解析时间（支持 "早上8点"、"晚上9点半"、"20:30"、"下午3点15" 等）
+   * 从自然语言文本中解析时间（支持相对延时“两分钟后/两分钟给我/半小时后”以及定点“早上8点/20:30/后天”）
    */
-  public static parseTimeFromText(text: string): { timeStr: string; daysOfWeek?: number[]; oneShotDate?: string; isRelative?: boolean } {
+  public static parseTimeFromText(text: string): {
+    timeStr: string;
+    daysOfWeek?: number[];
+    oneShotDate?: string;
+    isRelative?: boolean;
+    triggerAt?: number;
+  } {
     const cnNums: Record<string, number> = {
       零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
       十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16, 十七: 17, 十八: 18, 十九: 19, 二十: 20,
@@ -1285,32 +1356,51 @@ export class SchedulerService {
       return cnNums[s] ?? 8;
     };
 
-    // 0. 优先解析相对延时（例如：“两分钟后”、“2分钟后”、“半小时后”、“半个小时后”、“一个小时后”、“10分钟后”、“30min后”）
-    const relativeMinMatch = text.match(
-      /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|min(?:utes?)?|m\b)\s*(?:之?后|再|提醒|转存|推|发)/i
-    );
-    const relativeHalfHourMatch = text.match(/(?:等|过)?\s*半\s*个?\s*小时\s*(?:之?后|再|提醒|转存|推|发)/i);
-    const relativeHourMatch = text.match(
-      /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?\s*小时|钟头|hours?|h\b)\s*(?:之?后|再|提醒|转存|推|发)/i
+    // 0. 优先解析相对延时（排除“每/每隔/间隔/改成/设为”开头的轮询周期）
+    const isPollingExpr = /(?:每|每隔|间隔|改成|改为|设为|设置成|调整为|调成)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?\s*小时|钟头|min|h\b|m\b)/i.test(
+      text
     );
 
-    let offsetMinutes = 0;
-    if (relativeHalfHourMatch) {
-      offsetMinutes = 30;
-    } else if (relativeMinMatch) {
-      const val = parseNum(relativeMinMatch[1]);
-      if (!isNaN(val) && val > 0) {
-        offsetMinutes = Math.round(val);
-      }
-    } else if (relativeHourMatch) {
-      const val = parseNum(relativeHourMatch[1]);
-      if (!isNaN(val) && val > 0) {
-        offsetMinutes = Math.round(val * 60);
+    let offsetMs = 0;
+    if (!isPollingExpr) {
+      const relativeHalfHourMatch = text.match(
+        /(?:等|过)?\s*半\s*个?\s*小时\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+      );
+      const relativeMinMatch = text.match(
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|min(?:utes?)?|m\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+      );
+      const relativeHourMatch = text.match(
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?\s*小时|钟头|hours?|h\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+      );
+      const relativeSecMatch = text.match(
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:秒钟?|sec(?:onds?)?|s\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+      );
+
+      if (/一个半\s*小时/.test(text)) {
+        offsetMs = 90 * 60 * 1000;
+      } else if (relativeHalfHourMatch) {
+        offsetMs = 30 * 60 * 1000;
+      } else if (relativeMinMatch) {
+        const val = parseNum(relativeMinMatch[1]);
+        if (!isNaN(val) && val > 0) {
+          offsetMs = Math.round(val * 60 * 1000);
+        }
+      } else if (relativeHourMatch) {
+        const val = parseNum(relativeHourMatch[1]);
+        if (!isNaN(val) && val > 0) {
+          offsetMs = Math.round(val * 60 * 60 * 1000);
+        }
+      } else if (relativeSecMatch) {
+        const val = parseNum(relativeSecMatch[1]);
+        if (!isNaN(val) && val > 0) {
+          offsetMs = Math.round(val * 1000);
+        }
       }
     }
 
-    if (offsetMinutes > 0) {
-      const targetDate = new Date(Date.now() + offsetMinutes * 60 * 1000);
+    if (offsetMs > 0) {
+      const triggerAt = Date.now() + offsetMs;
+      const targetDate = new Date(triggerAt);
       // 转换为北京时间 (UTC+8)
       const utcMs = targetDate.getTime() + targetDate.getTimezoneOffset() * 60000;
       const bjDate = new Date(utcMs + 8 * 3600000);
@@ -1325,6 +1415,7 @@ export class SchedulerService {
         timeStr: `${hours}:${minutes}`,
         oneShotDate: `${y}-${m}-${d}`,
         isRelative: true,
+        triggerAt,
       };
     }
 
@@ -1334,13 +1425,13 @@ export class SchedulerService {
     // 匹配 HH:mm 或 X点Y分 / X点半
     const colonMatch = text.match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);
     const pointMatch = text.match(
-      /(早上|早晨|上午|中午|下午|傍晚|晚上|夜里|凌晨)?\s*(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:(\d{1,2}|半|[一二三四五六七八九十]{1,3})\s*分?)?/
+      /(早上|早晨|今早|明早|每早|上午|中午|下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜|凌晨)?\s*(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:(\d{1,2}|半|[一二三四五六七八九十]{1,3})\s*分?)?/
     );
 
     if (colonMatch) {
       hour = parseInt(colonMatch[1], 10);
       minute = parseInt(colonMatch[2], 10);
-      if (/(?:下午|傍晚|晚上|夜里)/.test(text) && hour < 12) {
+      if (/(?:下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜)/.test(text) && hour < 12) {
         hour += 12;
       }
     } else if (pointMatch) {
@@ -1349,20 +1440,20 @@ export class SchedulerService {
       if (pointMatch[3]) {
         minute = pointMatch[3] === '半' ? 30 : parseNum(pointMatch[3]);
       }
-      if (/(?:下午|傍晚|晚上|夜里)/.test(period) && hour < 12) {
+      if (/(?:下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜)/.test(period) && hour < 12) {
         hour += 12;
       } else if (period === '中午' && hour < 11) {
         hour += 12;
       } else if (period === '凌晨' && hour === 12) {
         hour = 0;
       }
-    } else if (/早上|早晨|明早/.test(text)) {
+    } else if (/早上|早晨|明早|今早/.test(text)) {
       hour = 8;
     } else if (/中午/.test(text)) {
       hour = 12;
     } else if (/下午/.test(text)) {
       hour = 15;
-    } else if (/晚上|今晚|每晚/.test(text)) {
+    } else if (/晚上|今晚|明晚|每晚/.test(text)) {
       hour = 20;
     }
 
@@ -1384,13 +1475,15 @@ export class SchedulerService {
       }
     }
 
-    // 解析单次日期（明天/今天）
+    // 解析单次日期（明天/后天/今天）
     let oneShotDate: string | undefined;
-    if (!/每天|每日|每晚|每早|每周/.test(text) && /(?:明天|明早|明晚|今天|今晚)/.test(text)) {
+    if (!/每天|每日|每晚|每早|每周/.test(text) && /(?:后天|明天|明早|明晚|今天|今早|今晚)/.test(text)) {
       const now = new Date();
       const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
       const bjDate = new Date(utcMs + 8 * 3600000);
-      if (/明天|明早|明晚/.test(text)) {
+      if (/后天/.test(text)) {
+        bjDate.setDate(bjDate.getDate() + 2);
+      } else if (/明天|明早|明晚/.test(text)) {
         bjDate.setDate(bjDate.getDate() + 1);
       }
       const y = bjDate.getFullYear();
@@ -1412,19 +1505,209 @@ export class SchedulerService {
     }
 
     // 纯转存动作指令不作为片名
-    if (/^(?:等|过)?\s*(?:\d+|[一二两三四五六七八九十半]+)?\s*(?:分钟|分|个?小时)?\s*(?:之?后)?\s*(?:再)?\s*(?:转存|存|帮我存|自动存|存入网盘|存到网盘|转存到网盘)$/i.test(text.trim())) {
+    const durationExpr = '(?:半\\s*个?\\s*(?:小时|钟头)|(?:\\d+(?:\\.\\d+)?|[一二两三四五六七八九十]{1,3})\\s*(?:个?半\\s*(?:小时|钟头)|个?\\s*小时|钟头|分钟?|秒钟?|sec|s\\b|min|m\\b|h\\b))';
+    const transferOnlyRe = new RegExp(
+      `^(?:过|等|在)?\\s*(?:${durationExpr})?\\s*(?:之?[后内]|以后|再)?\\s*(?:把?(?:这部|这个|它|片子|电影|剧集))?\\s*(?:自动)?(?:转存|存一下|存下|帮我存|自动存|存入|保存到)(?:(?:到|进|至)?(?:夸克)?网盘)?$`,
+      'i'
+    );
+    if (transferOnlyRe.test(text.trim())) {
       return '';
     }
 
     return text
-      .replace(/(?:等|过)?\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b)\s*(?:之?后|再)?/gi, '')
-      .replace(/(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b)\s*(?:一次|一轮|一扫|巡检|扫描|检测|轮询)?/gi, '')
+      .replace(new RegExp(`(?:过|等|在)?\\s*${durationExpr}\\s*(?:之?[后内]|以后|再)?`, 'gi'), '')
+      .replace(/(?:每|每隔|间隔)\s*(?:半\s*个?\s*(?:小时|钟头)|(?:\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?\s*小时|钟头|分钟?|秒钟?|sec|s\b|min|m\b|h\b))\s*(?:一次|一轮|一扫|巡检|扫描|检测|轮询)?/gi, '')
       .replace(/^(?:请|帮我|给我|麻烦|我想|我要|自动|全网)*/g, '')
-      .replace(/(?:蹲守|蹲一下|蹲一个|蹲|追更|订阅更新|监控|扫描|巡检|检测|看看|查查|转存|存到网盘|存进网盘|存入网盘)/g, '')
+      .replace(/(?:蹲守|蹲一下|蹲一个|蹲|追更|订阅更新|监控|扫描|巡检|检测|看看|查查|转存|存到网盘|存进网盘|存入网盘|保存到网盘|存一下|存下|帮我搜|搜一下|搜索)/g, '')
       .replace(/(?:如果|要是|等|当)?(.+?)(?:有4K资源了|出4K资源了|出4K了|有4K了|有资源了|出资源了|更新了|出了).*$/i, '$1')
-      .replace(/(?:推送消息给我|推送给我|通知我|告诉我|发给我|自动帮我存.*|帮我存.*|存进网盘.*)$/g, '')
+      .replace(/(?:推送消息给我|推送给我|通知我|告诉我|发给我|自动帮我存.*|帮我存.*|存进网盘.*|到夸克网盘|到网盘)$/g, '')
       .replace(/^[，,。！!？?\s]+|[，,。！!？?\s]+$/g, '')
       .trim();
+  }
+
+  /**
+   * 供 LLM 工具调用的结构化创建定时/延时任务入口
+   */
+  public async createStructuredTask(
+    userId: string,
+    params: {
+      action_type?: string;
+      instruction?: string;
+      delay_minutes?: number;
+      schedule_time?: string;
+      interval_minutes?: number;
+      one_shot?: boolean;
+      keyword?: string;
+      content?: string;
+      auto_save?: boolean;
+    }
+  ): Promise<string> {
+    const rawInstruction = (params.instruction || '').trim();
+    const hasDelay = typeof params.delay_minutes === 'number' && Number.isFinite(params.delay_minutes) && params.delay_minutes > 0;
+    const hasInterval = typeof params.interval_minutes === 'number' && Number.isFinite(params.interval_minutes) && params.interval_minutes > 0;
+    const scheduleMatch = (params.schedule_time || '').trim().match(/^(\d{1,2})[:：](\d{1,2})$/);
+
+    // 管理类或无结构化字段时，交回自然语言命令管道处理
+    if (
+      !params.action_type &&
+      !hasDelay &&
+      !hasInterval &&
+      !scheduleMatch &&
+      rawInstruction
+    ) {
+      return this.handleNaturalLanguageCommand(rawInstruction, userId);
+    }
+    if (
+      rawInstruction &&
+      /^(?:\/tasks|\/schedule|\/定时|定时任务|我的任务|我的定时|查看任务|任务列表|\/task-|执行任务|测试任务|运行任务|删除任务|取消任务|移除任务|清空|暂停任务|恢复任务|开启任务|开启全套)/i.test(rawInstruction)
+    ) {
+      return this.handleNaturalLanguageCommand(rawInstruction, userId);
+    }
+
+    const computeFutureBeijing = (offsetMs: number) => {
+      const targetMs = Date.now() + offsetMs;
+      const bj = new Date(targetMs + new Date(targetMs).getTimezoneOffset() * 60000 + 8 * 3600000);
+      const y = bj.getFullYear();
+      const mo = String(bj.getMonth() + 1).padStart(2, '0');
+      const d = String(bj.getDate()).padStart(2, '0');
+      const h = String(bj.getHours()).padStart(2, '0');
+      const mi = String(bj.getMinutes()).padStart(2, '0');
+      return { triggerAt: targetMs, oneShotDate: `${y}-${mo}-${d}`, timeStr: `${h}:${mi}` };
+    };
+
+    const parsedFromText = rawInstruction ? SchedulerService.parseTimeFromText(rawInstruction) : undefined;
+    let timeStr = parsedFromText?.timeStr || '20:00';
+    let oneShotDate = parsedFromText?.oneShotDate;
+    let triggerAt = parsedFromText?.triggerAt;
+    let isRelative = Boolean(parsedFromText?.isRelative);
+    let intervalMinutes = hasInterval ? Math.max(1, Math.min(1440, Math.round(params.interval_minutes!))) : undefined;
+
+    if (hasDelay) {
+      const future = computeFutureBeijing(Math.round(params.delay_minutes! * 60000));
+      timeStr = future.timeStr;
+      oneShotDate = future.oneShotDate;
+      triggerAt = future.triggerAt;
+      isRelative = true;
+      intervalMinutes = undefined;
+    } else if (scheduleMatch) {
+      const hh = Math.max(0, Math.min(23, parseInt(scheduleMatch[1], 10)));
+      const mm = Math.max(0, Math.min(59, parseInt(scheduleMatch[2], 10)));
+      timeStr = `${String(hh).padStart(2, '0')}:${String(mm).padStart(2, '0')}`;
+      if (params.one_shot && !oneShotDate) {
+        const now = new Date();
+        const bj = new Date(now.getTime() + now.getTimezoneOffset() * 60000 + 8 * 3600000);
+        if (bj.getHours() > hh || (bj.getHours() === hh && bj.getMinutes() >= mm)) {
+          bj.setDate(bj.getDate() + 1);
+        }
+        oneShotDate = `${bj.getFullYear()}-${String(bj.getMonth() + 1).padStart(2, '0')}-${String(bj.getDate()).padStart(2, '0')}`;
+      }
+    }
+
+    const actionType = params.action_type || (hasDelay && /(?:转存|存到网盘|存入网盘)/.test(rawInstruction) ? 'delayed_transfer' : hasDelay && /(?:推荐|推送|电影|剧)/.test(rawInstruction) ? 'delayed_recommend' : 'custom_reminder');
+
+    if (actionType === 'delayed_transfer') {
+      let targetTitle = (params.keyword || '').trim();
+      if (!targetTitle && rawInstruction) {
+        targetTitle = SchedulerService.extractCleanMovieTitle(rawInstruction);
+      }
+      if (!targetTitle || /^(?:这部|这个|它|片子|电影|剧集|网盘|夸克网盘|夸克)$/.test(targetTitle)) {
+        targetTitle = this.sessionManager.getRecentTargetTitle(userId) || '';
+      }
+      if (!targetTitle) {
+        return '🤔 我暂时没找到你最近看过或搜索过的具体片名。\n请带上片名再说一次，例如：「半小时后把《流浪地球2》转存到网盘」。';
+      }
+      const task = this.addTask({
+        userId,
+        type: 'custom_reminder',
+        title: `延时转存：《${targetTitle}》到夸克网盘`,
+        enabled: true,
+        scheduleTime: intervalMinutes ? undefined : timeStr,
+        intervalMinutes,
+        oneShotDate: intervalMinutes ? undefined : oneShotDate,
+        triggerAt: intervalMinutes ? undefined : triggerAt,
+        customAction: 'search',
+        keyword: targetTitle,
+        autoSave: true,
+        customPayload: rawInstruction || `转存《${targetTitle}》到网盘`,
+      });
+      return [
+        `🔔 已为你创建【延时转存计划任务】！`,
+        `─────────────────────────`,
+        `📌 任务内容：${task.title}`,
+        `🕒 触发时间：${oneShotDate ? `${oneShotDate} ${timeStr}` : `每天 ${timeStr}`}（单次触发）`,
+        `💾 动作预定：到点将自动搜寻《${targetTitle}》最佳活链并转存入你的网盘`,
+        `─────────────────────────`,
+        `💡 发送「/tasks」可随时管理或取消任务。`,
+      ].join('\n');
+    }
+
+    if (actionType === 'daily_recommend' || actionType === 'delayed_recommend') {
+      const refText = (params.content || rawInstruction || '推荐一部好看的电影').trim();
+      const isMovie = /(?:电影|大片|院线|影史|片)/i.test(refText) && !/(?:电视剧|剧集|韩剧|美剧|日剧|国产剧)/i.test(refText);
+      const mediaType: 'movie' | 'tv' = isMovie ? 'movie' : 'tv';
+      const typeLabel = mediaType === 'movie' ? '高分电影' : '热门好剧';
+      const useInterval = Boolean(intervalMinutes && !isRelative && !scheduleMatch);
+      const task = this.addTask({
+        userId,
+        type: 'daily_recommend',
+        title: isRelative || oneShotDate
+          ? `延时任务：${timeStr} 推送一部${typeLabel}`
+          : useInterval
+          ? `${SchedulerService.formatInterval(intervalMinutes!)}推送一部${typeLabel}`
+          : `每天 ${timeStr} 推送一部${typeLabel}`,
+        enabled: true,
+        scheduleTime: useInterval ? undefined : timeStr,
+        intervalMinutes: useInterval ? intervalMinutes : undefined,
+        oneShotDate: useInterval ? undefined : oneShotDate,
+        triggerAt: useInterval ? undefined : triggerAt,
+        mediaType,
+        tag: '热门',
+        query: params.content || `推荐一部好看的${typeLabel}`,
+        autoSave: Boolean(params.auto_save),
+      });
+      return [
+        `⏰ 已为你设定好【${isRelative || oneShotDate ? '延时' : '定时'}荐片任务】！`,
+        `─────────────────────────`,
+        `📌 任务名称：${task.title}`,
+        `🕒 触发时间：${useInterval ? `${SchedulerService.formatInterval(intervalMinutes!)}循环推送` : oneShotDate ? `${oneShotDate} ${timeStr}（准时推送）` : `每天 ${timeStr} 准时推送`}`,
+        `─────────────────────────`,
+        `💡 发送「/tasks」可随时查看任务进度。`,
+      ].join('\n');
+    }
+
+    if (actionType === 'resource_watch' || actionType === 'episode_chase' || actionType === 'quality_upgrade') {
+      const synthesized = `${intervalMinutes ? `每${intervalMinutes}分钟` : ''}${actionType === 'episode_chase' ? '追更' : actionType === 'quality_upgrade' ? '出4K了存' : '蹲守'}${params.keyword ? `《${params.keyword}》` : rawInstruction}`;
+      return this.handleNaturalLanguageCommand(synthesized, userId);
+    }
+
+    if (actionType === 'custom_reminder') {
+      const reminderText = (params.content || rawInstruction || '定时提醒').trim();
+      const useInterval = Boolean(intervalMinutes && !isRelative && !scheduleMatch);
+      const task = this.addTask({
+        userId,
+        type: 'custom_reminder',
+        title: isRelative || oneShotDate ? `延时任务：${reminderText}` : `定时任务：${reminderText}`,
+        enabled: true,
+        scheduleTime: useInterval ? undefined : timeStr,
+        intervalMinutes: useInterval ? intervalMinutes : undefined,
+        oneShotDate: useInterval ? undefined : oneShotDate,
+        triggerAt: useInterval ? undefined : triggerAt,
+        customAction: 'remind',
+        keyword: (params.keyword || '').trim() || undefined,
+        autoSave: Boolean(params.auto_save),
+        customPayload: reminderText,
+      });
+      return [
+        `🔔 已为你创建【${isRelative || oneShotDate ? '延时' : '定时'}计划任务】！`,
+        `─────────────────────────`,
+        `📌 任务内容：${task.title}`,
+        `🕒 触发时间：${useInterval ? `${SchedulerService.formatInterval(intervalMinutes!)}循环执行` : oneShotDate ? `${oneShotDate} ${timeStr}（单次触发）` : `每天 ${timeStr} 准时执行`}`,
+        `─────────────────────────`,
+        `💡 发送「/tasks」可管理你的全部任务。`,
+      ].join('\n');
+    }
+
+    return this.handleNaturalLanguageCommand(rawInstruction || params.content || '', userId);
   }
 
   /**
@@ -1546,7 +1829,10 @@ export class SchedulerService {
     }
 
     // 7. 扩展 A：连载热播剧全自动追更入库
-    if (/(?:\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed)) {
+    if (
+      /(?:^\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed) ||
+      /(?:更新了|出新集了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
+    ) {
       const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/追更\s*/i, ''));
       if (!movieTitle) {
         return '请告诉我要追更哪部剧呀，例如发送：「帮我追更《今天是太阳雨》」或「每15分钟追更《小城良方》」~';
@@ -1577,7 +1863,7 @@ export class SchedulerService {
 
     // 8. 场景 2：某部未出资源电影/剧集全网蹲守监控
     if (
-      /(?:\/watch|\/蹲守|帮我蹲守|蹲守|蹲一下|蹲一个|蹲)/i.test(trimmed) ||
+      /(?:^\/watch|^\/蹲守|帮我蹲守|帮我蹲|给我蹲|蹲守|蹲一下|蹲一个|^蹲\s+)/i.test(trimmed) ||
       /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
     ) {
       const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/(?:watch|蹲守)\s*/i, ''));
@@ -1657,7 +1943,7 @@ export class SchedulerService {
 
     // 10. 场景 1：每天/周期指定时间（或指定轮询间隔、相对延时）推送某类型电影或剧集推荐
     if (/(?:推荐|推送|推一部|推几部|发一部|来一部|安利)/i.test(trimmed)) {
-      const { timeStr, daysOfWeek, oneShotDate, isRelative } = SchedulerService.parseTimeFromText(trimmed);
+      const { timeStr, daysOfWeek, oneShotDate, isRelative, triggerAt } = SchedulerService.parseTimeFromText(trimmed);
       const useIntervalMode = Boolean(
         parsedInterval && !isRelative && !/(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)/.test(trimmed)
       );
@@ -1678,7 +1964,17 @@ export class SchedulerService {
       }
 
       const typeLabel = matchedTag !== '热门' ? `${matchedTag}${mediaType === 'movie' ? '电影' : '剧集'}` : mediaType === 'movie' ? '高分电影' : '热门好剧';
-      const cleanQuery = `推荐一部好看的${typeLabel}`;
+      const strippedQuery = trimmed
+        .replace(/^(?:请|帮我|给我|麻烦)?(?:设置|创建一个|定个|加个)?(?:定时任务|计划任务)?[：:\s]*/i, '')
+        .replace(/^(?:(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:秒钟?|分钟?|分|个?小时|钟头|sec|s\b|min|m\b|h\b)\s*(?:一次|一轮)?)\s*(?:准时)?/i, '')
+        .replace(/^(?:(?:过|等|在)?\s*(?:半\s*个?\s*(?:小时|钟头)|(?:\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?半\s*(?:小时|钟头)|个?\s*小时|钟头|分钟?|秒钟?|min|m\b|sec|s\b|h\b))\s*(?:之?[后内]|以后|再)?)\s*(?:准时)?/i, '')
+        .replace(/^(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|后天|明天|明早|今晚|今天)\s*(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})?\s*(?:点|时|:|：)?(?:\d{1,2}|半)?\s*分?\s*(?:准时)?/i, '')
+        .replace(/^(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)(?:\d{1,2}|半)?\s*分?\s*(?:准时)?/i, '')
+        .replace(/^(?:帮我|给我|请|麻烦)+/, '')
+        .trim();
+      const cleanQuery = strippedQuery && /(?:推荐|推送|推一部|推几部|发一部|来一部|安利)/.test(strippedQuery)
+        ? strippedQuery
+        : `推荐一部好看的${typeLabel}`;
 
       const task = this.addTask({
         userId,
@@ -1693,6 +1989,7 @@ export class SchedulerService {
         intervalMinutes: useIntervalMode ? parsedInterval : undefined,
         daysOfWeek: useIntervalMode || isRelative ? undefined : daysOfWeek,
         oneShotDate: useIntervalMode ? undefined : oneShotDate,
+        triggerAt: useIntervalMode ? undefined : triggerAt,
         mediaType,
         tag: matchedTag,
         query: cleanQuery,
@@ -1712,29 +2009,28 @@ export class SchedulerService {
     }
 
     // 11. 场景 3：自定义计划任务 / 定时提醒 / 定时搜片 / 延时转存（支持定点、自定义轮询间隔与相对延时）
-    const { timeStr, daysOfWeek, oneShotDate, isRelative } = SchedulerService.parseTimeFromText(trimmed);
+    const { timeStr, daysOfWeek, oneShotDate, isRelative, triggerAt } = SchedulerService.parseTimeFromText(trimmed);
     const useIntervalMode = Boolean(
       parsedInterval && !isRelative && !/(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)/.test(trimmed)
     );
     const isSearchAction = /(?:帮我搜|搜一下|搜索)/i.test(trimmed);
-    const isTransferAction = /(?:转存|存到网盘|存进网盘|帮我存|自动存|存入网盘)/i.test(trimmed);
+    const isTransferAction = /(?:转存|存到网盘|存进网盘|帮我存|自动存|存入网盘|存一下|存下|保存到网盘)/i.test(trimmed);
     let extractedTitle = SchedulerService.extractCleanMovieTitle(trimmed);
 
-    // 如果是转存动作但文字里没写具体片名（如“半个小时后转存到网盘”），尝试从最近会话上下文嗅探目标片名
-    if (isTransferAction && (!extractedTitle || /^(?:这部|这个|它|片子|电影|剧集|网盘)$/.test(extractedTitle))) {
-      const searchSess = this.sessionManager.getSearch(userId);
-      const hotSess = this.sessionManager.getHot(userId);
-      if (searchSess && searchSess.keyword) {
-        extractedTitle = searchSess.keyword;
-      } else if (hotSess && hotSess.items && hotSess.items.length > 0) {
-        extractedTitle = hotSess.items[0].title;
+    // 如果是转存动作但文字里没写具体片名（如“半个小时后转存到网盘”），按最近时间优先从上下文嗅探目标片名
+    if (isTransferAction && (!extractedTitle || /^(?:这部|这个|它|片子|电影|剧集|网盘|夸克网盘|夸克)$/.test(extractedTitle))) {
+      extractedTitle = this.sessionManager.getRecentTargetTitle(userId) || '';
+      if (!extractedTitle) {
+        return '🤔 我暂时没找到你最近看过或搜索过的具体片名。\n请带上片名再说一次，例如：「半小时后把《流浪地球2》转存到网盘」。';
       }
     }
 
     const cleanReminder = trimmed
       .replace(/^(?:请|帮我|给我|麻烦)?(?:设置|创建一个|定个|加个)?(?:定时任务|计划任务)?[：:\s]*/i, '')
-      .replace(/^(?:(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?小时|钟头|min|m\b|h\b)\s*(?:一次|一轮)?)\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
-      .replace(/^(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|明天|明早|今晚|今天)\s*(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)(?:\d{1,2}|半)?\s*分?\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
+      .replace(/^(?:(?:每|每隔|间隔)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:秒钟?|分钟?|分|个?小时|钟头|sec|s\b|min|m\b|h\b)\s*(?:一次|一轮)?)\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
+      .replace(/^(?:(?:过|等|在)?\s*(?:半\s*个?\s*(?:小时|钟头)|(?:\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?半\s*(?:小时|钟头)|个?\s*小时|钟头|分钟?|秒钟?|min|m\b|sec|s\b|h\b))\s*(?:之?[后内]|以后|再)?)\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
+      .replace(/^(?:每天|每日|每晚|每早|每周[一二三四五六日天末]?|后天|明天|明早|今晚|今天)\s*(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})?\s*(?:点|时|:|：)?(?:\d{1,2}|半)?\s*分?\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
+      .replace(/^(?:早上|上午|中午|下午|晚上|凌晨)?\s*(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时|:|：)(?:\d{1,2}|半)?\s*分?\s*(?:准时)?(?:提醒我|叫我|通知我)?/i, '')
       .trim() || trimmed;
 
     const taskTitle = isTransferAction && extractedTitle
@@ -1752,6 +2048,7 @@ export class SchedulerService {
       intervalMinutes: useIntervalMode ? parsedInterval : undefined,
       daysOfWeek: useIntervalMode || isRelative ? undefined : daysOfWeek,
       oneShotDate: useIntervalMode ? undefined : oneShotDate,
+      triggerAt: useIntervalMode ? undefined : triggerAt,
       customAction: isTransferAction ? 'search' : isSearchAction ? 'search' : 'remind',
       keyword: extractedTitle || undefined,
       autoSave: isTransferAction || wantAutoSave,

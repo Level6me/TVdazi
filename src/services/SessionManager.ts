@@ -24,6 +24,7 @@ export class SessionManager {
   private searchSessions: Map<string, SearchSession> = new Map();
   private hotSessions: Map<string, HotSession> = new Map();
   private lastActiveSessionType: Map<string, 'search' | 'hot'> = new Map();
+  private lastMentionedTitles: Map<string, { title: string; updatedAt: number }> = new Map();
 
   static getInstance(): SessionManager {
     if (!SessionManager.instance) {
@@ -78,6 +79,37 @@ export class SessionManager {
 
   getLastActiveType(userId: string): 'search' | 'hot' | null {
     return this.lastActiveSessionType.get(userId) || null;
+  }
+
+  /**
+   * 记录最近一次对话中提及或推荐的具体影视片名（供“半小时后转存到网盘”等延时操作提取上下文）
+   */
+  setLastMentionedTitle(userId: string, title: string): void {
+    const clean = title.replace(/[《》\s]/g, '').trim();
+    if (!clean) return;
+    this.lastMentionedTitles.set(userId, { title: title.replace(/[《》]/g, '').trim(), updatedAt: Date.now() });
+  }
+
+  /**
+   * 获取用户最近一次交互中最相关的影视片名（按时间最新优先比较搜索、推荐与闲聊提及）
+   */
+  getRecentTargetTitle(userId: string): string | undefined {
+    const candidates: Array<{ title: string; updatedAt: number }> = [];
+    const searchSess = this.searchSessions.get(userId);
+    if (searchSess?.keyword) {
+      candidates.push({ title: searchSess.keyword, updatedAt: searchSess.updatedAt });
+    }
+    const hotSess = this.hotSessions.get(userId);
+    if (hotSess?.items && hotSess.items.length > 0) {
+      candidates.push({ title: hotSess.items[0].title, updatedAt: hotSess.updatedAt });
+    }
+    const mentioned = this.lastMentionedTitles.get(userId);
+    if (mentioned?.title) {
+      candidates.push(mentioned);
+    }
+    if (candidates.length === 0) return undefined;
+    candidates.sort((a, b) => b.updatedAt - a.updatedAt);
+    return candidates[0].title;
   }
 
   /**
