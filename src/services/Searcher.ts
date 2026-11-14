@@ -199,149 +199,221 @@ export class ResourceSearcher {
   }
 
   /**
-   * 搜索公开频道影视/网盘资源
+   * 抓取单个 TG 频道中指定关键词的网盘分享帖并写入去重池
    */
-  async search(options: SearchOptions): Promise<SearchResult> {
-    const startTime = Date.now();
-    const keyword = options.keyword.trim();
-    if (!keyword) {
-      return { keyword: '', items: [], totalFound: 0, durationMs: 0 };
-    }
-    const results: CloudResource[] = [];
-    const seenUrls = new Set<string>();
-    const channels = this.getActiveChannels();
+  private async fetchChannelForKeyword(
+    channel: string,
+    keyword: string,
+    seenUrls: Set<string>,
+    results: CloudResource[]
+  ): Promise<void> {
+    try {
+      const url = `https://t.me/s/${channel}?q=${encodeURIComponent(keyword)}`;
+      const response = await axios.get(url, {
+        timeout: 5500,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+        },
+      });
 
-    const fetchChannel = async (channel: string) => {
-      try {
-        const url = `https://t.me/s/${channel}?q=${encodeURIComponent(keyword)}`;
-        const response = await axios.get(url, {
-          timeout: 5500,
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-          },
+      const $ = cheerio.load(response.data);
+      $('.tgme_widget_message_wrap').each((_, elem) => {
+        const msgElem = $(elem).find('.tgme_widget_message_text');
+        if (!msgElem.length) return;
+
+        // 将 <br> 替换为换行符，防止 Cheerio .text() 抹除换行导致片名与简介粘连成一行
+        msgElem.find('br').replaceWith('\n');
+
+        // 提取 <a href="..."> 中的隐藏网盘超链接
+        const hrefLinks: string[] = [];
+        msgElem.find('a').each((__, aElem) => {
+          const href = $(aElem).attr('href');
+          if (href && /^https?:\/\//i.test(href)) {
+            hrefLinks.push(href);
+          }
         });
 
-        const $ = cheerio.load(response.data);
-        $('.tgme_widget_message_wrap').each((_, elem) => {
-          const msgElem = $(elem).find('.tgme_widget_message_text');
-          if (!msgElem.length) return;
+        const rawTextContent = msgElem.text().trim();
+        const combinedText = hrefLinks.length > 0 ? `${rawTextContent}\n${hrefLinks.join('\n')}` : rawTextContent;
+        if (!combinedText) return;
 
-          // 将 <br> 替换为换行符，防止 Cheerio .text() 抹除换行导致片名与简介粘连成一行
-          msgElem.find('br').replaceWith('\n');
+        let extractedTitle = keyword;
+        const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
+        if (nameMatch && nameMatch[1]) {
+          extractedTitle = nameMatch[1].trim();
+        } else {
+          const lines = rawTextContent
+            .split(/\r?\n/)
+            .map((l) => l.trim())
+            .filter((l) => l && !/^https?:\/\//i.test(l));
+          extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
+        }
 
-          // 提取 <a href="..."> 中的隐藏网盘超链接
-          const hrefLinks: string[] = [];
-          msgElem.find('a').each((__, aElem) => {
-            const href = $(aElem).attr('href');
-            if (href && /^https?:\/\//i.test(href)) {
-              hrefLinks.push(href);
-            }
+        const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
+        const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
+
+        const addResource = (
+          shareUrl: string,
+          shareId: string,
+          panType: CloudResource['panType'],
+          passcode?: string
+        ) => {
+          if (!shareUrl || seenUrls.has(shareUrl)) return;
+          seenUrls.add(shareUrl);
+          results.push({
+            title: cleanTitle || keyword,
+            shareUrl,
+            shareId,
+            passcode: passcode || undefined,
+            panType,
+            category,
+            rawText: rawTextContent.slice(0, 400),
+            sourceChannel: channel,
           });
+        };
 
-          const rawTextContent = msgElem.text().trim();
-          const combinedText = hrefLinks.length > 0 ? `${rawTextContent}\n${hrefLinks.join('\n')}` : rawTextContent;
-          if (!combinedText) return;
+        // 提取一条消息内的全部网盘链接（支持同帖多链接/多清晰度/多网盘共存）
+        const quarkRegex = /https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/gi;
+        for (const m of combinedText.matchAll(quarkRegex)) {
+          const shareId = m[1];
+          const shareUrl = `https://pan.quark.cn/s/${shareId}`;
+          const matchPos = m.index ?? 0;
+          const nearbySlice = combinedText.slice(Math.max(0, matchPos - 20), Math.min(combinedText.length, matchPos + m[0].length + 45));
+          const nearbyPassMatch = nearbySlice.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
+          const fallbackPassMatch = !nearbyPassMatch
+            ? combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i)
+            : null;
+          const passcode = m[2] || nearbyPassMatch?.[1] || fallbackPassMatch?.[1] || '';
+          addResource(shareUrl, shareId, 'quark', passcode);
+        }
 
-          let extractedTitle = keyword;
-          const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
-          if (nameMatch && nameMatch[1]) {
-            extractedTitle = nameMatch[1].trim();
-          } else {
-            const lines = rawTextContent
-              .split(/\r?\n/)
-              .map((l) => l.trim())
-              .filter((l) => l && !/^https?:\/\//i.test(l));
-            extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
+        const otherPatterns: Array<{ regex: RegExp; panType: CloudResource['panType']; hasId: boolean }> = [
+          { regex: /https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'aliyun', hasId: true },
+          { regex: /https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/gi, panType: 'uc', hasId: true },
+          { regex: /https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: '115', hasId: true },
+          { regex: /https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'other', hasId: true },
+          { regex: /https?:\/\/cloud\.189\.cn\/[^\s<>"]+/gi, panType: 'other', hasId: false },
+          { regex: /https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/gi, panType: 'other', hasId: false },
+        ];
+
+        for (const pat of otherPatterns) {
+          for (const m of combinedText.matchAll(pat.regex)) {
+            addResource(m[0], pat.hasId ? m[1] || '' : '', pat.panType);
           }
-
-          const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
-          const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
-
-          const addResource = (
-            shareUrl: string,
-            shareId: string,
-            panType: CloudResource['panType'],
-            passcode?: string
-          ) => {
-            if (!shareUrl || seenUrls.has(shareUrl)) return;
-            seenUrls.add(shareUrl);
-            results.push({
-              title: cleanTitle || keyword,
-              shareUrl,
-              shareId,
-              passcode: passcode || undefined,
-              panType,
-              category,
-              rawText: rawTextContent.slice(0, 400),
-              sourceChannel: channel,
-            });
-          };
-
-          // 提取一条消息内的全部网盘链接（支持同帖多链接/多清晰度/多网盘共存）
-          const quarkRegex = /https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/gi;
-          for (const m of combinedText.matchAll(quarkRegex)) {
-            const shareId = m[1];
-            const shareUrl = `https://pan.quark.cn/s/${shareId}`;
-            const matchPos = m.index ?? 0;
-            const nearbySlice = combinedText.slice(Math.max(0, matchPos - 20), Math.min(combinedText.length, matchPos + m[0].length + 45));
-            const nearbyPassMatch = nearbySlice.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
-            const fallbackPassMatch = !nearbyPassMatch
-              ? combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i)
-              : null;
-            const passcode = m[2] || nearbyPassMatch?.[1] || fallbackPassMatch?.[1] || '';
-            addResource(shareUrl, shareId, 'quark', passcode);
-          }
-
-          const otherPatterns: Array<{ regex: RegExp; panType: CloudResource['panType']; hasId: boolean }> = [
-            { regex: /https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'aliyun', hasId: true },
-            { regex: /https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/gi, panType: 'uc', hasId: true },
-            { regex: /https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: '115', hasId: true },
-            { regex: /https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'other', hasId: true },
-            { regex: /https?:\/\/cloud\.189\.cn\/[^\s<>"]+/gi, panType: 'other', hasId: false },
-            { regex: /https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/gi, panType: 'other', hasId: false },
-          ];
-
-          for (const pat of otherPatterns) {
-            for (const m of combinedText.matchAll(pat.regex)) {
-              addResource(m[0], pat.hasId ? m[1] || '' : '', pat.panType);
-            }
-          }
-        });
-      } catch {
-        // 静默异常
-      }
-    };
-
-    // 分批并发控制（每批 15 个频道），并限制单次全网检索软超时上限（14秒）避免阻塞响应
-    const CONCURRENCY = 15;
-    const SEARCH_BUDGET_MS = 14000;
-    for (let i = 0; i < channels.length; i += CONCURRENCY) {
-      if (i > 0 && Date.now() - startTime >= SEARCH_BUDGET_MS) {
-        break;
-      }
-      const batch = channels.slice(i, i + CONCURRENCY);
-      await Promise.allSettled(batch.map((ch) => fetchChannel(ch)));
+        }
+      });
+    } catch {
+      // 静默异常
     }
+  }
 
-    // 严格过滤掉与搜索词及其已知别名完全无关的频道干扰项
-    const pool = results.filter((item) => this.isRelevantItem(item, keyword, options.aliasKeywords));
+  /**
+   * 过滤并按相关度重排合并后的资源池
+   */
+  private finalizeSearchPool(
+    results: CloudResource[],
+    primaryKeyword: string,
+    options?: Omit<SearchOptions, 'keyword'>,
+    startTime: number = Date.now()
+  ): SearchResult {
+    const pool = results.filter((item) => this.isRelevantItem(item, primaryKeyword, options?.aliasKeywords));
 
     pool.sort((a, b) => {
-      const scoreA = this.calculateScore(a, keyword, options.quality, options.aliasKeywords);
-      const scoreB = this.calculateScore(b, keyword, options.quality, options.aliasKeywords);
+      const scoreA = this.calculateScore(a, primaryKeyword, options?.quality, options?.aliasKeywords);
+      const scoreB = this.calculateScore(b, primaryKeyword, options?.quality, options?.aliasKeywords);
       return scoreB - scoreA;
     });
 
-    const limit = options.maxResults || 60;
+    const limit = options?.maxResults || 60;
     const finalItems = pool.slice(0, limit);
 
     return {
-      keyword,
+      keyword: primaryKeyword,
       items: finalItems,
       totalFound: pool.length,
       durationMs: Date.now() - startTime,
     };
+  }
+
+  /**
+   * 搜索公开频道影视/网盘资源（单关键词入口）
+   */
+  async search(options: SearchOptions): Promise<SearchResult> {
+    return this.searchMany([options.keyword], options);
+  }
+
+  /**
+   * 多语种/多标题共享并发池一次性联合检索：
+   * - 将多个语言标题（如 [中文, 拍摄国原语, 英文]）按频道交错排布在同一全局并发工作池中执行，
+   *   避免 N 个关键词各开独立 15 并发导致瞬时请求放大引发 TG 网页限流；
+   * - 实时按 shareUrl 去重并统一以主片名优先打分排序。
+   */
+  async searchMany(keywords: string[], options?: Omit<SearchOptions, 'keyword'>): Promise<SearchResult> {
+    const startTime = Date.now();
+    const seenTerms = new Set<string>();
+    const cleanKeywords: string[] = [];
+
+    for (const rawKw of keywords || []) {
+      const kw = (rawKw || '').trim();
+      if (!kw) continue;
+      const lower = kw.toLowerCase();
+      if (seenTerms.has(lower)) continue;
+      seenTerms.add(lower);
+      cleanKeywords.push(kw);
+      if (cleanKeywords.length >= 4) break;
+    }
+
+    if (cleanKeywords.length === 0) {
+      return { keyword: '', items: [], totalFound: 0, durationMs: 0 };
+    }
+
+    const primaryKeyword = cleanKeywords[0];
+    const mergedAliases = Array.from(
+      new Set([
+        ...cleanKeywords.slice(1),
+        ...(options?.aliasKeywords || []),
+      ].filter((a) => a && a.trim().toLowerCase() !== primaryKeyword.toLowerCase()))
+    );
+
+    const results: CloudResource[] = [];
+    const seenUrls = new Set<string>();
+    const channels = this.getActiveChannels();
+
+    // 按频道外层交错排布各语种词，确保重点优先频道的三语请求最先并发发出
+    const tasks: Array<{ channel: string; keyword: string }> = [];
+    for (const channel of channels) {
+      for (const kw of cleanKeywords) {
+        tasks.push({ channel, keyword: kw });
+      }
+    }
+
+    const GLOBAL_CONCURRENCY = cleanKeywords.length > 1 ? 18 : 15;
+    const SEARCH_BUDGET_MS = cleanKeywords.length > 1 ? 15000 : 14000;
+    const minWarmupTasks = Math.min(tasks.length, cleanKeywords.length * 10);
+
+    let cursor = 0;
+    const workerCount = Math.min(GLOBAL_CONCURRENCY, tasks.length);
+    const workers = Array.from({ length: workerCount }, async () => {
+      while (true) {
+        const idx = cursor++;
+        if (idx >= tasks.length) break;
+        if (idx >= minWarmupTasks && Date.now() - startTime >= SEARCH_BUDGET_MS) {
+          break;
+        }
+        const task = tasks[idx];
+        await this.fetchChannelForKeyword(task.channel, task.keyword, seenUrls, results);
+      }
+    });
+
+    await Promise.allSettled(workers);
+
+    return this.finalizeSearchPool(
+      results,
+      primaryKeyword,
+      { ...options, aliasKeywords: mergedAliases },
+      startTime
+    );
   }
 
   async verifyQuarkLink(pwdId: string): Promise<boolean> {

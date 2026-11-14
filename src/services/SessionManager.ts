@@ -22,6 +22,7 @@ export interface HotSession {
 export interface PendingImageSearch {
   standardTitle: string;
   originalTitle?: string;
+  englishTitle?: string;
   aliases: string[];
   year?: string;
   mediaType?: 'movie' | 'tv';

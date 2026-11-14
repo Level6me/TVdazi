@@ -13,6 +13,7 @@ import { MetadataResolver } from '../services/MetadataResolver';
 export interface RecognizedImageResult {
   standardTitle: string;
   originalTitle?: string;
+  englishTitle?: string;
   rawGuessTitle?: string;
   aliases: string[];
   year?: string;
@@ -184,6 +185,7 @@ export class DeepSeekAgent {
       return {
         standardTitle: finalTitle,
         originalTitle: resolved.originalTitle || originalTitle || undefined,
+        englishTitle: resolved.englishTitle,
         rawGuessTitle: officialChineseTitle || undefined,
         aliases: resolved.aliases,
         year: resolved.year || year || undefined,
@@ -226,6 +228,7 @@ export class DeepSeekAgent {
       this.sessionManager.setPendingImageSearch(userId, {
         standardTitle: detail.standardTitle,
         originalTitle: detail.originalTitle,
+        englishTitle: detail.englishTitle,
         aliases: detail.aliases,
         year: detail.year,
         mediaType: detail.mediaType,
@@ -328,6 +331,7 @@ export class DeepSeekAgent {
         const searchReply = await this.commandHandler.renderSearch(pendingImage.standardTitle, userId, {
           initialAliases: pendingImage.aliases,
           originalTitle: pendingImage.originalTitle,
+          englishTitle: pendingImage.englishTitle,
           year: pendingImage.year,
           mediaType: pendingImage.mediaType,
           overview: pendingImage.overview,

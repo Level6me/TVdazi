@@ -17,6 +17,8 @@ export interface MediaResolveInput {
 export interface ResolvedMediaInfo {
   standardTitle: string;
   originalTitle?: string;
+  englishTitle?: string;
+  originalLanguage?: string;
   aliases: string[];
   year?: string;
   mediaType?: 'movie' | 'tv';
@@ -70,11 +72,82 @@ export class MetadataResolver {
     return /[a-zA-Z]{3,}/.test(stripped);
   }
 
-  private normalizeCleanTitle(raw?: string): string {
+  private static cleanTitleStatic(raw?: string): string {
     return (raw || '')
       .replace(/[《》""''「」『』]/g, '')
       .replace(/\s+/g, ' ')
       .trim();
+  }
+
+  private normalizeCleanTitle(raw?: string): string {
+    return MetadataResolver.cleanTitleStatic(raw);
+  }
+
+  /**
+   * 过滤容易在全网频道产生海量无关匹配的极短纯英文词（例如仅 2 个字符的扩展词 "Up"/"It"），
+   * 但保留用户主动输入的原始关键词与多单词英文短语。
+   */
+  public static isNoisyShortEnglishTerm(term: string, userRawQuery?: string): boolean {
+    const clean = MetadataResolver.cleanTitleStatic(term);
+    if (!clean) return true;
+    const rawClean = MetadataResolver.cleanTitleStatic(userRawQuery);
+    if (rawClean && clean.toLowerCase() === rawClean.toLowerCase()) {
+      return false;
+    }
+    if (/^[a-zA-Z0-9\s\-_.:'!&]+$/.test(clean)) {
+      const compact = clean.replace(/[^a-zA-Z0-9]/g, '');
+      const hasSpaces = /\s+/.test(clean);
+      if (!hasSpaces && compact.length < 3) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 按固定三语槽位生成并发检索词列表：[中文官方名, 拍摄国原语言标题, 英文标题]（自动去重并过滤极短英文噪词）
+   */
+  public static buildTrilingualSearchTerms(
+    info: Partial<ResolvedMediaInfo>,
+    fallbackPrimary?: string,
+    userRawQuery?: string
+  ): string[] {
+    const chineseTitle = MetadataResolver.cleanTitleStatic(info.standardTitle || fallbackPrimary || userRawQuery);
+    const originalTitle = MetadataResolver.cleanTitleStatic(info.originalTitle);
+
+    let englishTitle = MetadataResolver.cleanTitleStatic(info.englishTitle);
+    if (!englishTitle && Array.isArray(info.aliases)) {
+      const fallbackEn = info.aliases.find((a) => {
+        const clean = MetadataResolver.cleanTitleStatic(a);
+        return clean.length >= 3 && /^[a-zA-Z0-9\s\-_.:'!&,()]+$/.test(clean) && /[a-zA-Z]{2,}/.test(clean);
+      });
+      if (fallbackEn) {
+        englishTitle = MetadataResolver.cleanTitleStatic(fallbackEn);
+      }
+    }
+
+    const candidates = [chineseTitle, originalTitle, englishTitle];
+    const seen = new Set<string>();
+    const out: string[] = [];
+
+    for (const c of candidates) {
+      if (!c || c.length < 2) continue;
+      if (/^\d{4}$/.test(c) || /^none$/i.test(c)) continue;
+      if (MetadataResolver.isNoisyShortEnglishTerm(c, userRawQuery)) continue;
+
+      const key = c.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(c);
+      if (out.length >= 3) break;
+    }
+
+    if (out.length === 0 && userRawQuery) {
+      const cleanRaw = MetadataResolver.cleanTitleStatic(userRawQuery);
+      if (cleanRaw) out.push(cleanRaw);
+    }
+
+    return out;
   }
 
   private buildUniqueAliases(primary: string, candidates: Array<string | undefined>): string[] {
@@ -155,28 +228,37 @@ export class MetadataResolver {
         const mediaType: 'movie' | 'tv' = best.media_type === 'tv' ? 'tv' : 'movie';
         const officialTitle = this.normalizeCleanTitle(best.title || best.name);
         const origTitle = this.normalizeCleanTitle(best.original_title || best.original_name);
+        const originalLanguage = best.original_language ? String(best.original_language).toLowerCase() : undefined;
         const year = String(best.release_date || best.first_air_date || '').slice(0, 4) || preferredYear;
 
         if (!officialTitle) continue;
 
+        let englishTitle = originalLanguage === 'en' && origTitle ? origTitle : '';
         const collectedAliases: string[] = [];
         if (origTitle && origTitle.toLowerCase() !== officialTitle.toLowerCase()) {
           collectedAliases.push(origTitle);
         }
 
-        // 并发拉取多地区译名与别名（zh-TW / zh-HK / en-US / 别名）
+        // 并发拉取多地区译名与别名（优先定位 en 英文国际名，同时收集 zh-CN/zh-TW/zh-HK 等译名）
         try {
           const [transData, altData] = await Promise.allSettled([
             tmdbGet(`/${mediaType}/${best.id}/translations`, {}),
             tmdbGet(`/${mediaType}/${best.id}/alternative_titles`, {}),
           ]);
 
+          const regionalAliases: string[] = [];
           if (transData.status === 'fulfilled' && Array.isArray(transData.value?.translations)) {
             for (const tr of transData.value.translations) {
               const iso = `${tr.iso_639_1 || ''}-${tr.iso_3166_1 || ''}`;
-              if (['zh-CN', 'zh-TW', 'zh-HK', 'en-US'].includes(iso)) {
-                const t = tr.data?.title || tr.data?.name;
-                if (t) collectedAliases.push(t);
+              const t = this.normalizeCleanTitle(tr.data?.title || tr.data?.name);
+              if (!t) continue;
+              if (tr.iso_639_1 === 'en') {
+                if (!englishTitle || iso === 'en-US') {
+                  englishTitle = t;
+                }
+                regionalAliases.push(t);
+              } else if (['zh-CN', 'zh-TW', 'zh-HK'].includes(iso)) {
+                regionalAliases.push(t);
               }
             }
           }
@@ -185,12 +267,23 @@ export class MetadataResolver {
             const altList = altData.value?.titles || altData.value?.results || [];
             if (Array.isArray(altList)) {
               for (const alt of altList) {
-                if (['CN', 'TW', 'HK', 'US', 'JP', 'KR'].includes(alt.iso_3166_1) && alt.title) {
-                  collectedAliases.push(alt.title);
+                if (!alt.title) continue;
+                const cleanAlt = this.normalizeCleanTitle(alt.title);
+                if (!cleanAlt) continue;
+                if (!englishTitle && ['US', 'GB'].includes(alt.iso_3166_1)) {
+                  englishTitle = cleanAlt;
+                }
+                if (['CN', 'TW', 'HK', 'US', 'JP', 'KR'].includes(alt.iso_3166_1)) {
+                  regionalAliases.push(cleanAlt);
                 }
               }
             }
           }
+
+          if (englishTitle) {
+            collectedAliases.push(englishTitle);
+          }
+          collectedAliases.push(...regionalAliases);
         } catch {
           // 补充别名失败不影响主片名返回
         }
@@ -198,6 +291,8 @@ export class MetadataResolver {
         return {
           standardTitle: officialTitle,
           originalTitle: origTitle || undefined,
+          englishTitle: englishTitle || undefined,
+          originalLanguage,
           aliases: this.buildUniqueAliases(officialTitle, collectedAliases),
           year: year || undefined,
           mediaType,
@@ -268,7 +363,8 @@ export class MetadataResolver {
 {
   "isKnownWork": true,
   "standardTitle": "中国大陆豆瓣或主流字幕组最通用的官方正式中文片名（不带书名号；严禁按外语单词字面生硬直译！）",
-  "originalTitle": "原语言标题（如日文/韩文/英文原名，不确定则留空）",
+  "originalTitle": "拍摄国原语言标题（如日文/韩文/英文原名，不确定则留空）",
+  "englishTitle": "官方或国际发行英文片名（若本身是英语作品可与originalTitle相同，不确定留空）",
   "aliases": ["港台译名", "常见别名或民间译名", "英文名或原片名（最多4个）"],
   "year": "上映或开播年份（4位数字，不确定留空）"
 }
@@ -305,14 +401,17 @@ export class MetadataResolver {
       if (!standard) return null;
 
       const orig = this.normalizeCleanTitle(parsed.originalTitle || input.originalTitle);
+      const englishTitle = this.normalizeCleanTitle(parsed.englishTitle);
       const llmAliases = Array.isArray(parsed.aliases) ? parsed.aliases : [];
 
       return {
         standardTitle: standard,
         originalTitle: orig || undefined,
+        englishTitle: englishTitle || undefined,
         aliases: this.buildUniqueAliases(standard, [
-          ...llmAliases,
           orig,
+          englishTitle,
+          ...llmAliases,
           input.guessTitle,
           input.query,
           ...(input.alternateTitles || []),
@@ -336,7 +435,11 @@ export class MetadataResolver {
 
     const cacheKey = [cleanOrig, cleanGuess, cleanQuery, input.year || ''].join('::').toLowerCase();
     const cached = this.cache.get(cacheKey);
-    if (cached && Date.now() - cached.timestamp < this.CACHE_TTL_MS) {
+    if (
+      cached &&
+      Date.now() - cached.timestamp < this.CACHE_TTL_MS &&
+      !(input.forceLlm && cached.data.source === 'raw')
+    ) {
       return cached.data;
     }
 

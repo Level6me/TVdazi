@@ -834,6 +834,7 @@ export class CommandHandler {
     searchMeta?: {
       initialAliases?: string[];
       originalTitle?: string;
+      englishTitle?: string;
       year?: string;
       mediaType?: 'movie' | 'tv';
       overview?: string;
@@ -862,131 +863,137 @@ export class CommandHandler {
       return out;
     };
 
-    let resolvedInfo: ResolvedMediaInfo | null = null;
-    // 若用户直接输入外语原片名（如日/韩/英文）且非识图已对齐，先通过 TMDB / 方案 A 转为官方中文片名
-    if (!searchMeta && MetadataResolver.hasForeignScript(searchWord)) {
-      resolvedInfo = await resolver.resolveMedia({
-        query: keyword,
-        guessTitle: standardTitle,
-        alternateTitles: correction.candidateKeywords,
-        userId,
-        forceLlm: true,
-      });
-      if (resolvedInfo.standardTitle) {
-        searchWord = resolvedInfo.standardTitle;
-        standardTitle = resolvedInfo.standardTitle;
-      }
+    const hasForeign = MetadataResolver.hasForeignScript(searchWord) || MetadataResolver.hasForeignScript(keyword);
+    const shouldResolveUpfront =
+      !searchMeta ||
+      (!searchMeta.englishTitle && resolver.hasTmdbConfigured());
+
+    // 2. 前置并发获取三语元信息（中文 + 拍摄国原语 + 英文）与豆瓣参考信息
+    const [resolvedSettled, doubanSettled] = await Promise.allSettled([
+      shouldResolveUpfront
+        ? resolver.resolveMedia({
+            query: keyword,
+            originalTitle: searchMeta?.originalTitle,
+            guessTitle: standardTitle,
+            alternateTitles: [
+              ...(searchMeta?.initialAliases || []),
+              ...(correction.candidateKeywords || []),
+            ],
+            year: searchMeta?.year,
+            userId,
+            forceLlm: !searchMeta && hasForeign,
+          })
+        : Promise.resolve(null),
+      this.doubanService.getMovieMeta(standardTitle).catch(() => null),
+    ]);
+
+    let resolvedInfo: ResolvedMediaInfo | null =
+      resolvedSettled.status === 'fulfilled' ? resolvedSettled.value : null;
+    const doubanMeta = doubanSettled.status === 'fulfilled' ? doubanSettled.value : null;
+
+    if (resolvedInfo?.standardTitle && resolvedInfo.standardTitle.length >= 2) {
+      standardTitle = resolvedInfo.standardTitle;
+      searchWord = resolvedInfo.standardTitle;
     }
 
+    const combinedMeta: Partial<ResolvedMediaInfo> = {
+      standardTitle,
+      originalTitle: resolvedInfo?.originalTitle || searchMeta?.originalTitle,
+      englishTitle: resolvedInfo?.englishTitle || searchMeta?.englishTitle,
+      originalLanguage: resolvedInfo?.originalLanguage,
+      aliases: mergeUniqueTerms(standardTitle, [
+        ...(resolvedInfo?.aliases || []),
+        ...(searchMeta?.initialAliases || []),
+        ...(correction.candidateKeywords || []),
+      ]),
+    };
+
     let allAliases = mergeUniqueTerms(standardTitle, [
-      ...(searchMeta?.initialAliases || []),
-      searchMeta?.originalTitle,
-      ...(resolvedInfo?.aliases || []),
-      resolvedInfo?.originalTitle,
-      ...(correction.candidateKeywords || []),
+      combinedMeta.originalTitle,
+      combinedMeta.englishTitle,
+      ...(combinedMeta.aliases || []),
       searchWord,
       this.aiCorrector.cleanQuery(keyword),
     ]);
 
-    // 2. 组装影视元数据与提示头
+    // 3. 组装影视元数据与提示头
     const metaHeaders: string[] = [];
+    const cleanInputKeyword = this.aiCorrector.cleanQuery(keyword);
     if (correction.isCorrected && correction.explanation) {
       if (correction.isPlotInferred) {
         metaHeaders.push(`💡 剧情识片：${correction.explanation}`);
       } else {
-        metaHeaders.push(`🤖 AI 纠错：识别到「${this.aiCorrector.cleanQuery(keyword)}」➜ ${correction.explanation}`);
+        metaHeaders.push(`🤖 AI 纠错：识别到「${cleanInputKeyword}」➜ ${correction.explanation}`);
       }
-    } else if (resolvedInfo && resolvedInfo.standardTitle.toLowerCase() !== this.aiCorrector.cleanQuery(keyword).toLowerCase()) {
+    } else if (
+      resolvedInfo &&
+      resolvedInfo.standardTitle &&
+      resolvedInfo.standardTitle.toLowerCase() !== cleanInputKeyword.toLowerCase()
+    ) {
       metaHeaders.push(
-        `🌐 跨语种片名对齐（${resolvedInfo.source.toUpperCase()}）：「${this.aiCorrector.cleanQuery(keyword)}」➜《${resolvedInfo.standardTitle}》`
+        `🌐 跨语种片名对齐（${resolvedInfo.source.toUpperCase()}）：「${cleanInputKeyword}」➜《${resolvedInfo.standardTitle}》`
       );
     }
 
     let doubanYear: string | undefined;
-    try {
-      const meta = (await this.doubanService.getMovieMeta(standardTitle)) ||
-                   (await this.doubanService.getMovieMeta(searchWord));
-      if (meta) {
-        doubanYear = meta.year;
-        const yearPart = meta.year ? `(${meta.year})` : '';
-        const subPart = meta.subTitle ? ` / ${meta.subTitle}` : '';
-        metaHeaders.push(`⭐ 豆瓣影视：${meta.title} ${yearPart}${subPart}`);
-      }
-    } catch {}
+    if (doubanMeta) {
+      doubanYear = doubanMeta.year;
+      const yearPart = doubanMeta.year ? `(${doubanMeta.year})` : '';
+      const subPart = doubanMeta.subTitle ? ` / ${doubanMeta.subTitle}` : '';
+      metaHeaders.push(`⭐ 豆瓣影视：${doubanMeta.title} ${yearPart}${subPart}`);
+    }
 
     const userPlan = this.userManager.getUserPlan(userId);
     const preferredQuality = userPlan.preferences?.preferredQuality;
 
-    // 3. 首轮主片名检索（帖子正文/标题匹配任一已知别名均保留）
-    let res = await this.searcher.search({
-      keyword: searchWord,
+    // 4. 固定按 [中文, 拍摄国原语, 英文] 生成去重搜索词，共享并发池一次性全量搜索
+    let trilingualTerms = MetadataResolver.buildTrilingualSearchTerms(
+      combinedMeta,
+      standardTitle,
+      cleanInputKeyword
+    );
+
+    let res = await this.searcher.searchMany(trilingualTerms, {
       aliasKeywords: allAliases,
       quality: preferredQuality,
     });
 
-    // 4. 结果稀疏（< 4 条）或有明确外语/别名扩展需求时，触发 TMDB(方案B) / 大模型+公开片库(方案A) 多标题合并检索
-    const shouldExpandAliases =
-      res.items.length < 4 ||
-      (resolver.hasTmdbConfigured() && res.items.length < 6 && (Boolean(searchMeta?.originalTitle) || !resolvedInfo));
+    if (trilingualTerms.length > 1) {
+      metaHeaders.push(`🌐 三语并发检索：${trilingualTerms.join(' / ')}`);
+    }
 
-    if (shouldExpandAliases) {
-      if (!resolvedInfo) {
-        resolvedInfo = await resolver.resolveMedia({
-          query: keyword,
-          originalTitle: searchMeta?.originalTitle,
-          guessTitle: standardTitle,
-          alternateTitles: allAliases,
-          year: searchMeta?.year,
-          userId,
-          forceLlm: res.items.length === 0,
-        });
-      }
-
-      if (resolvedInfo.standardTitle && resolvedInfo.standardTitle.toLowerCase() !== searchWord.toLowerCase()) {
-        const prevPrimary = searchWord;
-        standardTitle = resolvedInfo.standardTitle;
-        if (!metaHeaders.some((h) => h.includes(standardTitle))) {
-          metaHeaders.push(
-            `🔄 官方译名对齐（${resolvedInfo.source.toUpperCase()}）：「${prevPrimary}」➜《${standardTitle}》`
-          );
+    // 4b. 若完全无结果且先前尚未触发强力 LLM 反直译（例如无 TMDB Key 时遇到直译片名），尝试一次纠偏补搜
+    if (res.items.length === 0 && !searchMeta && !hasForeign && resolvedInfo?.source !== 'tmdb' && resolvedInfo?.source !== 'llm') {
+      const rescued = await resolver.resolveMedia({
+        query: keyword,
+        guessTitle: standardTitle,
+        alternateTitles: allAliases,
+        userId,
+        forceLlm: true,
+      });
+      if (rescued && rescued.source === 'llm') {
+        resolvedInfo = rescued;
+        if (rescued.standardTitle) {
+          standardTitle = rescued.standardTitle;
+          searchWord = rescued.standardTitle;
         }
-      }
-
-      allAliases = mergeUniqueTerms(standardTitle, [
-        ...allAliases,
-        ...resolvedInfo.aliases,
-        resolvedInfo.originalTitle,
-      ]);
-
-      // 待补搜词：若主词已切换为对齐后的新官方名，优先补搜它；再补搜最多 2 个未搜过的别名/外语原名
-      const alreadySearched = new Set<string>([searchWord.toLowerCase()]);
-      const expansionTerms: string[] = [];
-      if (!alreadySearched.has(standardTitle.toLowerCase())) {
-        expansionTerms.push(standardTitle);
-        alreadySearched.add(standardTitle.toLowerCase());
-      }
-      for (const alias of allAliases) {
-        if (expansionTerms.length >= 2) break;
-        if (!alreadySearched.has(alias.toLowerCase())) {
-          expansionTerms.push(alias);
-          alreadySearched.add(alias.toLowerCase());
-        }
-      }
-
-      if (expansionTerms.length > 0 && (res.items.length < 5 || expansionTerms[0] === standardTitle)) {
-        const extraResults = await Promise.all(
-          expansionTerms.map((term) =>
-            this.searcher.search({
-              keyword: term,
-              aliasKeywords: [standardTitle, ...allAliases],
-              quality: preferredQuality,
-            })
-          )
-        );
-        res = this.searcher.mergeResults(res, extraResults, standardTitle, preferredQuality, allAliases);
-        const hitExtraCount = extraResults.reduce((acc, r) => acc + (r.items?.length || 0), 0);
-        if (hitExtraCount > 0) {
-          metaHeaders.push(`🔀 多译名/别名联合检索：${[searchWord, ...expansionTerms].join(' / ')}`);
+        allAliases = mergeUniqueTerms(standardTitle, [
+          rescued.originalTitle,
+          rescued.englishTitle,
+          ...rescued.aliases,
+          ...allAliases,
+        ]);
+        const extraTerms = MetadataResolver.buildTrilingualSearchTerms(rescued, standardTitle, cleanInputKeyword)
+          .filter((t) => !trilingualTerms.some((existing) => existing.toLowerCase() === t.toLowerCase()));
+        if (extraTerms.length > 0) {
+          const extraRes = await this.searcher.searchMany(extraTerms, {
+            aliasKeywords: allAliases,
+            quality: preferredQuality,
+          });
+          res = this.searcher.mergeResults(res, [extraRes], standardTitle, preferredQuality, allAliases);
+          if (extraRes.items.length > 0) {
+            metaHeaders.push(`🔄 反直译扩展补充：${extraTerms.join(' / ')}`);
+          }
         }
       }
     }
@@ -997,18 +1004,6 @@ export class CommandHandler {
     const rawCountBeforeAi = res.items?.length || 0;
 
     if (res.items && res.items.length > 0 && searchMeta?.enableAiFilter !== false) {
-      // 若配置了 TMDB 且此前未获取元数据（例如纯文本搜索直接命中足够条数），快速补充年份/原名给 AI 校验
-      if (!resolvedInfo && !searchMeta?.year && resolver.hasTmdbConfigured()) {
-        try {
-          resolvedInfo = await resolver.resolveMedia({
-            query: standardTitle,
-            guessTitle: standardTitle,
-            alternateTitles: allAliases,
-            userId,
-          });
-        } catch {}
-      }
-
       const aiFilter = await resolver.filterRelevantResources({
         items: res.items,
         targetTitle: standardTitle || searchWord,

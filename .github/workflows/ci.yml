@@ -106,23 +106,94 @@ jobs:
           assert.strictEqual(merged.items.length, 2);
           assert.strictEqual(merged.items[0].shareId, 'main2');
 
-          // 8. PendingImageSearch state & confirmation matching check
-          const smGlobal = SessionManager.getInstance();
-          smGlobal.setPendingImageSearch('img_u1', {
-            standardTitle: '突如其来',
-            originalTitle: '急に具合が悪くなる',
-            aliases: ['All of a Sudden'],
-            year: '2026',
-            mediaType: 'movie',
-          });
-          assert.strictEqual(smGlobal.getPendingImageSearch('img_u1').standardTitle, '突如其来');
-          const { DeepSeekAgent } = require('./dist/agent/DeepSeekAgent');
-          const dummyAgent = new DeepSeekAgent('dummy');
-          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '搜索'), true);
-          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '好的'), true);
-          assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '不用了'), false);
-          smGlobal.clearPendingImageSearch('img_u1');
-          assert.strictEqual(smGlobal.getPendingImageSearch('img_u1'), undefined);
+          // 8. Trilingual slot builder & noise guard checks
+          assert.deepStrictEqual(
+            MetadataResolver.buildTrilingualSearchTerms({
+              standardTitle: '突如其来',
+              originalTitle: '急に具合が悪くなる',
+              englishTitle: 'All of a Sudden',
+              aliases: ['突緣其來', '一瞬間'],
+            }),
+            ['突如其来', '急に具合が悪くなる', 'All of a Sudden']
+          );
+          assert.deepStrictEqual(
+            MetadataResolver.buildTrilingualSearchTerms({
+              standardTitle: '盗梦空间',
+              originalTitle: 'Inception',
+              englishTitle: 'Inception',
+            }),
+            ['盗梦空间', 'Inception']
+          );
+          assert.deepStrictEqual(
+            MetadataResolver.buildTrilingualSearchTerms({
+              standardTitle: '飞屋环游记',
+              originalTitle: 'Up',
+              englishTitle: 'Up',
+            }, undefined, '飞屋环游记'),
+            ['飞屋环游记']
+          );
+          assert.deepStrictEqual(
+            MetadataResolver.buildTrilingualSearchTerms({
+              standardTitle: '飞屋环游记',
+              originalTitle: 'Up',
+              englishTitle: 'Up',
+            }, undefined, 'Up'),
+            ['飞屋环游记', 'Up']
+          );
 
-          console.log('ALL_CI_CHECKS_PASSED');
+          // 9. ResourceSearcher.searchMany concurrent pool & dedup/sort check (mocked HTTP)
+          (async () => {
+            const axios = require('axios');
+            const origGet = axios.get;
+            const requestedUrls = [];
+            axios.get = async (url) => {
+              requestedUrls.push(url);
+              if (url.includes(encodeURIComponent('All of a Sudden'))) {
+                return {
+                  data: '<div class="tgme_widget_message_wrap"><div class="tgme_widget_message_text">名称：All of a Sudden 2026<br>https://pan.quark.cn/s/en123456</div></div>',
+                };
+              }
+              if (url.includes(encodeURIComponent('突如其来'))) {
+                return {
+                  data: '<div class="tgme_widget_message_wrap"><div class="tgme_widget_message_text">名称：突如其来 2026 4K<br>https://pan.quark.cn/s/cn123456</div></div>',
+                };
+              }
+              return { data: '' };
+            };
+            try {
+              const s2 = new ResourceSearcher(['ch1', 'ch2']);
+              const manyRes = await s2.searchMany(['突如其来', '急に具合が悪くなる', 'All of a Sudden']);
+              assert.strictEqual(requestedUrls.length, 6);
+              assert.strictEqual(manyRes.items.length, 2);
+              assert.strictEqual(manyRes.items[0].shareId, 'cn123456');
+              assert.strictEqual(manyRes.items[1].shareId, 'en123456');
+            } finally {
+              axios.get = origGet;
+            }
+
+            // 10. PendingImageSearch state & confirmation matching check
+            const smGlobal = SessionManager.getInstance();
+            smGlobal.setPendingImageSearch('img_u1', {
+              standardTitle: '突如其来',
+              originalTitle: '急に具合が悪くなる',
+              englishTitle: 'All of a Sudden',
+              aliases: ['All of a Sudden'],
+              year: '2026',
+              mediaType: 'movie',
+            });
+            assert.strictEqual(smGlobal.getPendingImageSearch('img_u1').englishTitle, 'All of a Sudden');
+            const { DeepSeekAgent } = require('./dist/agent/DeepSeekAgent');
+            const dummyAgent = new DeepSeekAgent('dummy');
+            assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '搜索'), true);
+            assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '好的'), true);
+            assert.strictEqual(dummyAgent.isPendingImageSearchConfirm('img_u1', '不用了'), false);
+            smGlobal.clearPendingImageSearch('img_u1');
+            assert.strictEqual(smGlobal.getPendingImageSearch('img_u1'), undefined);
+
+            console.log('ALL_CI_CHECKS_PASSED');
+            process.exit(0);
+          })().catch((err) => {
+            console.error(err);
+            process.exit(1);
+          });
           EOF
