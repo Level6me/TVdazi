@@ -1,0 +1,33 @@
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Dependency and Build
+node_modules/
+dist/
+
+# Runtime Data and Secrets (CRITICAL)
+data/*
+!data/.gitkeep
+codex_bot.db
+*.pid
+*.png
+prompt.txt
+FeishuSaver/
+
+# Sensitive Environment Configurations
+.env
+.env.local
+.env.*.local
+
+# Operating System & IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

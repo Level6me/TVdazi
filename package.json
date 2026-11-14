@@ -1,0 +1,46 @@
+{
+  "name": "wesaver",
+  "version": "1.0.0",
+  "description": "WeSaver - 微信端 AI 云盘资源转存助手 (DeepSeek 驱动)",
+  "main": "dist/login.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/login.js",
+    "server": "node dist/index.js",
+    "dev": "ts-node src/login.ts",
+    "cli": "ts-node src/cli.ts",
+    "wechat": "node dist/login.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Level6me/wesaver.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Level6me/wesaver/issues"
+  },
+  "homepage": "https://github.com/Level6me/wesaver#readme",
+  "keywords": [
+    "wechat",
+    "deepseek",
+    "ai-agent",
+    "quark",
+    "resource-saver",
+    "xiaohongshu-style"
+  ],
+  "author": "Level6me",
+  "license": "MIT",
+  "dependencies": {
+    "@types/qrcode": "^1.5.6",
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0-rc.12",
+    "dotenv": "^16.4.5",
+    "openai": "^4.70.2",
+    "qrcode": "^1.5.4",
+    "sqlite3": "^5.1.7"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.5",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.6.3"
+  }
+}

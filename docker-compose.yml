@@ -1,0 +1,14 @@
+version: '3.8'
+
+services:
+  wesaver:
+    build: .
+    container_name: wesaver
+    restart: always
+    ports:
+      - '3001:3001'
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    environment:
+      - NODE_ENV=production
