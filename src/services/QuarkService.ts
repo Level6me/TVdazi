@@ -810,7 +810,7 @@ export class QuarkService {
    */
   async cleanUserWorkspace(
     userRootDir?: string,
-    options?: { userId?: string; customCookie?: string }
+    options?: { userId?: string; customCookie?: string; standardTitle?: string }
   ): Promise<{
     scannedCount: number;
     renamedItems: Array<{ original: string; restored: string; reason?: string }>;
