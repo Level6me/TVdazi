@@ -13,6 +13,7 @@ export interface CloudResource {
   title: string;
   shareUrl: string;
   shareId: string;
+  passcode?: string;
   panType: 'quark' | 'aliyun' | 'uc' | '115' | 'other';
   rawText?: string;
   sourceChannel?: string;

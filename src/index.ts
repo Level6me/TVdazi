@@ -11,6 +11,7 @@ import { DoubanService } from './services/DoubanService';
 import { ChannelManager } from './services/ChannelManager';
 import { SessionManager } from './services/SessionManager';
 import { CategoryClassifier } from './services/CategoryClassifier';
+import { SchedulerService } from './services/SchedulerService';
 
 export {
   DeepSeekAgent,
@@ -27,6 +28,13 @@ export async function bootstrap() {
   const agent = new DeepSeekAgent();
   const commandHandler = new CommandHandler();
   const port = parseInt(process.env.PORT || '3001', 10);
+  const xmlPendingCache = new Map<string, { query: string; reply?: string; promise?: Promise<string>; timestamp: number }>();
+
+  // 启动后台定时与监控引擎
+  SchedulerService.getInstance().start(async (userId, message) => {
+    console.log(`[Scheduler 定时推送 -> ${userId}]\n${message}`);
+    return true;
+  });
 
   const server = http.createServer(async (req, res) => {
     const parsedUrl = url.parse(req.url || '', true);
@@ -100,7 +108,35 @@ export async function bootstrap() {
             }
 
             console.log(`[WeSaver 微信XML消息] 来自 ${fromUser}: ${userText}`);
-            const reply = await agent.chat(userText, [], fromUser);
+            let reply = '';
+            const cached = xmlPendingCache.get(fromUser);
+            if (cached && cached.reply && Date.now() - cached.timestamp < 120000 && (userText === cached.query || userText === '继续' || userText === '查看结果')) {
+              reply = cached.reply;
+              xmlPendingCache.delete(fromUser);
+            } else {
+              const chatPromise = agent.chat(userText, [], fromUser).then((resText) => {
+                const entry = xmlPendingCache.get(fromUser);
+                if (entry && entry.query === userText) {
+                  entry.reply = resText;
+                }
+                return resText;
+              });
+              xmlPendingCache.set(fromUser, { query: userText, promise: chatPromise, timestamp: Date.now() });
+
+              // 微信公众号被动回复严格限制 5 秒超时，在 4.4 秒内完成则直接返回，否则转后台缓存引导二次拉取
+              const timeoutSentinel = '__WECHAT_XML_TIMEOUT__';
+              const raceRes = await Promise.race([
+                chatPromise,
+                new Promise<string>((resolve) => setTimeout(() => resolve(timeoutSentinel), 4400)),
+              ]);
+
+              if (raceRes === timeoutSentinel) {
+                reply = `🔍 正在全网 50+ 频道为您深度检索「${userText}」...\n⏳ 请过 3 秒后回复「继续」或再次发送「${userText}」立即获取结果！`;
+              } else {
+                xmlPendingCache.delete(fromUser);
+                reply = raceRes;
+              }
+            }
 
             const xmlReply = `
 <xml>

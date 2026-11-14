@@ -292,6 +292,15 @@ export class UserManager {
     this.saveUserPlan(plan);
   }
 
+  setUserPreferredQuality(userId: string, quality: '4K' | '1080P' | '原盘' | 'any'): void {
+    const plan = this.getUserPlan(userId);
+    if (!plan.preferences) {
+      plan.preferences = { autoSaveOnSelect: true };
+    }
+    plan.preferences.preferredQuality = quality;
+    this.saveUserPlan(plan);
+  }
+
   getAllUsers(): UserPlan[] {
     return Array.from(this.memoryCache.values());
   }

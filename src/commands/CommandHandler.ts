@@ -31,10 +31,31 @@ export class CommandHandler {
     this.aiCorrector = AiCorrector.getInstance();
   }
 
+  private isFriendInviteIntent(trimmed: string): boolean {
+    if (/^\/(?:share|invite)\b/i.test(trimmed)) return true;
+    if (/https?:\/\/|pan\.quark\.cn|alipan\.com|aliyundrive\.com|drive\.uc\.cn|baidu\.com/i.test(trimmed)) {
+      return false;
+    }
+    return (
+      /^(?:分享|邀请|二维码|分享机器人|邀请二维码)$/.test(trimmed) ||
+      /(?:推荐给朋友|分享给朋友|分享给好友|把你推荐给|加机器人|邀请好友|邀请朋友|好友邀请|生成邀请|邀请码|机器人二维码|授权二维码)/.test(
+        trimmed
+      )
+    );
+  }
+
+  private hasDirectQuarkLink(trimmed: string): boolean {
+    return !trimmed.startsWith('/') && /https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/i.test(trimmed);
+  }
+
   isCommand(text: string, userId: string = 'default_user'): boolean {
     const trimmed = text.trim();
 
     if (this.userManager.getPendingSharePrompt(userId)) {
+      return true;
+    }
+
+    if (this.hasDirectQuarkLink(trimmed)) {
       return true;
     }
 
@@ -44,22 +65,11 @@ export class CommandHandler {
 
     if (
       trimmed.startsWith('/') ||
-      trimmed.startsWith('配置') ||
-      trimmed.startsWith('帮助') ||
-      trimmed.startsWith('排行榜') ||
-      trimmed.startsWith('搜 ') ||
-      trimmed.startsWith('搜索 ') ||
-      trimmed.startsWith('追剧') ||
-      trimmed.startsWith('片单') ||
-      trimmed.startsWith('修改目录') ||
-      trimmed.startsWith('设置目录') ||
-      trimmed.startsWith('保存目录') ||
-      trimmed.startsWith('转存目录') ||
-      trimmed.includes('分享') ||
-      trimmed.includes('推荐给朋友') ||
-      trimmed.includes('加机器人') ||
-      trimmed.includes('邀请') ||
-      trimmed.includes('二维码')
+      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质)(?:\s+.*)?$/i.test(
+        trimmed
+      ) ||
+      /^(?:搜|搜索)\s+.+/i.test(trimmed) ||
+      this.isFriendInviteIntent(trimmed)
     ) {
       return true;
     }
@@ -70,8 +80,8 @@ export class CommandHandler {
       }
     }
 
-    const num = SessionManager.parseNumberSelection(trimmed);
-    if (num !== null) {
+    const selection = SessionManager.parseSelection(trimmed);
+    if (selection !== null) {
       if (this.sessionManager.getSearch(userId) || this.sessionManager.getHot(userId)) {
         return true;
       }
@@ -136,22 +146,38 @@ export class CommandHandler {
       return await this.handlePagination(pageNav, userId);
     }
 
-    // 3. 序号选择指令
-    const selectedNum = SessionManager.parseNumberSelection(trimmed);
-    if (selectedNum !== null) {
-      return await this.handleSelection(selectedNum, userId);
+    // 3. 序号选择指令（兼容列表全局序号与“本页第X个”相对序号）
+    const selected = SessionManager.parseSelection(trimmed);
+    if (selected !== null) {
+      return await this.handleSelection(selected, userId);
+    }
+
+    // 3.5 直接粘贴夸克网盘分享链接或口令自动转存
+    if (this.hasDirectQuarkLink(trimmed)) {
+      const linkMatch = trimmed.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/i);
+      if (linkMatch && linkMatch[1]) {
+        const pwdId = linkMatch[1];
+        const codeMatch = trimmed.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})/i);
+        const passcode = linkMatch[2] || (codeMatch ? codeMatch[1] : '');
+        const titleMatch = trimmed.match(/「([^」]+)」|《([^》]+)》/);
+        const extractedTitle = titleMatch ? (titleMatch[1] || titleMatch[2] || '').trim() : undefined;
+        const category = extractedTitle ? CategoryClassifier.classify(extractedTitle, trimmed) : '电影';
+        const userPlan = this.userManager.getUserPlan(userId);
+        const res = await this.quarkService.saveShareFiles(pwdId, passcode, category, {
+          customCookie: userPlan.quarkCookie,
+          rootDir: userPlan.saveRootDir,
+          standardTitle: extractedTitle,
+          userId,
+        });
+        if (res.success) {
+          this.userManager.recordSave(userId, extractedTitle, `https://pan.quark.cn/s/${pwdId}`, category);
+        }
+        return res.message;
+      }
     }
 
     // 4. 用户表达分享意向时提问
-    if (
-      trimmed.includes('分享') ||
-      trimmed.includes('推荐给朋友') ||
-      trimmed.includes('加机器人') ||
-      trimmed.includes('邀请') ||
-      trimmed.includes('二维码') ||
-      trimmed.startsWith('/share') ||
-      trimmed.startsWith('/invite')
-    ) {
+    if (this.isFriendInviteIntent(trimmed)) {
       this.userManager.setPendingSharePrompt(userId);
       const userPlan = this.userManager.getUserPlan(userId);
       const currentKeyType = userPlan.deepseekApiKey ? '你的个人独立 API Key' : '系统默认共享 Key';
@@ -187,11 +213,11 @@ export class CommandHandler {
       return this.renderConfig(userId);
     }
 
-    if (['/watchlist', '/plan', '/追剧', '追剧', '/片单', '片单'].includes(cmd)) {
+    if (['/watchlist', '/plan', '/追剧', '追剧', '追剧清单', '我的追剧', '/片单', '片单', '我的片单', '查看片单'].includes(cmd)) {
       return this.renderWatchlist(userId, args);
     }
 
-    if (['/hot', '/discover', '/排行', '排行榜', '/热门'].includes(cmd)) {
+    if (['/hot', '/discover', '/排行', '排行榜', '/热门', '热门'].includes(cmd)) {
       const subType = args[0] ? args[0].toLowerCase() : 'movie';
       let type: 'movie' | 'tv' = 'movie';
       let tag = '热门';
@@ -222,7 +248,10 @@ export class CommandHandler {
 
     if (cmd === '/transfer-quark') {
       let pwdId = args[0] || '';
-      const passcode = args[1] || '';
+      const rawTail = args.slice(1).join(' ');
+      const urlPwdMatch = pwdId.match(/\bpwd=([a-zA-Z0-9]{4})/i);
+      const tailCodeMatch = rawTail.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})|^([a-zA-Z0-9]{4})$/i);
+      const passcode = (urlPwdMatch ? urlPwdMatch[1] : '') || (tailCodeMatch ? tailCodeMatch[1] || tailCodeMatch[2] || '' : '');
 
       if (!pwdId) {
         return '请给我夸克网盘的分享链接或链接里的那串字母哦！例如：/transfer-quark https://pan.quark.cn/s/xxxx';
@@ -303,6 +332,35 @@ export class CommandHandler {
       ].join('\n');
     }
 
+    if (['/prefer', '/quality', '画质偏好', '设置画质'].includes(cmd)) {
+      const rawPref = (args[0] || '').trim().toUpperCase();
+      if (!rawPref) {
+        const current = this.userManager.getUserPlan(userId).preferences?.preferredQuality || 'any';
+        return [
+          `🎞️ 当前搜片画质偏好：【${current === 'any' ? '自动默认（不限画质）' : current}】`,
+          '----------------------------------------',
+          '💡 可发送以下命令切换画质优先排序：',
+          '• `/prefer 4K`   优先置顶 4K / 杜比 / HDR 片源',
+          '• `/prefer 原盘` 优先置顶 REMUX / 蓝光原盘',
+          '• `/prefer 1080P` 优先置顶 1080P 省流版',
+          '• `/prefer 自动` 恢复默认排序',
+        ].join('\n');
+      }
+      let target: '4K' | '1080P' | '原盘' | 'any' = 'any';
+      if (['4K', '2160P', 'UHD', '高画质'].includes(rawPref)) target = '4K';
+      else if (['1080', '1080P', '省流', '高清'].includes(rawPref)) target = '1080P';
+      else if (['原盘', 'REMUX', '蓝光', 'BLURAY'].includes(rawPref)) target = '原盘';
+      else if (['ANY', 'AUTO', '自动', '默认', '不限', '重置'].includes(rawPref)) target = 'any';
+      else {
+        return '支持的画质偏好选项：`4K`、`1080P`、`原盘` 或 `自动`，例如：`/prefer 4K`';
+      }
+
+      this.userManager.setUserPreferredQuality(userId, target);
+      return target === 'any'
+        ? '✅ 已恢复默认搜片排序（自动综合相关度与夸克优先）。'
+        : `🎉 已为你设置首选画质为【${target}】！后续搜片与榜单搜存将优先为你置顶匹配 ${target} 片源~`;
+    }
+
     if (['/channels', '/频道'].includes(cmd)) {
       return this.renderChannels();
     }
@@ -326,34 +384,19 @@ export class CommandHandler {
         return '你还没有绑定夸克网盘 Cookie 哦！请先发送 /set-quark <你的Cookie> 绑定后再试~';
       }
 
-      // 扫描根目录与用户分类目录
-      const rootRes = await this.quarkService.cleanAntiCensorFilesInFolder('0', {
+      // 全面扫描网盘根目录、用户保存根目录及其下全部已存在影视分类目录
+      const userRootDir = userPlan.saveRootDir || this.quarkService.getDefaultRootDir();
+      const cleanRes = await this.quarkService.cleanUserWorkspace(userRootDir, {
         userId,
         customCookie: userPlan.quarkCookie,
       });
 
-      const userRootDir = userPlan.saveRootDir || this.quarkService.getDefaultRootDir();
-      let catCleanCount = 0;
-      let catRenamed: Array<{ original: string; restored: string; reason?: string }> = [];
-
-      try {
-        const catRes = await this.quarkService.getCategoryDir('电影', userRootDir, userPlan.quarkCookie);
-        if (catRes.fid && catRes.fid !== '0') {
-          const subRes = await this.quarkService.cleanAntiCensorFilesInFolder(catRes.fid, {
-            userId,
-            customCookie: userPlan.quarkCookie,
-          });
-          catCleanCount = subRes.scannedCount;
-          catRenamed = subRes.renamedItems;
-        }
-      } catch {}
-
-      const allRenamed = [...rootRes.renamedItems, ...catRenamed];
+      const allRenamed = cleanRes.renamedItems;
       if (allRenamed.length === 0) {
-        return `🎉 扫描完成（共检查 ${rootRes.scannedCount + catCleanCount} 个资源）！\n当前网盘中的资源名称都很规整，未检测到火星文或防版权混淆文件~`;
+        return `🎉 扫描完成（共全面巡检 ${cleanRes.scannedCount} 个文件/目录）！\n当前网盘中的资源名称都很规整，未检测到火星文或防版权混淆文件~`;
       }
 
-      let reply = `🎉 智能防和谐治理完成（共发现并还原 ${allRenamed.length} 处混淆剧名）：\n----------------------------------------`;
+      let reply = `🎉 智能防和谐治理完成（共扫描 ${cleanRes.scannedCount} 项，发现并还原 ${allRenamed.length} 处混淆剧名）：\n----------------------------------------`;
       for (const item of allRenamed) {
         reply += `\n• 原名：「${item.original}」\n  ➜ 还原为：《${item.restored}》`;
       }
@@ -508,7 +551,12 @@ export class CommandHandler {
     );
   }
 
-  private async handleSelection(index: number, userId: string): Promise<string> {
+  private async handleSelection(
+    selection: number | { index: number; isPageRelative: boolean },
+    userId: string
+  ): Promise<string> {
+    const parsed = typeof selection === 'number' ? { index: selection, isPageRelative: false } : selection;
+    const rawIndex = parsed.index;
     const lastType = this.sessionManager.getLastActiveType(userId);
     const searchSession = this.sessionManager.getSearch(userId);
     const hotSession = this.sessionManager.getHot(userId);
@@ -516,10 +564,25 @@ export class CommandHandler {
 
     // 若用户刚刚触发的是影视推荐 (hot)，优先从推荐列表中按序号搜存，避免被旧的搜索会话抢占
     if (lastType === 'hot' && hotSession && hotSession.items.length > 0) {
-      return await this.handleHotSelection(index, userId, hotSession, userPlan);
+      return await this.handleHotSelection(rawIndex, userId, hotSession, userPlan);
     }
 
     if (searchSession && searchSession.items.length > 0) {
+      const currentPage = Math.max(1, searchSession.page || 1);
+      const pageSize = Math.max(1, searchSession.pageSize || 8);
+      const startIdx = (currentPage - 1) * pageSize;
+      const currentPageCount = Math.min(pageSize, Math.max(0, searchSession.items.length - startIdx));
+
+      let index = rawIndex;
+      let relativeLabel = '';
+      if (parsed.isPageRelative && currentPage > 1) {
+        if (rawIndex < 1 || rawIndex > currentPageCount) {
+          return `当前第 ${currentPage} 页共有 ${currentPageCount} 个结果，请回复「本页第1个」~「本页第${currentPageCount}个」，或直接回复列表中对应的数字 ${startIdx + 1}~${startIdx + currentPageCount}！`;
+        }
+        index = startIdx + rawIndex;
+        relativeLabel = `（第 ${currentPage} 页第 ${rawIndex} 个）`;
+      }
+
       const itemIndex = index - 1;
       if (itemIndex < 0 || itemIndex >= searchSession.items.length) {
         return `序号【${index}】超出范围啦，当前一共有 ${searchSession.items.length} 个结果，请回复 1~${searchSession.items.length} 之间的数字哦！`;
@@ -527,18 +590,19 @@ export class CommandHandler {
 
       const item = searchSession.items[itemIndex];
       const category = item.category || CategoryClassifier.classify(item.title, item.rawText);
+      const standardTitle = searchSession.keyword || item.title;
 
       if (item.panType === 'quark' || item.shareUrl.includes('pan.quark.cn')) {
-        const res = await this.quarkService.saveShareFiles(item.shareId, '', category, {
+        const res = await this.quarkService.saveShareFiles(item.shareId, item.passcode || '', category, {
           customCookie: userPlan.quarkCookie,
           rootDir: userPlan.saveRootDir,
-          standardTitle: item.title,
+          standardTitle,
           userId: userId,
         });
         if (res.success) {
           this.userManager.recordSave(userId, item.title, item.shareUrl, category);
           return [
-            `🎬 收到！正在为你转存第 ${index} 个资源：`,
+            `🎬 收到！正在为你转存第 ${index} 个资源${relativeLabel}：`,
             `《${item.title}》`,
             `📂 已为你整理放入网盘：【${res.targetPath}】`,
             '----------------------------------------',
@@ -549,7 +613,7 @@ export class CommandHandler {
 
         // 转存失败时的友好降级与引导分支
         return [
-          `🎬 正在为你转存第 ${index} 个资源：`,
+          `🎬 正在为你转存第 ${index} 个资源${relativeLabel}：`,
           `《${item.title}》`,
           '----------------------------------------',
           `⚠️ 转存未能成功：${res.message}`,
@@ -564,7 +628,7 @@ export class CommandHandler {
 
       const panName = item.panType === 'aliyun' ? '阿里云盘' : item.panType === 'uc' ? 'UC网盘' : '第三方网盘';
       return [
-        `🎬 已为你找到第 ${index} 个资源《${item.title}》：`,
+        `🎬 已为你找到第 ${index} 个资源${relativeLabel}《${item.title}》：`,
         `📦 资源类型：${panName}（分类：${category}）`,
         `🔗 完整链接：${item.shareUrl}`,
         '----------------------------------------',
@@ -573,7 +637,7 @@ export class CommandHandler {
     }
 
     if (hotSession && hotSession.items.length > 0) {
-      return await this.handleHotSelection(index, userId, hotSession, userPlan);
+      return await this.handleHotSelection(rawIndex, userId, hotSession, userPlan);
     }
 
     return '还没有在搜索或者看榜单呢~ 告诉我你想看的片名（如“流浪地球2”），或者发送“热门”先挑挑看吧！';
@@ -593,7 +657,8 @@ export class CommandHandler {
     const subject = hotSession.items[itemIndex];
     const title = subject.title;
 
-    const searchRes = await this.searcher.search({ keyword: title });
+    const preferredQuality = userPlan.preferences?.preferredQuality;
+    const searchRes = await this.searcher.search({ keyword: title, quality: preferredQuality });
     if (!searchRes.items || searchRes.items.length === 0) {
       return [
         `🔍 正在全网为你搜寻《${title}》的资源...`,
@@ -603,54 +668,74 @@ export class CommandHandler {
       ].join('\n');
     }
 
-    this.sessionManager.setSearch(userId, title, searchRes.items, 10);
+    this.sessionManager.setSearch(userId, title, searchRes.items, 8);
 
-    const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
-    const targetItem = bestQuark || searchRes.items[0];
+    const resolveCategory = (item: CloudResource): ResourceCategory => {
+      let category: ResourceCategory = item.category || CategoryClassifier.classify(item.title, item.rawText || '');
+      if (hotSession.type === 'tv' && category === '电影') {
+        const tag = `${hotSession.tag || ''} ${subject.region || ''} ${(subject.types || []).join(' ')}`;
+        if (tag.includes('韩')) category = '韩剧';
+        else if (tag.includes('美') || tag.includes('英')) category = '美剧';
+        else if (tag.includes('日') && !tag.includes('动画')) category = '日剧';
+        else if (tag.includes('动画') || tag.includes('动漫')) category = '动漫';
+        else if (tag.includes('综艺') || tag.includes('真人秀')) category = '综艺';
+        else category = '国产剧';
+      }
+      return category;
+    };
 
-    let category: ResourceCategory = '电影';
-    if (hotSession.type === 'tv') {
-      const tag = hotSession.tag || '';
-      if (tag.includes('韩剧')) category = '韩剧';
-      else if (tag.includes('美剧')) category = '美剧';
-      else if (tag.includes('日剧')) category = '日剧';
-      else if (tag.includes('动漫')) category = '动漫';
-      else if (tag.includes('综艺')) category = '综艺';
-      else category = '国产剧';
-    }
+    const quarkCandidates = searchRes.items.filter(
+      (i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn')
+    );
 
-    if (targetItem.panType === 'quark' || targetItem.shareUrl.includes('pan.quark.cn')) {
-      const saveRes = await this.quarkService.saveShareFiles(targetItem.shareId, '', category, {
-        customCookie: userPlan.quarkCookie,
-        rootDir: userPlan.saveRootDir,
-        standardTitle: title,
-        userId: userId,
-      });
-      if (saveRes.success) {
-        this.userManager.recordSave(userId, title, targetItem.shareUrl, category);
-        return [
-          `🎉 一键全网搜存成功！`,
-          `📺 剧名：《${title}》`,
-          `📁 存放目录：夸克网盘【${saveRes.targetPath}】`,
-          `🎬 版本信息：${targetItem.title}`,
-          '----------------------------------------',
-          saveRes.message,
-          `🔗 分享链接：${targetItem.shareUrl}`,
-        ].join('\n');
+    if (quarkCandidates.length > 0) {
+      const maxAttempts = Math.min(3, quarkCandidates.length);
+      let lastSaveMsg = '';
+      let lastCandidate = quarkCandidates[0];
+
+      // 自动死链顺延容错：若第 1 条夸克链接已失效，自动顺延尝试第 2、第 3 条直到转存成功
+      for (let idx = 0; idx < maxAttempts; idx++) {
+        const cand = quarkCandidates[idx];
+        lastCandidate = cand;
+        const category = resolveCategory(cand);
+        const saveRes = await this.quarkService.saveShareFiles(cand.shareId, cand.passcode || '', category, {
+          customCookie: userPlan.quarkCookie,
+          rootDir: userPlan.saveRootDir,
+          standardTitle: title,
+          userId: userId,
+        });
+        if (saveRes.success) {
+          this.userManager.recordSave(userId, title, cand.shareUrl, category);
+          const failoverTip = idx > 0 ? `（前 ${idx} 条链接已失效，已自动为你顺延命中有效活链 ⚡）` : '';
+          return [
+            `🎉 一键全网搜存成功！${failoverTip}`,
+            `📺 剧名：《${title}》`,
+            `📁 存放目录：夸克网盘【${saveRes.targetPath}】`,
+            `🎬 版本信息：${cand.title}`,
+            '----------------------------------------',
+            saveRes.message,
+            `🔗 分享链接：${cand.shareUrl}`,
+          ].join('\n');
+        }
+        lastSaveMsg = saveRes.message;
       }
 
+      const pageData = this.sessionManager.getSearchPage(userId, 1);
+      const listPreview = pageData ? `\n${this.formatSearchResultPage({ ...pageData, keyword: title })}` : '';
       return [
-        `🎬 正在为你转存《${title}》精选资源：`,
-        `🎬 版本信息：${targetItem.title}`,
+        `🎬 正在为你转存《${title}》资源（已自动尝试前 ${maxAttempts} 条夸克候选）：`,
+        `🎬 最近尝试版本：${lastCandidate.title}`,
         '----------------------------------------',
-        `⚠️ 转存未能成功：${saveRes.message}`,
-        `🔗 分享链接：${targetItem.shareUrl}`,
-        '----------------------------------------',
-        '💡 该分享链接可能已失效：',
-        `👉 列表中还有其他候选资源，你可以继续回复数字序号（1~${searchRes.items.length}）尝试转存其他版本；`,
-        '👉 或回复「取消」退出当前找片。',
-      ].join('\n');
+        `⚠️ 转存未能成功：${lastSaveMsg}`,
+        '💡 已为你列出全部候选资源，可直接回复下方列表中的序号继续尝试转存或复制其他网盘链接：',
+        listPreview,
+      ]
+        .filter(Boolean)
+        .join('\n');
     }
+
+    const targetItem = searchRes.items[0];
+    const category = resolveCategory(targetItem);
 
     return [
       `🎉 找到《${title}》的网盘资源啦！`,
@@ -693,13 +778,30 @@ export class CommandHandler {
           ? 'UC'
           : '网盘';
       const cat = item.category ? `[${item.category}]` : '';
-      msg += `${seq}. [${panTag}]${cat} ${item.title}\n`;
+      const fullText = `${item.title} ${item.rawText || ''}`;
+      let qBadge = '';
+      if (!/4k|2160p/i.test(item.title) && /(?:4k|2160p|杜比|dolby)/i.test(fullText)) {
+        qBadge = '[4K]';
+      } else if (!/remux|原盘/i.test(item.title) && /(?:remux|蓝光原盘)/i.test(fullText)) {
+        qBadge = '[原盘]';
+      } else if (!/1080p/i.test(item.title) && /1080p/i.test(fullText)) {
+        qBadge = '[1080P]';
+      }
+      const pwdBadge = item.passcode ? '[含密码]' : '';
+      msg += `${seq}. [${panTag}]${cat}${qBadge}${pwdBadge} ${item.title}\n`;
     });
 
     msg += `----------------------------------------\n`;
-    msg += `💡 回复序号一键转存（如「1」或「存第1个」）`;
-    if (page < totalPages) {
-      msg += `；回复「下一页」翻页`;
+    if (page > 1) {
+      msg += `💡 回复序号（如「${startIdx + 1}」或「本页第1个」）一键转存`;
+    } else {
+      msg += `💡 回复序号一键转存（如「1」或「存第1个」）`;
+    }
+    const navHints: string[] = [];
+    if (page > 1) navHints.push('「上一页」');
+    if (page < totalPages) navHints.push('「下一页」');
+    if (navHints.length > 0) {
+      msg += `；回复${navHints.join('/')}翻页`;
     }
     return msg.trim();
   }
@@ -734,12 +836,15 @@ export class CommandHandler {
 
     const metaHeader = metaHeaders.join('\n');
 
+    const userPlan = this.userManager.getUserPlan(userId);
+    const preferredQuality = userPlan.preferences?.preferredQuality;
+
     // 智能多级检索尝试：先检索主词，无结果时自动尝试备选词
-    let res = await this.searcher.search({ keyword: searchWord });
+    let res = await this.searcher.search({ keyword: searchWord, quality: preferredQuality });
     if ((!res.items || res.items.length === 0) && correction.candidateKeywords && correction.candidateKeywords.length > 0) {
       for (const candidate of correction.candidateKeywords) {
         if (candidate !== searchWord) {
-          const candidateRes = await this.searcher.search({ keyword: candidate });
+          const candidateRes = await this.searcher.search({ keyword: candidate, quality: preferredQuality });
           if (candidateRes.items && candidateRes.items.length > 0) {
             res = candidateRes;
             searchWord = candidate;
@@ -851,6 +956,7 @@ export class CommandHandler {
       '• /status        查看网盘空间与状态',
       '• /config        查看当前个人配置',
       '• /set-dir 路径   修改保存目录(如 /影视)',
+      '• /prefer 4K     设置搜片优先画质偏好',
       '• /clean-names   一键清洗网盘火星文剧名',
       '• /追剧          查看追剧清单与历史',
       '• /share         邀请微信好友一起使用',
@@ -883,6 +989,7 @@ export class CommandHandler {
     }
 
     const maskedUser = userId.length > 16 ? `${userId.slice(0, 8)}...${userId.slice(-6)}` : userId;
+    const prefQuality = userPlan.preferences?.preferredQuality || 'any';
 
     return [
       '⚙️ 【你的专属配置面板】',
@@ -890,6 +997,7 @@ export class CommandHandler {
       `👤 微信账号：${maskedUser}`,
       `☁️ 夸克网盘：${hasCustomCookie ? '✅ 你的私有账号已绑定' : isGlobalQuark ? '✅ 正在使用公共网盘' : '❌ 尚未绑定 (发 /set-quark)'}`,
       `📂 转存目录：${saveDir}`,
+      `🎞️ 画质偏好：${prefQuality === 'any' ? '自动默认' : `${prefQuality} 优先`}（发 /prefer 可改）`,
       `🧠 AI 驱动：${keyStatus}`,
       `📋 追剧片单：已收录 ${userPlan.watchlist.length} 部影视`,
       `📊 使用统计：找片 ${userPlan.stats.totalSearches} 次，累计转存 ${userPlan.stats.totalSaves} 部`,

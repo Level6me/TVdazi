@@ -1,4 +1,5 @@
 import axios from 'axios';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as path from 'path';
 import { ResourceCategory } from '../types';
@@ -229,12 +230,19 @@ export class QuarkService {
     }
   }
 
+  private getCookieScopeKey(customCookie?: string): string {
+    const raw = (customCookie || this.cookie || '').trim();
+    if (!raw) return 'empty';
+    return crypto.createHash('md5').update(raw).digest('hex').slice(0, 12);
+  }
+
   /**
    * 递归解析并自动逐层创建多级路径，返回最底层目录 FID
    * 例如 "/我的资源/MI/电影"，会依次定位或创建 "我的资源" -> "MI" -> "电影"
    */
   async ensureDirectoryPath(fullPath: string, customCookie?: string): Promise<string> {
-    const cacheKey = `${customCookie ? 'custom' : 'default'}:${fullPath}`;
+    const scopeKey = this.getCookieScopeKey(customCookie);
+    const cacheKey = `${scopeKey}:${fullPath}`;
     if (this.dirCache.has(cacheKey)) {
       return this.dirCache.get(cacheKey)!;
     }
@@ -249,7 +257,7 @@ export class QuarkService {
 
     for (const segment of segments) {
       currentPath += `/${segment}`;
-      const subCacheKey = `${customCookie ? 'custom' : 'default'}:${currentPath}`;
+      const subCacheKey = `${scopeKey}:${currentPath}`;
       if (this.dirCache.has(subCacheKey)) {
         currentFid = this.dirCache.get(subCacheKey)!;
         continue;
@@ -383,7 +391,7 @@ export class QuarkService {
   /**
    * 轮询异步转存任务状态并获取生成的文件/目录 fid 列表
    */
-  async pollTaskTopFids(taskId: string, customCookie?: string, maxAttempts = 3): Promise<string[]> {
+  async pollTaskTopFids(taskId: string, customCookie?: string, maxAttempts = 6): Promise<string[]> {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       try {
         const resp = await axios.get('https://drive-h.quark.cn/1/clouddrive/task', {
@@ -398,8 +406,11 @@ export class QuarkService {
           timeout: 4000,
         });
         const taskData = resp.data?.data;
-        if (taskData?.status === 2 && taskData?.save_as?.save_as_top_fids) {
-          return taskData.save_as.save_as_top_fids;
+        if (taskData?.status === 2) {
+          return taskData?.save_as?.save_as_top_fids || [];
+        }
+        if (taskData?.status === 3) {
+          break;
         }
       } catch {}
       await new Promise((r) => setTimeout(r, 600));
@@ -480,7 +491,11 @@ export class QuarkService {
       } catch {}
 
       if (fid_list.length === 0) {
-        fid_list = [pwdId];
+        return {
+          success: false,
+          message: '分享链接内没有可转存的文件，或分享内容已被删除',
+          targetPath,
+        };
       }
 
       // 3. 执行转存
@@ -596,18 +611,22 @@ export class QuarkService {
       timeout: 7000,
     });
 
-    const fileList: Array<{ fid: string; file_name: string }> = sortResp.data?.data?.list || [];
+    const fileList: Array<{ fid: string; file_name: string; dir?: boolean }> = sortResp.data?.data?.list || [];
     const shareNameSet = new Set(shareItems.map((s) => s.file_name));
     const targetFidSet = new Set(targetFids);
 
-    // 候选文件：命中 task_id top_fids 或者文件名与分享项一致的文件
+    // 候选文件/目录：命中 task_id top_fids 或者文件名与分享项一致的项
     const candidates = fileList.filter((f) => targetFidSet.has(f.fid) || shareNameSet.has(f.file_name));
 
+    const childDirsToScan: Array<{ fid: string; folderTitle: string }> = [];
+
     for (const item of candidates) {
+      let effectiveName = item.file_name;
       const checkRes = await antiCensor.restoreTitle(item.file_name, standardTitle, userId);
       if (checkRes.isHarmonized && checkRes.restoredName && checkRes.restoredName !== item.file_name) {
         const renameRes = await this.renameFile(item.fid, checkRes.restoredName, customCookie);
         if (renameRes.success) {
+          effectiveName = checkRes.restoredName;
           renamedItems.push({
             original: item.file_name,
             restored: checkRes.restoredName,
@@ -615,6 +634,25 @@ export class QuarkService {
           });
         }
       }
+      if (item.dir && childDirsToScan.length < 5) {
+        childDirsToScan.push({
+          fid: item.fid,
+          folderTitle: standardTitle || checkRes.standardTitle || effectiveName,
+        });
+      }
+    }
+
+    // 递归 1 层进入新转存的剧集/合集子目录，清洗内部被混淆的单集文件名（最多处理 5 个子目录）
+    for (const child of childDirsToScan) {
+      try {
+        const childRes = await this.cleanAntiCensorFilesInFolder(child.fid, {
+          standardTitle: child.folderTitle,
+          userId,
+          customCookie,
+          maxScan: 30,
+        });
+        renamedItems.push(...childRes.renamedItems);
+      } catch {}
     }
   }
 
@@ -680,5 +718,87 @@ export class QuarkService {
         renamedItems,
       };
     }
+  }
+
+  /**
+   * 仅解析已存在的路径 FID（只读查找，不自动创建不存在的空目录）
+   */
+  async resolveExistingPathFid(fullPath: string, customCookie?: string): Promise<string | null> {
+    const segments = fullPath
+      .replace(/^[\/\\]+|[\/\\]+$/g, '')
+      .split(/[\/\\]+/)
+      .filter(Boolean);
+    if (segments.length === 0) return '0';
+
+    let currentFid = '0';
+    for (const segment of segments) {
+      const folders = await this.getFolderList(currentFid, customCookie);
+      const found = folders.find((f) => f.name === segment);
+      if (!found) return null;
+      currentFid = found.cid;
+    }
+    return currentFid;
+  }
+
+  /**
+   * 全面扫描用户网盘工作区（根目录 + 用户保存根目录 + 全部已存在的影视分类子目录），不误建空文件夹
+   */
+  async cleanUserWorkspace(
+    userRootDir?: string,
+    options?: { userId?: string; customCookie?: string }
+  ): Promise<{
+    scannedCount: number;
+    renamedItems: Array<{ original: string; restored: string; reason?: string }>;
+  }> {
+    const customCookie = options?.customCookie;
+    const baseDir = userRootDir || this.defaultRootDir;
+    let totalScanned = 0;
+    const allRenamed: Array<{ original: string; restored: string; reason?: string }> = [];
+    const scannedFids = new Set<string>();
+
+    const antiCensor = AntiCensorService.getInstance();
+    const scanOnce = async (fid: string, fallbackTitle?: string) => {
+      if (!fid || scannedFids.has(fid)) return;
+      scannedFids.add(fid);
+      const res = await this.cleanAntiCensorFilesInFolder(fid, {
+        ...options,
+        standardTitle: options?.standardTitle || fallbackTitle,
+      });
+      totalScanned += res.scannedCount;
+      allRenamed.push(...res.renamedItems);
+    };
+
+    // 1. 扫描网盘顶层根目录 '0'
+    await scanOnce('0');
+
+    // 2. 查找用户保存根目录（如 /我的资源），若存在则扫描该目录、全部分类子目录及其下 1 层影视文件夹（最多 15 个，防止触发接口限流）
+    try {
+      const rootFid = await this.resolveExistingPathFid(baseDir, customCookie);
+      if (rootFid && rootFid !== '0') {
+        await scanOnce(rootFid);
+        const categoryFolders = await this.getFolderList(rootFid, customCookie);
+        let nestedScanned = 0;
+        for (const catFolder of categoryFolders) {
+          await scanOnce(catFolder.cid);
+          if (nestedScanned >= 15) continue;
+          try {
+            const mediaFolders = await this.getFolderList(catFolder.cid, customCookie);
+            for (const mediaFolder of mediaFolders) {
+              if (nestedScanned >= 15) break;
+              nestedScanned++;
+              const folderHint = antiCensor.hasHarmonizedFeatures(mediaFolder.name)
+                ? undefined
+                : mediaFolder.name.replace(/[《》]/g, '').trim();
+              await scanOnce(mediaFolder.cid, folderHint);
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+
+    return {
+      scannedCount: totalScanned,
+      renamedItems: allRenamed,
+    };
   }
 }

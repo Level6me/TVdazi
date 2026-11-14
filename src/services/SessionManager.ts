@@ -33,6 +33,14 @@ export class SessionManager {
     return SessionManager.instance;
   }
 
+  private setBounded<T>(map: Map<string, T>, key: string, value: T, limit: number = 300): void {
+    if (!map.has(key) && map.size >= limit) {
+      const oldestKey = map.keys().next().value;
+      if (oldestKey) map.delete(oldestKey);
+    }
+    map.set(key, value);
+  }
+
   setSearch(userId: string, keyword: string, items: CloudResource[], pageSize: number = 20): SearchSession {
     const session: SearchSession = {
       keyword,
@@ -41,8 +49,8 @@ export class SessionManager {
       pageSize,
       updatedAt: Date.now(),
     };
-    this.searchSessions.set(userId, session);
-    this.lastActiveSessionType.set(userId, 'search');
+    this.setBounded(this.searchSessions, userId, session);
+    this.setBounded(this.lastActiveSessionType, userId, 'search');
     return session;
   }
 
@@ -68,8 +76,8 @@ export class SessionManager {
       pageSize,
       updatedAt: Date.now(),
     };
-    this.hotSessions.set(userId, session);
-    this.lastActiveSessionType.set(userId, 'hot');
+    this.setBounded(this.hotSessions, userId, session);
+    this.setBounded(this.lastActiveSessionType, userId, 'hot');
     return session;
   }
 
@@ -184,10 +192,10 @@ export class SessionManager {
   }
 
   /**
-   * 解析数字/序号选择
-   * 支持: "第2个", "我要第2个", "存第2个", "2", "第二个", "选2", "看第1个"
+   * 解析数字/序号选择（同时区分“当前页/本页相对序号”与“列表全局序号”）
+   * 支持: "第2个", "我要第2个", "本页第1个", "当前第2个", "这页1", "2", "第二个"
    */
-  static parseNumberSelection(text: string): number | null {
+  static parseSelection(text: string): { index: number; isPageRelative: boolean } | null {
     const trimmed = text.trim();
     if (!trimmed) return null;
 
@@ -202,7 +210,16 @@ export class SessionManager {
         trimmed
       )
     ) {
-      return 1;
+      return { index: 1, isPageRelative: true };
+    }
+
+    const relMatch = trimmed.match(
+      /^(?:我要|我要存|帮我存|存|选|要|保存|查看|看|转存)?\s*(?:本页|当前页|当前|这一页|这页|当页)(?:的)?\s*(?:第)?\s*([0-9]{1,3}|[一二两三四五六七八九十])\s*(?:个|条|部|集)?$/
+    );
+    if (relMatch && relMatch[1]) {
+      const val = relMatch[1];
+      const idx = /^[0-9]+$/.test(val) ? parseInt(val, 10) : cnMap[val];
+      if (idx) return { index: idx, isPageRelative: true };
     }
 
     const match = trimmed.match(
@@ -212,13 +229,21 @@ export class SessionManager {
     if (match && match[1]) {
       const val = match[1];
       if (/^[0-9]+$/.test(val)) {
-        return parseInt(val, 10);
+        return { index: parseInt(val, 10), isPageRelative: false };
       }
       if (cnMap[val]) {
-        return cnMap[val];
+        return { index: cnMap[val], isPageRelative: false };
       }
     }
     return null;
+  }
+
+  /**
+   * 解析数字/序号选择
+   * 支持: "第2个", "我要第2个", "存第2个", "2", "第二个", "选2", "看第1个"
+   */
+  static parseNumberSelection(text: string): number | null {
+    return SessionManager.parseSelection(text)?.index ?? null;
   }
 
   /**

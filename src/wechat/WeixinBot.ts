@@ -41,6 +41,8 @@ export class WeixinBot {
   private authData: AuthData | null = null;
   private isRunning: boolean = false;
   private syncBuf: string = '';
+  private processedMsgIds: Map<string, number> = new Map();
+  private userTaskQueues: Map<string, Promise<void>> = new Map();
 
   constructor() {
     this.agent = new DeepSeekAgent();
@@ -254,6 +256,49 @@ export class WeixinBot {
   }
 
   /**
+   * 检查消息是否已处理过（防止长轮询网络重传导致重复转存/重复回复）
+   */
+  private isDuplicateMessage(botId: string, msg: any): boolean {
+    const rawId = msg.message_id || msg.msg_id || msg.client_id || msg.seq;
+    if (!rawId) return false;
+    const key = `${botId}:${rawId}`;
+    const now = Date.now();
+    if (this.processedMsgIds.has(key)) {
+      return true;
+    }
+    this.processedMsgIds.set(key, now);
+    if (this.processedMsgIds.size > 1500) {
+      for (const [k, ts] of this.processedMsgIds) {
+        if (now - ts > 10 * 60 * 1000 || this.processedMsgIds.size > 1000) {
+          this.processedMsgIds.delete(k);
+        } else {
+          break;
+        }
+      }
+    }
+    return false;
+  }
+
+  /**
+   * 按用户串行排队执行任务（不同用户完全并发，同一用户多条连发严格保序，防止会话状态竞态）
+   */
+  private enqueueUserTask(userKey: string, task: () => Promise<void>): void {
+    const prev = this.userTaskQueues.get(userKey) || Promise.resolve();
+    const next = prev
+      .catch(() => {})
+      .then(task)
+      .catch((err: any) => {
+        console.error(`[Weixin 用户队列异常] ${userKey}:`, err?.message || err);
+      })
+      .finally(() => {
+        if (this.userTaskQueues.get(userKey) === next) {
+          this.userTaskQueues.delete(userKey);
+        }
+      });
+    this.userTaskQueues.set(userKey, next);
+  }
+
+  /**
    * 启动指定账号的消息长轮询循环
    */
   async startAccountLoop(auth: AuthData) {
@@ -301,25 +346,39 @@ export class WeixinBot {
           console.log(`[WeixinBot-${auth.botId} 消息详情] msg_type=${msg.message_type}, from=${msg.from_user_id}, to=${msg.to_user_id}`);
           // 只处理用户发出的消息 (message_type === 1)
           if (msg.message_type === 1 && msg.from_user_id) {
+            if (this.isDuplicateMessage(auth.botId, msg)) {
+              continue;
+            }
             const fromUser = msg.from_user_id;
             const contextToken = msg.context_token;
             this.recordUserRoute(fromUser, auth.botId, contextToken);
             const textItem = msg.item_list?.find((i: any) => i.type === 1);
             const imageItem = msg.item_list?.find((i: any) => i.type === 2);
             const userText = textItem?.text_item?.text?.trim();
+            const userQueueKey = `${auth.botId}:${fromUser}`;
 
             if (userText) {
               console.log(`[Weixin 收到消息] [Bot:${auth.botId}] 来自 ${fromUser}: ${userText}`);
 
-              // 调用 WeSaver 智能 Agent（支持搜片、指令、热门排行与智能归类转存）
-              const reply = await this.agent.chat(userText, [], fromUser);
-
-              // 自动回复给微信用户
-              await this.sendTextMessageWithAuth(auth, fromUser, reply, contextToken);
+              // 异步入队处理：不阻塞长轮询心跳，同时保证同一用户连发消息按顺序执行
+              this.enqueueUserTask(userQueueKey, async () => {
+                try {
+                  const reply = await this.agent.chat(userText, [], fromUser);
+                  await this.sendTextMessageWithAuth(auth, fromUser, reply, contextToken);
+                } catch (chatErr: any) {
+                  console.error(`[Weixin 消息处理异常] [Bot:${auth.botId}]`, chatErr.message);
+                }
+              });
             } else if (imageItem) {
               console.log(`[Weixin 收到图片] [Bot:${auth.botId}] 来自 ${fromUser}`);
-              // 用户发送图片交互处理
-              await this.handleInboundImageWithAuth(auth, fromUser, imageItem, contextToken);
+              // 异步入队处理图片交互
+              this.enqueueUserTask(userQueueKey, async () => {
+                try {
+                  await this.handleInboundImageWithAuth(auth, fromUser, imageItem, contextToken);
+                } catch (imgErr: any) {
+                  console.error(`[Weixin 图片处理异常] [Bot:${auth.botId}]`, imgErr.message);
+                }
+              });
             }
           }
         }

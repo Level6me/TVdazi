@@ -7,6 +7,7 @@ import { AiRecommender } from './AiRecommender';
 import { SessionManager } from './SessionManager';
 import { UserManager } from './UserManager';
 import { CategoryClassifier, ResourceCategory } from './CategoryClassifier';
+import { CloudResource } from '../types';
 
 export type TaskType =
   | 'daily_recommend'   // 场景1：每日/周期定时推送指定类型影视推荐
@@ -340,27 +341,17 @@ export class SchedulerService {
       return null;
     }
 
-    // 优先选夸克资源
-    const quarkItems = items.filter((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
-    const bestItem = quarkItems[0] || items[0];
-
+    // 优先选夸克资源，且支持死链自动顺延重试（最多尝试前 3 条夸克活链）
     this.sessionManager.setSearch(task.userId, keyword, items, 8);
 
     let saveMsg = '';
-    if (task.autoSave && (bestItem.panType === 'quark' || bestItem.shareUrl.includes('pan.quark.cn'))) {
-      const userPlan = this.userManager.getUserPlan(task.userId);
-      const category = bestItem.category || CategoryClassifier.classify(bestItem.title, bestItem.rawText);
-      const saveRes = await this.quarkService.saveShareFiles(bestItem.shareId, '', category, {
-        customCookie: userPlan.quarkCookie,
-        rootDir: userPlan.saveRootDir,
-        standardTitle: keyword,
-        userId: task.userId,
-      });
-      if (saveRes.success) {
-        this.userManager.recordSave(task.userId, keyword, bestItem.shareUrl, category);
-        saveMsg = `\n🎉 已按你的预约，全自动转存至夸克网盘：【${saveRes.targetPath}】！\n${saveRes.message}`;
-      } else {
-        saveMsg = `\n💡 自动转存尝试提示：${saveRes.message}（可直接回复数字 1~${Math.min(5, items.length)} 尝试其他候选活链）`;
+    if (task.autoSave) {
+      const autoRes = await this.trySaveQuarkCandidates(items, task.userId, '电影', keyword);
+      if (autoRes.success && autoRes.item) {
+        const tip = autoRes.attempt > 1 ? `（第 1 条失效，已自动顺延第 ${autoRes.attempt} 条活链入库）` : '';
+        saveMsg = `\n🎉 已按你的预约，全自动转存至夸克网盘：【${autoRes.targetPath}】！${tip}\n${autoRes.message}`;
+      } else if (autoRes.message) {
+        saveMsg = `\n💡 自动转存尝试提示：${autoRes.message}（可直接回复数字 1~${Math.min(5, items.length)} 尝试其他候选活链）`;
       }
     }
 
@@ -407,7 +398,7 @@ export class SchedulerService {
     const patterns = [
       /(?:更至|更新至|更新到|更到|至)\s*(?:第)?\s*(\d{1,3})\s*[集话期]/gi,
       /第\s*(\d{1,3})\s*-\s*(\d{1,3})\s*[集话期]/gi,
-      /(?:0?1)\s*-\s*(\d{1,3})\s*[集话期]?/gi,
+      /(?:0?1)\s*-\s*(\d{1,3})\s*[集话期]/gi,
       /第\s*(\d{1,3})\s*[集话期]/gi,
       /[Ss]\d{1,2}\s*[Ee]\d{1,3}\s*-\s*[Ee]?(\d{1,3})/g,
       /[Ss]\d{1,2}\s*[Ee](\d{1,3})/g,
@@ -456,8 +447,8 @@ export class SchedulerService {
       if (info.maxEp > highestEp) {
         highestEp = info.maxEp;
         bestCandidate = item;
-      }
-      if (info.isComplete) {
+        completeFlag = info.isComplete;
+      } else if (info.maxEp === highestEp && info.isComplete) {
         completeFlag = true;
       }
     }
@@ -488,24 +479,19 @@ export class SchedulerService {
     if (completeFlag && highestEp > 0) {
       // 完结剧集追更圆满完成
       task.status = 'completed';
+      task.enabled = false;
     }
     this.saveTasks();
 
     this.sessionManager.setSearch(task.userId, keyword, items, 8);
 
     let saveDetail = '';
-    if (task.autoSave !== false && (bestCandidate.panType === 'quark' || bestCandidate.shareUrl.includes('pan.quark.cn'))) {
-      const userPlan = this.userManager.getUserPlan(task.userId);
-      const category = bestCandidate.category || CategoryClassifier.classify(bestCandidate.title, bestCandidate.rawText || '');
-      const saveRes = await this.quarkService.saveShareFiles(bestCandidate.shareId, '', category, {
-        customCookie: userPlan.quarkCookie,
-        rootDir: userPlan.saveRootDir,
-        standardTitle: keyword,
-        userId: task.userId,
-      });
-      if (saveRes.success) {
-        this.userManager.recordSave(task.userId, keyword, bestCandidate.shareUrl, category);
-        saveDetail = `\n📂 已自动转存至夸克网盘：【${saveRes.targetPath}】\n${saveRes.message}`;
+    if (task.autoSave !== false) {
+      // 优先尝试含最高集数的 bestCandidate，失败时自动顺延同批次其他有效夸克候选（最多 3 条）
+      const prioritized = [bestCandidate, ...candidates.filter((c) => c.shareId !== bestCandidate.shareId)];
+      const autoRes = await this.trySaveQuarkCandidates(prioritized, task.userId, '国产剧', keyword);
+      if (autoRes.success) {
+        saveDetail = `\n📂 已自动转存至夸克网盘：【${autoRes.targetPath}】\n${autoRes.message}`;
       } else {
         saveDetail = `\n🔗 最新分享链接：${bestCandidate.shareUrl}（回复「1」可手动转存）`;
       }
@@ -554,18 +540,10 @@ export class SchedulerService {
     this.sessionManager.setSearch(task.userId, keyword, hqItems, 8);
 
     let saveDetail = '';
-    if (task.autoSave !== false && (bestHq.panType === 'quark' || bestHq.shareUrl.includes('pan.quark.cn'))) {
-      const userPlan = this.userManager.getUserPlan(task.userId);
-      const category = bestHq.category || CategoryClassifier.classify(bestHq.title, bestHq.rawText || '');
-      const saveRes = await this.quarkService.saveShareFiles(bestHq.shareId, '', category, {
-        customCookie: userPlan.quarkCookie,
-        rootDir: userPlan.saveRootDir,
-        standardTitle: `${keyword} (4K收藏版)`,
-        userId: task.userId,
-      });
-      if (saveRes.success) {
-        this.userManager.recordSave(task.userId, keyword, bestHq.shareUrl, category);
-        saveDetail = `\n📂 已自动为你洗版转存至夸克网盘：【${saveRes.targetPath}】\n${saveRes.message}`;
+    if (task.autoSave !== false) {
+      const autoRes = await this.trySaveQuarkCandidates(hqItems, task.userId, '电影', keyword);
+      if (autoRes.success) {
+        saveDetail = `\n📂 已自动为你洗版转存至夸克网盘：【${autoRes.targetPath}】\n${autoRes.message}`;
       }
     }
 
@@ -624,29 +602,14 @@ export class SchedulerService {
     }
 
     const info = await this.quarkService.getUserInfo(customCookie);
-    const rootRes = await this.quarkService.cleanAntiCensorFilesInFolder('0', {
+    const userRootDir = userPlan.saveRootDir || this.quarkService.getDefaultRootDir();
+    const cleanRes = await this.quarkService.cleanUserWorkspace(userRootDir, {
       userId: task.userId,
       customCookie,
     });
 
-    const userRootDir = userPlan.saveRootDir || this.quarkService.getDefaultRootDir();
-    let subRenamed: Array<{ original: string; restored: string; reason?: string }> = [];
-    let subScanned = 0;
-
-    try {
-      const catRes = await this.quarkService.getCategoryDir('电影', userRootDir, customCookie);
-      if (catRes.fid && catRes.fid !== '0') {
-        const subRes = await this.quarkService.cleanAntiCensorFilesInFolder(catRes.fid, {
-          userId: task.userId,
-          customCookie,
-        });
-        subScanned = subRes.scannedCount;
-        subRenamed = subRes.renamedItems;
-      }
-    } catch {}
-
-    const allRenamed = [...rootRes.renamedItems, ...subRenamed];
-    const totalScanned = rootRes.scannedCount + subScanned;
+    const allRenamed = cleanRes.renamedItems;
+    const totalScanned = cleanRes.scannedCount;
 
     // 解析剩余空间是否低于阈值
     let isLowSpace = false;
@@ -713,7 +676,7 @@ export class SchedulerService {
     const picked = targetPool[Math.floor(Math.random() * targetPool.length)];
 
     const searchRes = await this.searcher.search({ keyword: picked.title });
-    const items = searchRes.items || [];
+    const items = (searchRes.items || []).filter((i) => this.isStrictTitleMatch(i, picked.title));
     if (items.length > 0) {
       this.sessionManager.setSearch(task.userId, picked.title, items, 8);
     }
@@ -756,7 +719,7 @@ export class SchedulerService {
       }
 
       const res = await this.searcher.search({ keyword: task.keyword });
-      const items = res.items || [];
+      const items = (res.items || []).filter((i) => this.isStrictTitleMatch(i, task.keyword!));
       if (items.length > 0) {
         this.sessionManager.setSearch(task.userId, task.keyword, items, 8);
         const topList = items
@@ -779,9 +742,10 @@ export class SchedulerService {
     if (bookMatch && bookMatch[1]) {
       const movieTitle = bookMatch[1].trim();
       const res = await this.searcher.search({ keyword: movieTitle });
-      if (res.items && res.items.length > 0) {
-        this.sessionManager.setSearch(task.userId, movieTitle, res.items, 8);
-        extraResourceTip = `\n\n🎬 我还顺手帮你搜好了《${movieTitle}》的 ${res.items.length} 条网盘活链，直接回复「1」就能一键转存到网盘看啦！`;
+      const validItems = (res.items || []).filter((i) => this.isStrictTitleMatch(i, movieTitle));
+      if (validItems.length > 0) {
+        this.sessionManager.setSearch(task.userId, movieTitle, validItems, 8);
+        extraResourceTip = `\n\n🎬 我还顺手帮你搜好了《${movieTitle}》的 ${validItems.length} 条网盘活链，直接回复「1」就能一键转存到网盘看啦！`;
       }
     }
 
@@ -792,25 +756,59 @@ export class SchedulerService {
     ].join('\n');
   }
 
-  private async tryAutoSaveByTitle(userId: string, title: string, defaultCategory: ResourceCategory): Promise<string | null> {
-    const searchRes = await this.searcher.search({ keyword: title });
-    if (!searchRes.items || searchRes.items.length === 0) return null;
+  private async trySaveQuarkCandidates(
+    items: CloudResource[],
+    userId: string,
+    defaultCategory: ResourceCategory,
+    standardTitle: string,
+    maxAttempts: number = 3
+  ): Promise<{ success: boolean; targetPath?: string; message?: string; item?: CloudResource; attempt: number }> {
+    const quarkItems = items.filter((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
+    if (quarkItems.length === 0) {
+      return { success: false, attempt: 0 };
+    }
 
-    const bestQuark = searchRes.items.find((i) => i.panType === 'quark' || i.shareUrl.includes('pan.quark.cn'));
-    if (!bestQuark) return null;
-
-    const category = bestQuark.category || CategoryClassifier.classify(bestQuark.title, bestQuark.rawText || '') || defaultCategory;
     const userPlan = this.userManager.getUserPlan(userId);
-    const saveRes = await this.quarkService.saveShareFiles(bestQuark.shareId, '', category, {
-      customCookie: userPlan.quarkCookie,
-      rootDir: userPlan.saveRootDir,
-      standardTitle: title,
-      userId,
-    });
+    const limit = Math.min(maxAttempts, quarkItems.length);
+    let lastMsg = '';
 
-    if (saveRes.success) {
-      this.userManager.recordSave(userId, title, bestQuark.shareUrl, category);
-      return `⚡ 已为你把《${title}》自动转存进夸克网盘：【${saveRes.targetPath}】！`;
+    for (let i = 0; i < limit; i++) {
+      const item = quarkItems[i];
+      const category = item.category || CategoryClassifier.classify(item.title, item.rawText || '') || defaultCategory;
+      const saveRes = await this.quarkService.saveShareFiles(item.shareId, item.passcode || '', category, {
+        customCookie: userPlan.quarkCookie,
+        rootDir: userPlan.saveRootDir,
+        standardTitle,
+        userId,
+      });
+      if (saveRes.success) {
+        this.userManager.recordSave(userId, standardTitle, item.shareUrl, category);
+        return {
+          success: true,
+          targetPath: saveRes.targetPath,
+          message: saveRes.message,
+          item,
+          attempt: i + 1,
+        };
+      }
+      lastMsg = saveRes.message;
+    }
+
+    return { success: false, message: lastMsg, attempt: limit };
+  }
+
+  private async tryAutoSaveByTitle(userId: string, title: string, defaultCategory: ResourceCategory): Promise<string | null> {
+    const userPlan = this.userManager.getUserPlan(userId);
+    const searchRes = await this.searcher.search({
+      keyword: title,
+      quality: userPlan.preferences?.preferredQuality,
+    });
+    const validItems = (searchRes.items || []).filter((i) => this.isStrictTitleMatch(i, title));
+    if (validItems.length === 0) return null;
+
+    const autoRes = await this.trySaveQuarkCandidates(validItems, userId, defaultCategory, title);
+    if (autoRes.success) {
+      return `⚡ 已为你把《${title}》自动转存进夸克网盘：【${autoRes.targetPath}】！`;
     }
     return null;
   }
@@ -1290,7 +1288,11 @@ export class SchedulerService {
       /\d{1,2}\s*[:：]\s*\d{1,2}|(?:\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:半|\s*(?:\d{1,2}|[一二三四五六七八九十]{1,3})\s*分?)?/i.test(
         trimmed
       );
-    if (hasConcreteClock && !/豆瓣\s*\d+\s*点|\d+\s*点\s*\d+\s*分制|几\s*点/.test(trimmed) && hasScheduleVerb) {
+    if (
+      hasConcreteClock &&
+      !/豆瓣\s*\d+\s*点|\d+\s*点\s*\d+\s*分制|几\s*点|八点档|黄金档|午夜档/.test(trimmed) &&
+      /(?:推|发|荐|提醒|叫我|通知|准时|定时)/.test(trimmed)
+    ) {
       return true;
     }
 
@@ -1318,8 +1320,13 @@ export class SchedulerService {
       return true;
     }
 
-    // 扩展D：4K 洗版监控
-    if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|高画质|洗版|原盘|杜比).*?(?:通知|提醒|帮我存|自动存|转存|告诉我|蹲|监控)/i.test(trimmed)) {
+    // 扩展D：4K 洗版监控（要求含明确监控/等待条件，避免把立即搜/存4K资源误判为后台监控）
+    if (
+      /(?:出\s*4[kK]|有\s*4[kK]\s*了|出\s*(?:高画质|原盘|杜比)|洗版).*?(?:通知|提醒|帮我存|自动存|转存|告诉我|蹲|监控)/i.test(
+        trimmed
+      ) ||
+      /(?:蹲守|蹲|监控|等).*?(?:4[kK]|高画质|洗版|原盘|杜比)/i.test(trimmed)
+    ) {
       return true;
     }
 

@@ -73,7 +73,15 @@ export class DeepSeekAgent {
     if (!client.apiKey) return null;
 
     try {
-      const base64Data = `data:image/jpeg;base64,${imageBuffer.toString('base64')}`;
+      let mimeType = 'image/jpeg';
+      if (imageBuffer.length >= 4 && imageBuffer[0] === 0x89 && imageBuffer[1] === 0x50 && imageBuffer[2] === 0x4e && imageBuffer[3] === 0x47) {
+        mimeType = 'image/png';
+      } else if (imageBuffer.length >= 3 && imageBuffer[0] === 0x47 && imageBuffer[1] === 0x49 && imageBuffer[2] === 0x46) {
+        mimeType = 'image/gif';
+      } else if (imageBuffer.length >= 12 && imageBuffer.subarray(0, 4).toString('ascii') === 'RIFF' && imageBuffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+        mimeType = 'image/webp';
+      }
+      const base64Data = `data:${mimeType};base64,${imageBuffer.toString('base64')}`;
 
       const res = await client.chat.completions.create({
         model: this.visionModel,
@@ -168,6 +176,10 @@ export class DeepSeekAgent {
       if (list.length > 12) {
         list = list.slice(-12);
       }
+      if (!this.userHistories.has(userId) && this.userHistories.size >= 300) {
+        const oldestUser = this.userHistories.keys().next().value;
+        if (oldestUser) this.userHistories.delete(oldestUser);
+      }
       this.userHistories.set(userId, list);
     };
 
@@ -178,17 +190,41 @@ export class DeepSeekAgent {
       return reply;
     }
 
+    // 1.5 优先识别「具体剧情细节找特定某部片 / 记不清片名」意图（避免被泛化推荐正则抢占）
+    const isSpecificPlotIdentify =
+      /(?:记不清名字|忘了叫什么|叫什么名字|哪部电影|哪部剧|什么电影|什么电视剧|有一部(?:电影|电视剧|剧|动漫|片)|有个(?:电影|电视剧|剧|片)|讲的是.+|男主.+女主.+|主角.+)/.test(
+        trimmed
+      ) && !/(?:推荐|有哪些|有什么好看|求推荐|安利|类似|同款)/.test(trimmed);
+
+    if (isSpecificPlotIdentify && trimmed.length < 200) {
+      const reply = await this.commandHandler.renderSearch(trimmed, userId);
+      appendUserHistory(trimmed, reply);
+      return reply;
+    }
+
     // 2. 意图快速嗅探：影视推荐与种草对话（支持指定年份、年代、档期、类似剧情、数量、时效、地区、类型及多轮追问等自然语言表达）
+    const isHotFollowUp =
+      this.sessionManager.getLastActiveType(userId) === 'hot' &&
+      trimmed.length <= 18 &&
+      /(?:^(?:不要|别推|不看|换|那|再来|有没?有)|(?:的呢|的吗|呢)$|(?:韩剧|美剧|英剧|日剧|国产剧|电影|悬疑|喜剧|科幻|爱情|古装|恐怖|治愈|高分|今年|去年|最近))/.test(
+        trimmed
+      ) &&
+      !/(?:我想看|帮我搜|搜一下)/.test(trimmed);
+
     const isRecommendIntent =
+      isHotFollowUp ||
       /(?:推荐|有什么好看|有哪些好看|求推荐|安利|介绍几部|介绍一部|推几部|推一部|发几部|换一部.+|换几部.+|有没有类似|类似.+的(?:剧|电影|片|动漫)|像.+?(?:一样|那样|这种|那种).*?(?:的剧|的电影|的片|有哪些|有什么|推荐)|(?:来一部|来部|找一部|找部|看一部|有没有).*?(?:火|好看|新|高分|经典|悬疑|搞笑|喜剧|治愈|甜宠|科幻|动作|犯罪|下饭|恐怖|古装|武侠|奇幻|战争|历史|灾难|家庭|19\d\d|20\d\d|[789012]0年代)|(?:最近|近期|今年|去年|前年|这两个月|近两个月|这阵子|19\d\d年?|20\d\d年?|[789012]0年代|春节档|暑期档|国庆档).*?(?:新出|比較火|比较火|最火|热门|好看|热播|在播|高分|经典|有什么|有哪些).*?(?:电影|剧|动漫|片|综艺|纪录片)?|(?:韩剧|美剧|英剧|日剧|国剧|国产剧|港片|港剧|台剧|泰剧|动漫|电影|电视剧|悬疑片|科幻片|喜剧片|动作片|恐怖片|犯罪片).*?(?:有哪些|有什么|推荐))/i.test(
         trimmed
       );
     if (isRecommendIntent) {
-      let type: 'movie' | 'tv' = 'tv';
-      let tag = '热门';
+      const prevHot = this.sessionManager.getHot(userId);
+      let type: 'movie' | 'tv' = isHotFollowUp && prevHot ? prevHot.type : 'tv';
+      let tag = isHotFollowUp && prevHot?.tag ? prevHot.tag : '热门';
 
       if (/(?:电影|大片|影史|高分片|院线|科幻片|动作片|喜剧片|恐怖片|悬疑片)/i.test(trimmed)) {
         type = 'movie';
+      } else if (/(?:电视剧|剧集|韩剧|美剧|英剧|日剧|国剧|国产剧|港剧|台剧|泰剧|网剧)/i.test(trimmed)) {
+        type = 'tv';
       }
       if (/韩剧|韩国/i.test(trimmed)) tag = '韩剧';
       else if (/美剧|美国/i.test(trimmed)) tag = '美剧';
@@ -439,7 +475,9 @@ export class DeepSeekAgent {
         const args = JSON.parse(toolCall.function.arguments || '{}');
 
         if (toolCall.function.name === 'search_cloud_resources') {
-          return await this.commandHandler.renderSearch(args.keyword, userId);
+          const searchReply = await this.commandHandler.renderSearch(args.keyword, userId);
+          appendUserHistory(trimmed, searchReply);
+          return searchReply;
         } else if (toolCall.function.name === 'transfer_resource') {
           let shareId = args.shareId;
           const match = shareId.match(/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/);

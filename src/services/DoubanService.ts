@@ -58,6 +58,10 @@ export class DoubanService {
         shortComment: sub.short_comment?.content ? String(sub.short_comment.content).trim() : undefined,
       };
 
+      if (this.abstractCache.size >= 500) {
+        const oldestKey = this.abstractCache.keys().next().value;
+        if (oldestKey) this.abstractCache.delete(oldestKey);
+      }
       this.abstractCache.set(subjectId, info);
       return info;
     } catch {

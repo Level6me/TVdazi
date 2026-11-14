@@ -53,7 +53,7 @@ export class AiRecommender {
     this.doubanService = new DoubanService();
     this.globalApiKey = process.env.DEEPSEEK_API_KEY || '';
     this.globalBaseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com';
-    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-flash';
 
     this.globalClient = new OpenAI({
       apiKey: this.globalApiKey || 'dummy_key',
@@ -69,19 +69,27 @@ export class AiRecommender {
     return AiRecommender.instance;
   }
 
-  private getClientForUser(userId?: string): OpenAI {
+  private getClientForUser(userId?: string): { client: OpenAI; model: string; hasValidKey: boolean } {
     if (userId) {
       const plan = this.userManager.getUserPlan(userId);
       const activeKey = plan.deepseekApiKey?.trim() || plan.inheritedApiKey?.trim();
       if (activeKey) {
-        return new OpenAI({
-          apiKey: activeKey,
-          baseURL: this.globalBaseURL,
-          timeout: 12000,
-        });
+        return {
+          client: new OpenAI({
+            apiKey: activeKey,
+            baseURL: this.globalBaseURL,
+            timeout: 12000,
+          }),
+          model: plan.deepseekModel || this.model,
+          hasValidKey: true,
+        };
       }
     }
-    return this.globalClient;
+    return {
+      client: this.globalClient,
+      model: this.model,
+      hasValidKey: Boolean(this.globalApiKey && this.globalApiKey.trim().length > 0),
+    };
   }
 
   private getCurrentYearAndMonth(): { year: number; month: number } {
@@ -381,13 +389,14 @@ export class AiRecommender {
     }
 
     const hotTag = this.resolveDoubanHotTag(slots);
+    const startOffset = Math.max(0, ((page || 1) - 1) * 10);
     const tasks: Array<{ promise: Promise<DoubanSubject[]>; weight: number }> = [];
 
     if (slots.timeScope === 'current_season') {
       // 【这两个月/最近正在热播/最新】：
       // 第一优先级：豆瓣实时热播榜 (search_subjects)，代表当前 1~2 个月内正在热播的剧集/电影
       tasks.push({
-        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 16, 0),
+        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 16, startOffset),
         weight: 2.2,
       });
       // 第二优先级：豆瓣近期热度趋势榜 (sort=U)，严格限定当年 (2026,2026)，绝不混入 2025 旧作
@@ -398,20 +407,21 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${currentYear},${currentYear}`,
+          start: startOffset,
           limit: 16,
         }),
         weight: 1.6,
       });
       if (slots.mediaType === 'movie') {
         tasks.push({
-          promise: this.doubanService.getHotList('movie', '最新', 12, 0),
+          promise: this.doubanService.getHotList('movie', '最新', 12, startOffset),
           weight: 1.5,
         });
       }
     } else if (slots.timeScope === 'this_year') {
       // 【今年/2026年】：限定当年 (2026,2026)，兼顾近期热度 (U) 与年度爆款 (T)
       tasks.push({
-        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 15, 0),
+        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 15, startOffset),
         weight: 1.8,
       });
       tasks.push({
@@ -421,6 +431,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${currentYear},${currentYear}`,
+          start: startOffset,
           limit: 15,
         }),
         weight: 1.6,
@@ -432,6 +443,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${currentYear},${currentYear}`,
+          start: startOffset,
           limit: 15,
         }),
         weight: 1.5,
@@ -445,6 +457,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${lastYear},${lastYear}`,
+          start: startOffset,
           limit: 16,
         }),
         weight: 1.8,
@@ -458,6 +471,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${yStart},${yEnd}`,
+          start: startOffset,
           limit: 18,
         }),
         weight: 2.0,
@@ -469,6 +483,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${yStart},${yEnd}`,
+          start: startOffset,
           limit: 15,
         }),
         weight: 1.6,
@@ -481,6 +496,7 @@ export class AiRecommender {
             countries: slots.country,
             genres: slots.genre,
             yearRange: `${yStart},${yEnd}`,
+            start: startOffset,
             limit: 14,
           }),
           weight: 1.5,
@@ -493,6 +509,7 @@ export class AiRecommender {
           sort: 'S',
           countries: slots.country,
           genres: slots.genre,
+          start: startOffset,
           limit: 20,
         }),
         weight: 1.8,
@@ -503,6 +520,7 @@ export class AiRecommender {
           sort: 'T',
           countries: slots.country,
           genres: slots.genre,
+          start: startOffset,
           limit: 15,
         }),
         weight: 1.4,
@@ -510,7 +528,7 @@ export class AiRecommender {
     } else {
       // 默认 mixed：优先当前热播 + 当年佳作 + 近年口碑爆款
       tasks.push({
-        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 14, 0),
+        promise: this.doubanService.getHotList(slots.mediaType, hotTag, 14, startOffset),
         weight: 1.8,
       });
       tasks.push({
@@ -520,6 +538,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${currentYear},${currentYear}`,
+          start: startOffset,
           limit: 14,
         }),
         weight: 1.5,
@@ -531,6 +550,7 @@ export class AiRecommender {
           countries: slots.country,
           genres: slots.genre,
           yearRange: `${currentYear - 1},${currentYear}`,
+          start: startOffset,
           limit: 12,
         }),
         weight: 1.1,
@@ -538,35 +558,44 @@ export class AiRecommender {
     }
 
     const settled = await Promise.allSettled(tasks.map((t) => t.promise));
-    const mergedMap = new Map<string, { subject: DoubanSubject; score: number }>();
+    const collectCandidates = (ignoreHistory: boolean) => {
+      const map = new Map<string, { subject: DoubanSubject; score: number }>();
+      settled.forEach((res, idx) => {
+        const weight = tasks[idx].weight;
+        if (res.status === 'fulfilled' && Array.isArray(res.value)) {
+          res.value.forEach((item, rankIdx) => {
+            const cleanTitle = (item.title || '').trim();
+            if (!cleanTitle || (!ignoreHistory && excludeSet.has(cleanTitle))) return;
 
-    settled.forEach((res, idx) => {
-      const weight = tasks[idx].weight;
-      if (res.status === 'fulfilled' && Array.isArray(res.value)) {
-        res.value.forEach((item, rankIdx) => {
-          const cleanTitle = (item.title || '').trim();
-          if (!cleanTitle || excludeSet.has(cleanTitle)) return;
+            const rateNum = parseFloat(item.rate) || 0;
+            if (rateNum > 0 && rateNum < 6.2) return;
 
-          const rateNum = parseFloat(item.rate) || 0;
-          // 剔除已出分且评分过低的烂片
-          if (rateNum > 0 && rateNum < 6.2) return;
+            const rankScore = Math.max(0, 20 - rankIdx) * weight;
+            const ratingBonus = rateNum >= 7.0 ? rateNum * 2.8 : rateNum > 0 ? rateNum * 1.8 : 16;
+            const totalScore = rankScore + ratingBonus;
 
-          const rankScore = Math.max(0, 20 - rankIdx) * weight;
-          // 已出高分的当季剧集给予适当口碑加成，未出分的刚开播新剧给予基础热度分
-          const ratingBonus = rateNum >= 7.0 ? rateNum * 2.8 : rateNum > 0 ? rateNum * 1.8 : 16;
-          const totalScore = rankScore + ratingBonus;
+            if (map.has(cleanTitle)) {
+              const existing = map.get(cleanTitle)!;
+              existing.score += 14;
+              if (!existing.subject.actors && item.actors) existing.subject.actors = item.actors;
+              if (!existing.subject.id && item.id) existing.subject.id = item.id;
+            } else {
+              map.set(cleanTitle, { subject: { ...item }, score: totalScore });
+            }
+          });
+        }
+      });
+      return map;
+    };
 
-          if (mergedMap.has(cleanTitle)) {
-            const existing = mergedMap.get(cleanTitle)!;
-            existing.score += 14; // 多路同时命中的当季爆款大幅加权
-            if (!existing.subject.actors && item.actors) existing.subject.actors = item.actors;
-            if (!existing.subject.id && item.id) existing.subject.id = item.id;
-          } else {
-            mergedMap.set(cleanTitle, { subject: { ...item }, score: totalScore });
-          }
-        });
+    let mergedMap = collectCandidates(false);
+    // 若用户多次点击“换一批”导致当前页候选均已在历史已推集合中，自动重置该用户的历史去重池并重新选取
+    if (mergedMap.size < slots.count) {
+      if (userId) {
+        this.recommendedHistory.get(userId)?.clear();
       }
-    });
+      mergedMap = collectCandidates(true);
+    }
 
     const initialRanked = Array.from(mergedMap.values()).sort((a, b) => b.score - a.score);
     const topPool = initialRanked.slice(0, 14);
@@ -675,7 +704,7 @@ export class AiRecommender {
     const { query, type = 'tv', tag = '热门', page = 1, userId, chatHistory = [] } = options;
     const { year: currentYear, month: currentMonth } = this.getCurrentYearAndMonth();
     const slots = this.parseIntentSlots(query || '', type, tag, userId);
-    const client = this.getClientForUser(userId);
+    const { client, model: activeModel, hasValidKey } = this.getClientForUser(userId);
 
     // 实时召回并经豆瓣 subject_abstract 核验的候选池
     const candidates = await this.recallAndRankCandidates(slots, userId, page);
@@ -774,8 +803,12 @@ ${candidateContext}
   "recommendedTitles": ["按你在正文中推荐顺序排列的标准中文片名（不带书名号，严格 ${slots.count} 个）"]
 }`;
 
+      if (!hasValidKey) {
+        return this.buildFallbackFromCandidates(topCandidates, slots, page, userId);
+      }
+
       const res = await client.chat.completions.create({
-        model: this.model,
+        model: activeModel,
         messages: [{ role: 'user', content: prompt }],
         response_format: { type: 'json_object' },
         temperature: 0.4,
@@ -852,9 +885,32 @@ ${candidateContext}
     userId?: string
   ): RecommendResult {
     const { year: currentYear } = this.getCurrentYearAndMonth();
-    const picked = (
-      candidates.length > 0
-        ? candidates
+    const defaultFallbacks: DoubanSubject[] =
+      slots.mediaType === 'movie'
+        ? [
+            {
+              id: '3541415',
+              title: '盗梦空间',
+              rate: '9.4',
+              year: '2010',
+              cover: '',
+              url: '',
+              actors: '莱昂纳多·迪卡普里奥 / 约瑟夫·高登-莱维特',
+              types: ['剧情', '科幻', '悬疑', '冒险'],
+              shortComment: '诺兰封神之作，多重梦境结构与视觉想象力叹为观止。',
+            },
+            {
+              id: '1889243',
+              title: '星际穿越',
+              rate: '9.4',
+              year: '2014',
+              cover: '',
+              url: '',
+              actors: '马修·麦康纳 / 安妮·海瑟薇',
+              types: ['剧情', '科幻', '冒险'],
+              shortComment: '爱是唯一能够超越时间与空间维度的力量。',
+            },
+          ]
         : [
             {
               id: '36675942',
@@ -867,8 +923,8 @@ ${candidateContext}
               types: ['剧情'],
               shortComment: '有笑有泪有吵有闹，但又不失烟火气的鲜活群像故事。',
             },
-          ]
-    ).slice(0, slots.count);
+          ];
+    const picked = (candidates.length > 0 ? candidates : defaultFallbacks).slice(0, slots.count);
 
     this.recordRecommended(
       userId,

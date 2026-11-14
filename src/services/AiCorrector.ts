@@ -167,7 +167,7 @@ export class AiCorrector {
   private constructor() {
     this.globalApiKey = process.env.DEEPSEEK_API_KEY || '';
     this.globalBaseURL = process.env.DEEPSEEK_BASE_URL || 'https://api.deepseek.com/v1';
-    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-chat';
+    this.model = process.env.DEEPSEEK_MODEL || 'deepseek-flash';
     this.globalClient = new OpenAI({
       apiKey: this.globalApiKey,
       baseURL: this.globalBaseURL,
@@ -329,6 +329,10 @@ export class AiCorrector {
         explanation: parsed.explanation,
       };
 
+      if (this.cache.size >= 500) {
+        const oldestKey = this.cache.keys().next().value;
+        if (oldestKey) this.cache.delete(oldestKey);
+      }
       this.cache.set(cacheKey, { result, timestamp: Date.now() });
       return result;
     } catch (err: any) {

@@ -40,10 +40,11 @@ export class ResourceSearcher {
    * 计算匹配相关度得分：
    * 标题完全包含关键词 > 帖子正文包含关键词 > 模糊匹配
    */
-  private calculateScore(item: CloudResource, keyword: string): number {
+  private calculateScore(item: CloudResource, keyword: string, preferredQuality?: string): number {
     const kw = keyword.toLowerCase().trim();
     const title = (item.title || '').toLowerCase();
     const raw = (item.rawText || '').toLowerCase();
+    const full = `${title} ${raw}`;
 
     let score = 0;
 
@@ -66,12 +67,65 @@ export class ResourceSearcher {
       score += 50;
     }
 
-    // 4. 画质标签加分
-    if (title.includes('4k') || raw.includes('4k')) score += 20;
-    if (title.includes('remux') || raw.includes('remux')) score += 15;
+    // 4. 画质标签加分与用户专属画质偏好加权
+    if (title.includes('4k') || raw.includes('4k') || full.includes('2160p')) score += 20;
+    if (title.includes('remux') || raw.includes('remux') || full.includes('原盘') || full.includes('蓝光')) score += 15;
     if (title.includes('1080p') || raw.includes('1080p')) score += 10;
 
+    const pref = (preferredQuality || '').toUpperCase();
+    if (pref === '4K' && /(?:4k|2160p|uhd|杜比|dolby|hdr)/i.test(full)) {
+      score += 80;
+    } else if (pref === '原盘' && /(?:remux|原盘|bluray|蓝光|iso)/i.test(full)) {
+      score += 80;
+    } else if (pref === '1080P' && /(?:1080p|1080i|高码)/i.test(full)) {
+      score += 80;
+    }
+
     return score;
+  }
+
+  /**
+   * 归一化文本用于相关性校验（去除书名号、标点符号与空白）
+   */
+  private normalizeForMatch(str: string): string {
+    return (str || '')
+      .toLowerCase()
+      .replace(/[《》〈〉「」『』【】\[\]()（）:：·.,，。！!？?、\s\-_\/\\]/g, '');
+  }
+
+  /**
+   * 判断检索到的网盘资源是否与搜索词真实相关（拒绝完全无关的频道最新消息充数）
+   */
+  private isRelevantItem(item: CloudResource, keyword: string): boolean {
+    const kwNorm = this.normalizeForMatch(keyword);
+    if (!kwNorm) return true;
+
+    const hayRaw = `${item.title || ''} ${item.rawText || ''}`.toLowerCase();
+    const hayNorm = this.normalizeForMatch(hayRaw);
+
+    if (hayNorm.includes(kwNorm)) {
+      return true;
+    }
+
+    // 支持空格分词的多关键词组合（如 "周星驰 功夫"、"沙丘 4K"）
+    const tokens = keyword
+      .toLowerCase()
+      .split(/\s+/)
+      .map((t) => this.normalizeForMatch(t))
+      .filter(Boolean);
+    if (tokens.length > 1 && tokens.every((t) => hayNorm.includes(t))) {
+      return true;
+    }
+
+    // 若关键词带有季数/画质后缀（如 "庆余年第二季"、"流浪地球2 4K"），剥离后缀检查核心主片名
+    const coreKw = kwNorm
+      .replace(/(?:第[一二三四五六七八九十\d]+[季部]|season\d+|s\d+|4k|2160p|1080p|国语|中字|完结|全集|电影|电视剧|网剧|动漫)+$/g, '')
+      .trim();
+    if (coreKw.length >= 2 && hayNorm.includes(coreKw)) {
+      return true;
+    }
+
+    return false;
   }
 
   /**
@@ -80,11 +134,14 @@ export class ResourceSearcher {
   async search(options: SearchOptions): Promise<SearchResult> {
     const startTime = Date.now();
     const keyword = options.keyword.trim();
+    if (!keyword) {
+      return { keyword: '', items: [], totalFound: 0, durationMs: 0 };
+    }
     const results: CloudResource[] = [];
     const seenUrls = new Set<string>();
     const channels = this.getActiveChannels();
 
-    const searchPromises = channels.map(async (channel) => {
+    const fetchChannel = async (channel: string) => {
       try {
         const url = `https://t.me/s/${channel}?q=${encodeURIComponent(keyword)}`;
         const response = await axios.get(url, {
@@ -97,25 +154,44 @@ export class ResourceSearcher {
 
         const $ = cheerio.load(response.data);
         $('.tgme_widget_message_wrap').each((_, elem) => {
-          const text = $(elem).find('.tgme_widget_message_text').text();
-          if (!text) return;
+          const msgElem = $(elem).find('.tgme_widget_message_text');
+          if (!msgElem.length) return;
 
-          // 提取各种网盘链接
-          const quarkMatch = text.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)/);
-          const aliyunMatch = text.match(/https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/);
-          const ucMatch = text.match(/https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/);
-          const pan115Match = text.match(/https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/);
-          const pan123Match = text.match(/https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/);
-          const tianyiMatch = text.match(/https?:\/\/cloud\.189\.cn\/[^\s<>"]+/);
-          const baiduMatch = text.match(/https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/);
+          // 将 <br> 替换为换行符，防止 Cheerio .text() 抹除换行导致片名与简介粘连成一行
+          msgElem.find('br').replaceWith('\n');
+
+          // 提取 <a href="..."> 中的隐藏网盘超链接
+          const hrefLinks: string[] = [];
+          msgElem.find('a').each((__, aElem) => {
+            const href = $(aElem).attr('href');
+            if (href && /^https?:\/\//i.test(href)) {
+              hrefLinks.push(href);
+            }
+          });
+
+          const rawTextContent = msgElem.text().trim();
+          const combinedText = hrefLinks.length > 0 ? `${rawTextContent}\n${hrefLinks.join('\n')}` : rawTextContent;
+          if (!combinedText) return;
+
+          // 提取各种网盘链接（优先提取夸克网盘链接及可能附带的提取码）
+          const quarkMatch = combinedText.match(/https?:\/\/pan\.quark\.cn\/s\/([a-zA-Z0-9]+)(?:\?(?:[^#\s"']*?\b)?pwd=([a-zA-Z0-9]{4}))?/i);
+          const aliyunMatch = combinedText.match(/https?:\/\/(?:\w+\.)?(?:alipan|aliyundrive)\.com\/s\/([a-zA-Z0-9]+)/);
+          const ucMatch = combinedText.match(/https?:\/\/drive\.uc\.cn\/s\/([a-zA-Z0-9]+)/);
+          const pan115Match = combinedText.match(/https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/);
+          const pan123Match = combinedText.match(/https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/);
+          const tianyiMatch = combinedText.match(/https?:\/\/cloud\.189\.cn\/[^\s<>"]+/);
+          const baiduMatch = combinedText.match(/https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/);
 
           let shareUrl = '';
           let shareId = '';
+          let passcode = '';
           let panType: CloudResource['panType'] = 'other';
 
           if (quarkMatch) {
-            shareUrl = quarkMatch[0];
             shareId = quarkMatch[1];
+            shareUrl = `https://pan.quark.cn/s/${shareId}`;
+            const textPassMatch = combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
+            passcode = quarkMatch[2] || (textPassMatch ? textPassMatch[1] : '');
             panType = 'quark';
           } else if (aliyunMatch) {
             shareUrl = aliyunMatch[0];
@@ -128,7 +204,7 @@ export class ResourceSearcher {
           } else if (pan115Match) {
             shareUrl = pan115Match[0];
             shareId = pan115Match[1];
-            panType = 'other';
+            panType = '115';
           } else if (pan123Match) {
             shareUrl = pan123Match[0];
             shareId = pan123Match[1];
@@ -143,50 +219,51 @@ export class ResourceSearcher {
 
           if (shareUrl && !seenUrls.has(shareUrl)) {
             let extractedTitle = keyword;
-            const nameMatch = text.match(/名称[：:]\s*([^\n\r]+)/);
+            const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
             if (nameMatch && nameMatch[1]) {
               extractedTitle = nameMatch[1].trim();
             } else {
-              const lines = text.split('\n').map((l) => l.trim()).filter(Boolean);
-              extractedTitle = lines[0] ? lines[0].replace(/^(名称|片名|标题)[：:]\s*/, '').trim() : keyword;
+              const lines = rawTextContent
+                .split(/\r?\n/)
+                .map((l) => l.trim())
+                .filter((l) => l && !/^https?:\/\//i.test(l));
+              extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
             }
 
             const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
             seenUrls.add(shareUrl);
-            const category = CategoryClassifier.classify(cleanTitle || keyword, text);
+            const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
 
             results.push({
               title: cleanTitle || keyword,
               shareUrl,
               shareId,
+              passcode: passcode || undefined,
               panType,
               category,
-              rawText: text.slice(0, 400),
+              rawText: rawTextContent.slice(0, 400),
               sourceChannel: channel,
             });
           }
         });
-      } catch (err) {
+      } catch {
         // 静默异常
       }
-    });
+    };
 
-    await Promise.allSettled(searchPromises);
+    // 分批并发控制（每批 12 个频道），防止瞬时 50 并发触发连接池耗尽或 429 限流
+    const CONCURRENCY = 12;
+    for (let i = 0; i < channels.length; i += CONCURRENCY) {
+      const batch = channels.slice(i, i + CONCURRENCY);
+      await Promise.allSettled(batch.map((ch) => fetchChannel(ch)));
+    }
 
-    // 关键优化：按相关度精确打分并降序排列！优先过滤标题或正文完全不含关键词的无关干扰项
-    const kwLower = keyword.toLowerCase();
-    const relevantItems = results.filter((item) => {
-      const inTitle = item.title.toLowerCase().includes(kwLower);
-      const inRaw = (item.rawText || '').toLowerCase().includes(kwLower);
-      return inTitle || inRaw;
-    });
-
-    // 若有高相关度结果，则只使用高相关度项；若都没有才降级返回全部
-    const pool = relevantItems.length > 0 ? relevantItems : results;
+    // 严格过滤掉与搜索词完全无关的频道干扰项（绝不把无关结果降级充数返回）
+    const pool = results.filter((item) => this.isRelevantItem(item, keyword));
 
     pool.sort((a, b) => {
-      const scoreA = this.calculateScore(a, keyword);
-      const scoreB = this.calculateScore(b, keyword);
+      const scoreA = this.calculateScore(a, keyword, options.quality);
+      const scoreB = this.calculateScore(b, keyword, options.quality);
       return scoreB - scoreA;
     });
 
