@@ -7,7 +7,7 @@ import { exec } from 'child_process';
 import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 
 import { downloadAndDecryptWechatImage } from './CdnDecrypt';
-import { uploadImageToWechatCdn } from './CdnUpload';
+import { encodeWechatMediaAesKey, uploadImageToWechatCdn } from './CdnUpload';
 import { SchedulerService } from '../services/SchedulerService';
 import { DashboardServer } from '../web/DashboardServer';
 import { PushGateway } from '../services/PushGateway';
@@ -583,7 +583,7 @@ export class WeixinBot {
                 image_item: {
                   media: {
                     encrypt_query_param: uploadRes.downloadEncryptedQueryParam,
-                    aes_key: Buffer.from(uploadRes.aeskey).toString('base64'),
+                    aes_key: encodeWechatMediaAesKey(uploadRes.aeskey),
                     encrypt_type: 1,
                   },
                   mid_size: uploadRes.ciphertextSize,

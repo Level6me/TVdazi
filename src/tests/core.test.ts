@@ -5,7 +5,12 @@ import http from 'http';
 import * as os from 'os';
 import * as path from 'path';
 import * as vm from 'vm';
+import * as crypto from 'crypto';
 import axios from 'axios';
+import QRCode from 'qrcode';
+
+import { encodeWechatMediaAesKey } from '../wechat/CdnUpload';
+import { WeixinBot } from '../wechat/WeixinBot';
 
 import { maskSensitive } from '../utils/Logger';
 import { LruCache } from '../utils/LruCache';
@@ -910,5 +915,73 @@ test('Watchlist full lifecycle: episode tracking, cloud save sync, profile-weigh
       } catch {}
     }, 60);
     server.close();
+  }
+});
+
+test('微信图片 AES 密钥编码与 QRCode PNG 加解密闭环', async () => {
+  const aeskey = crypto.randomBytes(16);
+  const pngBuf = await QRCode.toBuffer('https://weixin.qq.com/x/test-invite', { width: 360, margin: 2 });
+  assert.equal(pngBuf.subarray(0, 8).toString('hex'), '89504e470d0a1a0a');
+
+  const cipher = crypto.createCipheriv('aes-128-ecb', aeskey, null);
+  const ciphertext = Buffer.concat([cipher.update(pngBuf), cipher.final()]);
+
+  // 微信客户端解码链路: base64_decode -> 32位 ASCII hex -> fromhex() -> 16字节密钥
+  const encodedAesKey = encodeWechatMediaAesKey(aeskey);
+  assert.equal(encodedAesKey.length, 44);
+  const asciiHex = Buffer.from(encodedAesKey, 'base64').toString('ascii');
+  assert.match(asciiHex, /^[0-9a-f]{32}$/);
+  assert.equal(asciiHex, aeskey.toString('hex'));
+
+  const decodedKey = Buffer.from(asciiHex, 'hex');
+  const decipher = crypto.createDecipheriv('aes-128-ecb', decodedKey, null);
+  const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+  assert.equal(decrypted.equals(pngBuf), true);
+});
+
+test('好友邀请提示与二维码生成文案具备自然真人感', async () => {
+  const testUser = `__test_invite_${Date.now()}__`;
+  const handler = new CommandHandler();
+  const origAxiosPost = axios.post;
+  const origGetInstance = WeixinBot.getInstance;
+  let capturedImagePath = '';
+
+  try {
+    const askReply = await handler.handle('我想把你推荐给别人', testUser);
+    assert.ok(askReply.includes('共享'));
+    assert.ok(askReply.includes('独立'));
+    assert.equal(askReply.includes('----'), false);
+    assert.equal(askReply.includes('API Key'), false);
+
+    (axios as any).post = async () => ({
+      data: {
+        qrcode: 'qr_mock_token_123',
+        qrcode_img_content: 'https://weixin.qq.com/x/mock-qr-123',
+      },
+    });
+    (WeixinBot as any).getInstance = () => ({
+      getAllBotTokens: () => [],
+      waitForLogin: async () => null,
+      sendImageMessage: async (_to: string, imgPath: string) => {
+        capturedImagePath = imgPath;
+        return fs.existsSync(imgPath) && fs.readFileSync(imgPath).subarray(0, 4).toString('hex') === '89504e47';
+      },
+    });
+
+    const qrReply = await handler.handle('共享', testUser);
+    assert.ok(capturedImagePath.endsWith('.png'));
+    assert.ok(qrReply.includes('5 分钟内'));
+    assert.ok(qrReply.includes('https://weixin.qq.com/x/mock-qr-123'));
+    assert.equal(qrReply.includes('----'), false);
+    assert.equal(qrReply.includes('📌'), false);
+  } finally {
+    (axios as any).post = origAxiosPost;
+    (WeixinBot as any).getInstance = origGetInstance;
+    const f = path.resolve(process.cwd(), 'data/users', `${Buffer.from(testUser).toString('hex')}.json`);
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {}
+    }, 60);
   }
 });

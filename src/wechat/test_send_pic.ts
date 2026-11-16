@@ -5,7 +5,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import axios from 'axios';
 import * as crypto from 'crypto';
-import { uploadImageToWechatCdn } from './CdnUpload';
+import { encodeWechatMediaAesKey, uploadImageToWechatCdn } from './CdnUpload';
 
 const DATA_DIR = path.resolve(__dirname, '../../data');
 const AUTH_FILE = path.resolve(DATA_DIR, 'weixin_auth.json');
@@ -81,7 +81,7 @@ async function run() {
             image_item: {
               media: {
                 encrypt_query_param: uploadResult.downloadEncryptedQueryParam,
-                aes_key: uploadResult.aeskey.toString('base64'),
+                aes_key: encodeWechatMediaAesKey(uploadResult.aeskey),
                 encrypt_type: 1,
               },
               mid_size: uploadResult.ciphertextSize,

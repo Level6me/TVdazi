@@ -14,6 +14,7 @@ import { WebhookService } from '../services/WebhookService';
 import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
 import { WatchlistService } from '../services/WatchlistService';
+import { pickVariant } from '../utils/HumanTone';
 import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
@@ -161,7 +162,14 @@ export class CommandHandler {
         return await this.generateFriendInviteQr(userId, false);
       } else if (['取消', '算了', 'exit', 'quit'].includes(lower)) {
         this.userManager.clearPendingSharePrompt(userId);
-        return '好嘞，已经取消生成二维码啦！有需要随时再跟我说~';
+        return pickVariant(
+          [
+            '行，那先不生成啦，啥时候想拉朋友一起用直接叫我~',
+            '好嘞先收起来了，回头想推荐给朋友了再喊我一声就行。',
+            '没问题，先取消啦，有需要随时说~',
+          ],
+          `invite_cancel:${userId}`
+        );
       }
     }
 
@@ -205,20 +213,18 @@ export class CommandHandler {
     if (this.isFriendInviteIntent(trimmed)) {
       this.userManager.setPendingSharePrompt(userId);
       const userPlan = this.userManager.getUserPlan(userId);
-      const currentKeyType = userPlan.deepseekApiKey ? '你的个人独立 API Key' : '系统默认共享 Key';
+      const quotaNote = userPlan.deepseekApiKey
+        ? '你现在用的是自己的额度'
+        : '现在走的是公共额度';
 
-      return [
-        '好呀！把我也介绍给你的朋友认识吧 😊',
-        '----------------------------------------',
-        `在为你生成专属邀请二维码前，先问你一个小问题：`,
-        `❓ 是否愿意让好友与你【共用当前的 AI 额度】呢？（当前使用的是：${currentKeyType}）`,
-        '',
-        '👉 你可以直接回复：',
-        '• 回复「共享」或「1」：好友扫码后，能直接和你一起使用 AI 找片，不用额外配置。',
-        '• 回复「独立」或「2」：好友扫码后自己配自己的 Key，各用各的。',
-        '----------------------------------------',
-        '💬 回复「共享」或「独立」就可以啦！',
-      ].join('\n');
+      return pickVariant(
+        [
+          `好呀，随时欢迎拉朋友一起来玩！不过生成二维码前先问你一嘴，${quotaNote}，你是想回个「共享」让朋友直接蹭你的额度一起找片，还是回「独立」让他扫码后各用各的？`,
+          `妥妥的，这就准备给你出二维码~ 先确认个小事：${quotaNote}，好友扫码后你想直接「共享」额度带他一起用，还是「独立」开他自己的号各用各的？直接回我“共享”或“独立”就行。`,
+          `行啊，帮我安利给朋友太感谢了哈哈！先跟你说下，${quotaNote}，回「共享」的话朋友扫码就能直接用不用折腾，回「独立」就是各算各的额度。你选哪种呀？`,
+        ],
+        `invite_ask:${userId}`
+      );
     }
 
     // 4.5 定时任务、全网蹲守、连载追更与智能监控指令处理
@@ -524,23 +530,26 @@ export class CommandHandler {
         }
       } catch {}
 
-      const modeTip = shareApiKey
-        ? '✅ 已开启共享（朋友扫码绑定后，将共享你的 AI 额度）'
-        : '🔒 独立模式（朋友扫码绑定后使用其自己的独立额度）';
+      const shareText = shareApiKey ? '扫码后直接共享你的额度' : '扫码后各自独立使用额度';
 
-      return [
-        '🎉 好友邀请授权已准备好啦！',
-        '----------------------------------------',
-        `📌 当前设定：${modeTip}`,
-        '',
-        sentQrImage
-          ? '📸 上方已为你生成专属微信授权二维码图片，直接长按转发给好友扫码即可绑定！'
-          : '👉 请把下面这个官方授权链接转发给好友，打开并微信扫码即可绑定：',
-        sentQrImage ? `🔗 备用链接：${qrcodeUrl}` : qrcodeUrl,
-        '',
-        '💡 说明：该授权码用于好友绑定独立的微信助手通道并继承额度设置；仅转发名片无法触发额度继承。',
-        '⏱️ 该授权码 5 分钟内有效。',
-      ].join('\n');
+      if (sentQrImage) {
+        return pickVariant(
+          [
+            `二维码刚发到上面啦，5 分钟内有效，你直接长按转给朋友扫一扫就行（${shareText}）。要是图片那边打不开，也可以点这个备用链接：${qrcodeUrl}`,
+            `搞定啦，专属二维码在上面那张图里，5 分钟内让朋友长按扫一下就能用上啦（${shareText}）。万一图片糊了打不开，补一个链接放这儿：${qrcodeUrl}`,
+            `上面那张二维码就是给你朋友准备的，5 分钟内有效，直接转发过去让他扫码绑定就行（${shareText}）。备用链接也留这儿以防万一：${qrcodeUrl}`,
+          ],
+          `invite_done_img:${inviterUserId}`
+        );
+      }
+
+      return pickVariant(
+        [
+          `二维码刚才没发出去，你直接把这个链接转给朋友，5 分钟内点开微信扫一下就能绑定啦（${shareText}）：\n${qrcodeUrl}`,
+          `图片这边稍微卡了下，麻烦直接把下面这个链接甩给朋友吧，5 分钟内扫码就能连上（${shareText}）：\n${qrcodeUrl}`,
+        ],
+        `invite_done_url:${inviterUserId}`
+      );
     } catch (err: any) {
       return `哎呀，向微信服务器申请邀请二维码时走神了：${err.message || '网络超时'}，请稍后再试一次哦！`;
     }

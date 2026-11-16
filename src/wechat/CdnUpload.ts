@@ -70,7 +70,7 @@ export async function uploadImageToWechatCdn(
 
     let cdnUrl = uploadFullUrl;
     if (!cdnUrl && uploadParam) {
-      cdnUrl = `${baseUrl}/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
+      cdnUrl = `https://novac2c.cdn.weixin.qq.com/c2c/upload?encrypted_query_param=${encodeURIComponent(uploadParam)}&filekey=${encodeURIComponent(filekey)}`;
     }
 
     if (!cdnUrl) {
@@ -104,4 +104,12 @@ export async function uploadImageToWechatCdn(
     console.error('[CdnUpload] 上传图片到微信 CDN 失败:', err.response?.data || err.message);
     return null;
   }
+}
+
+/**
+ * 将 16 字节原始 AES 密钥编码为微信 iLink 协议要求的 aes_key 字段：
+ * 先转为 32 位小写十六进制 ASCII 字符串，再做 Base64（共 44 字符）。
+ */
+export function encodeWechatMediaAesKey(aeskey: Buffer): string {
+  return Buffer.from(aeskey.toString('hex'), 'ascii').toString('base64');
 }
