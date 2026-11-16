@@ -4,6 +4,8 @@ import * as fs from 'fs';
 import http from 'http';
 import * as os from 'os';
 import * as path from 'path';
+import * as vm from 'vm';
+import axios from 'axios';
 
 import { maskSensitive } from '../utils/Logger';
 import { LruCache } from '../utils/LruCache';
@@ -498,5 +500,134 @@ test('UserProfileService builds explicit & time-decayed implicit taste profile a
         if (fs.existsSync(f)) fs.unlinkSync(f);
       } catch {}
     }, 60);
+  }
+});
+
+test('DashboardServer supports panel watch creation, safe task deletion, live channel probing, and safe JS', async () => {
+  const testUser = '__panel_watch_probe_test__';
+  const token = DashboardServer.issueUserToken(testUser);
+
+  const server = http.createServer((req, res) => {
+    DashboardServer.handleHttpRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  const healthFile = path.resolve(process.cwd(), 'data/channel_health.json');
+  const hadHealthFile = fs.existsSync(healthFile);
+  const origAxiosGet = axios.get;
+  (axios as any).get = async () => ({
+    status: 200,
+    data: '<div class="tgme_widget_message_wrap"><a href="https://pan.quark.cn/s/abc123">quark</a></div>',
+  });
+
+  try {
+    // 1. 确认 H5 控制台内联 JS 语法正确、无可选链、且未将字符串传给 showToast 的 duration 参数
+    const htmlRes = await fetch(`${baseUrl}/panel?token=${encodeURIComponent(token)}`);
+    assert.equal(htmlRes.status, 200);
+    const html = await htmlRes.text();
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    assert.equal(scripts.length, 2);
+    scripts.forEach((scriptBody, idx) => {
+      assert.doesNotThrow(() => new vm.Script(scriptBody, { filename: `panel_script_${idx}.js` }));
+    });
+    const pageScript = scripts[1];
+    assert.ok(pageScript.includes('function refreshPanel'));
+    assert.ok(pageScript.includes('function createWatch'));
+    assert.ok(pageScript.includes('function probeChannelsNow'));
+    assert.equal(/\?\./.test(pageScript), false);
+    assert.equal(/showToast\([^)]*["'](?:success|error|warning|info)["']\)/.test(pageScript), false);
+    // 2. 创建电影/影视追更任务
+    const createRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'create_watch',
+        title: '测试电影追更作品',
+        mode: 'resource_watch',
+        intervalMinutes: 15,
+        autoSave: false,
+        runInitialCheck: false,
+      }),
+    });
+    assert.equal(createRes.status, 200);
+    const createJson: any = await createRes.json();
+    assert.equal(createJson.ok, true);
+    assert.ok(createJson.task?.id);
+    assert.equal(createJson.task.keyword, '测试电影追更作品');
+    assert.ok(createJson.watchlist.some((w: any) => w.title === '测试电影追更作品'));
+
+    const taskId = createJson.task.id;
+
+    // 3. 切换暂停 & 正常删除 & 重复/空 taskId 安全返回
+    const togRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'toggle', taskId }),
+    });
+    assert.equal(togRes.status, 200);
+    const togJson: any = await togRes.json();
+    assert.equal(togJson.ok, true);
+    assert.equal(togJson.task.enabled, false);
+
+    const delRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', taskId }),
+    });
+    assert.equal(delRes.status, 200);
+    const delJson: any = await delRes.json();
+    assert.equal(delJson.ok, true);
+
+    const dupDelRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', taskId }),
+    });
+    assert.equal(dupDelRes.status, 200);
+    const dupDelJson: any = await dupDelRes.json();
+    assert.equal(dupDelJson.ok, false);
+
+    const emptyDelRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', taskId: '' }),
+    });
+    assert.equal(emptyDelRes.status, 400);
+
+    // 4. 频道健康度实时测速刷新接口
+    const probeRes = await fetch(`${baseUrl}/api/panel/channels/probe?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    assert.equal(probeRes.status, 200);
+    const probeJson: any = await probeRes.json();
+    assert.equal(probeJson.ok, true);
+    assert.ok(Array.isArray(probeJson.channels.topChannels));
+    assert.ok(probeJson.channels.topChannels.length > 0);
+    assert.ok(probeJson.channels.topChannels[0].avgLatencyMs > 0);
+    assert.ok(probeJson.channels.topChannels[0].score > 75);
+  } finally {
+    (axios as any).get = origAxiosGet;
+    if (!hadHealthFile && fs.existsSync(healthFile)) {
+      try {
+        fs.unlinkSync(healthFile);
+      } catch {}
+    }
+    const f = path.resolve(process.cwd(), 'data/users', `${Buffer.from(testUser).toString('hex')}.json`);
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {}
+    }, 60);
+    server.close();
   }
 });

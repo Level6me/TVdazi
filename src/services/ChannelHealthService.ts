@@ -1,5 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
+import axios from 'axios';
 import { SerializedJsonStore } from '../utils/StorageQueue';
 
 export interface ChannelHealthRecord {
@@ -26,6 +27,7 @@ export class ChannelHealthService {
   private readonly failThreshold = 3;
   private readonly circuitCooldownMs = 5 * 60 * 1000;
   private saveTimer: NodeJS.Timeout | null = null;
+  private activeProbePromise: Promise<Array<ChannelHealthRecord & { score: number; circuitOpen: boolean }>> | null = null;
 
   private constructor(storePath?: string) {
     this.storePath = storePath || path.resolve(process.cwd(), 'data/channel_health.json');
@@ -182,5 +184,80 @@ export class ChannelHealthService {
   resetChannel(channelId: string): void {
     this.records.delete(channelId);
     this.schedulePersist();
+  }
+
+  private persistNow(): void {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
+    try {
+      SerializedJsonStore.writeSync(this.storePath, Array.from(this.records.values()));
+    } catch {
+      this.schedulePersist();
+    }
+  }
+
+  /**
+   * 并发探测 Telegram 频道真实可达性与响应延迟，并持久化健康度评分
+   */
+  async probeChannels(
+    channelIds: string[],
+    concurrency: number = 12,
+    timeoutMs: number = 3500
+  ): Promise<Array<ChannelHealthRecord & { score: number; circuitOpen: boolean }>> {
+    if (this.activeProbePromise) {
+      return this.activeProbePromise;
+    }
+
+    const targets = Array.from(new Set(channelIds.map((id) => String(id || '').trim()).filter(Boolean)));
+    if (targets.length === 0) {
+      return this.getAllStats([]);
+    }
+
+    this.activeProbePromise = (async () => {
+      let cursor = 0;
+      const workerCount = Math.min(Math.max(1, concurrency), targets.length);
+      const netdiskHintRegex = /(?:pan\.quark\.cn|alipan\.com|aliyundrive\.com|115\.com|anxia\.com|drive\.uc\.cn|pan\.baidu\.com|123pan)/i;
+
+      const worker = async () => {
+        while (cursor < targets.length) {
+          const channelId = targets[cursor++];
+          const start = Date.now();
+          try {
+            const url = `https://t.me/s/${encodeURIComponent(channelId)}`;
+            const resp = await axios.get(url, {
+              timeout: timeoutMs,
+              headers: {
+                'User-Agent':
+                  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+              },
+            });
+            const latency = Math.max(1, Date.now() - start);
+            const html = typeof resp.data === 'string' ? resp.data : '';
+            if (resp.status >= 200 && resp.status < 400 && html.includes('tgme_widget_message')) {
+              const hasNetdiskHit = netdiskHintRegex.test(html);
+              this.recordSuccess(channelId, latency, hasNetdiskHit ? 1 : 0);
+            } else {
+              this.recordFailure(channelId, latency);
+            }
+          } catch {
+            const latency = Math.max(1, Date.now() - start);
+            this.recordFailure(channelId, latency);
+          }
+        }
+      };
+
+      await Promise.all(Array.from({ length: workerCount }, () => worker()));
+      this.persistNow();
+      return this.getAllStats(targets);
+    })();
+
+    try {
+      return await this.activeProbePromise;
+    } finally {
+      this.activeProbePromise = null;
+    }
   }
 }

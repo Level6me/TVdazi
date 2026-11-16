@@ -117,9 +117,9 @@ export class DashboardServer {
   }
 
   /**
-   * 为指定微信用户签发带时效性的 HMAC 访问 Token（默认 15 分钟有效）
+   * 为指定微信用户签发带时效性的 HMAC 访问 Token（默认 24 小时有效）
    */
-  static issueUserToken(userId: string, ttlMs: number = 15 * 60 * 1000): string {
+  static issueUserToken(userId: string, ttlMs: number = 24 * 60 * 60 * 1000): string {
     const exp = Date.now() + ttlMs;
     const payload = Buffer.from(JSON.stringify({ userId, exp }), 'utf-8').toString('base64url');
     const sig = crypto
@@ -252,6 +252,9 @@ export class DashboardServer {
     const channelIds = new ChannelManager().loadChannels().map((c) => c.id);
 
     if (req.method === 'GET' && pathname === '/api/panel/state') {
+      if (parsedUrl.query.probe === '1') {
+        await health.probeChannels(channelIds);
+      }
       const plan = userManager.getUserPlan(userId);
       const tasks = scheduler.getUserTasks(userId);
       const channels = health.getAllStats(channelIds);
@@ -373,20 +376,80 @@ export class DashboardServer {
     }
 
     if (req.method === 'POST' && pathname === '/api/panel/tasks') {
-      const action = String(body.action || '');
-      const taskId = String(body.taskId || '');
-      if (action === 'toggle' && taskId) {
+      const action = String(body.action || '').trim();
+      const taskId = String(body.taskId || '').trim();
+      if (action === 'create_watch') {
+        const title = String(body.title || '').replace(/[《》]/g, '').trim();
+        if (!title) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '请输入要追更的电影或剧集名称' }));
+          return true;
+        }
+        const rawMode = String(body.mode || 'resource_watch');
+        const mode: 'episode_chase' | 'resource_watch' | 'quality_upgrade' =
+          rawMode === 'episode_chase' || rawMode === 'quality_upgrade' ? rawMode : 'resource_watch';
+        const intervalMinutes = Number(body.intervalMinutes || 30);
+        const autoSave = Boolean(body.autoSave);
+        const task = scheduler.createPanelWatchTask({
+          userId,
+          title,
+          mode,
+          intervalMinutes,
+          autoSave,
+          runInitialCheck: body.runInitialCheck !== false,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            task,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+            tasks: scheduler.getUserTasks(userId),
+          })
+        );
+        return true;
+      }
+      if (action === 'toggle') {
+        if (!taskId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '缺少任务 ID' }));
+          return true;
+        }
         const task = scheduler.toggleUserTaskById(userId, taskId);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: Boolean(task), task }));
+        res.end(JSON.stringify({ ok: Boolean(task), task, error: task ? undefined : '任务不存在或已被删除' }));
         return true;
       }
-      if (action === 'delete' && taskId) {
+      if (action === 'delete') {
+        if (!taskId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '缺少任务 ID' }));
+          return true;
+        }
         const ok = scheduler.deleteUserTaskById(userId, taskId);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok }));
+        res.end(JSON.stringify({ ok, error: ok ? undefined : '任务不存在或已被删除' }));
         return true;
       }
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: '不支持的任务操作' }));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/panel/channels/probe') {
+      const channels = await health.probeChannels(channelIds);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          channels: {
+            total: channels.length,
+            circuitOpenCount: channels.filter((c) => c.circuitOpen).length,
+            topChannels: channels.slice(0, 20),
+          },
+        })
+      );
+      return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/panel/channels/reset') {
@@ -507,7 +570,7 @@ ${AUI_BUNDLE_CSS}
       <h1 class="title" id="page-title">观影总览</h1>
     </div>
     <div class="header-actions">
-      <button class="pill-btn" onclick="load(true)"><span>↻</span><span class="pill-text">刷新</span></button>
+      <button class="pill-btn" id="btnRefreshPanel" onclick="refreshPanel(this)"><span>↻</span><span class="pill-text" id="refreshLabel">刷新</span></button>
       <button class="pill-btn" onclick="cycleTheme()"><span id="theme-icon">🌓</span><span id="theme-label" class="pill-text">自动</span></button>
     </div>
   </header>
@@ -639,6 +702,35 @@ ${AUI_BUNDLE_CSS}
   <main id="p-media" class="page">
     <div class="card">
       <div class="card-header">
+        <div class="card-title">添加追更 / 新片蹲守</div>
+        <span class="badge success">有更新微信通知</span>
+      </div>
+      <div class="form-group">
+        <input class="form-control" id="watchTitle" placeholder="输入电影或剧集片名，如：流浪地球3、难哄">
+      </div>
+      <div class="grid-2" style="margin-bottom:10px;">
+        <select class="form-control" id="watchMode">
+          <option value="resource_watch">电影 / 新片全网蹲守</option>
+          <option value="episode_chase">连载剧集自动追更</option>
+          <option value="quality_upgrade">4K / 杜比高画质洗版</option>
+        </select>
+        <select class="form-control" id="watchInterval">
+          <option value="15">每 15 分钟巡检</option>
+          <option value="30" selected>每 30 分钟巡检</option>
+          <option value="60">每 60 分钟巡检</option>
+        </select>
+      </div>
+      <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+        <label style="display:inline-flex;align-items:center;gap:6px;font-size:12px;color:var(--text-sec);cursor:pointer;">
+          <input type="checkbox" id="watchAutoSave">
+          <span>命中资源时自动转存夸克网盘</span>
+        </label>
+        <button class="btn" id="btnCreateWatch" onclick="createWatch(this)">开启追更通知</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
         <div class="card-title">追剧片单与批量导入</div>
         <span class="badge purple" id="watchlistCountBadge">0 部</span>
       </div>
@@ -722,7 +814,10 @@ ${AUI_BUNDLE_CSS}
       <div class="card">
         <div class="card-header">
           <div class="card-title">资源频道健康度 Top 20</div>
-          <span class="badge success" id="channelsHealthBadge">0 / 0</span>
+          <div style="display:flex;align-items:center;gap:8px;">
+            <button class="pill-btn" id="btnProbeChannels" onclick="probeChannelsNow(true, this)">测速刷新</button>
+            <span class="badge success" id="channelsHealthBadge">0 / 0</span>
+          </div>
         </div>
         <div id="channelsBox"></div>
       </div>
@@ -763,18 +858,56 @@ function esc(s){
   return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
 }
 
+let autoProbedOnce = false;
+const TASK_TYPE_LABELS = {
+  resource_watch: "全网蹲守",
+  episode_chase: "剧集追更",
+  quality_upgrade: "4K洗版",
+  daily_recommend: "定时推荐",
+  friday_weekly: "周末周报",
+  disk_guard: "网盘巡检",
+  watchlist_remind: "片单提醒",
+  custom_reminder: "自定义"
+};
+
+function toast(msg, ms){
+  showToast(String(msg || ""), typeof ms === "number" ? ms : 2600);
+}
+
 function navTab(pageId, title, dockIndex){
   const btns = document.querySelectorAll('.dock .dock-btn');
   switchPage(pageId, title, btns[dockIndex]);
 }
 
 async function api(path, body){
-  const res = await fetch(path + "?token=" + encodeURIComponent(TOKEN), {
-    method: body ? "POST" : "GET",
-    headers: body ? {"Content-Type":"application/json"} : {},
-    body: body ? JSON.stringify(body) : undefined
-  });
-  return res.json();
+  try {
+    const sep = path.indexOf("?") === -1 ? "?" : "&";
+    const res = await fetch(path + sep + "token=" + encodeURIComponent(TOKEN), {
+      method: body ? "POST" : "GET",
+      headers: body ? {"Content-Type":"application/json"} : {},
+      body: body ? JSON.stringify(body) : undefined
+    });
+    const text = await res.text();
+    let data = null;
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (e) {
+      data = { ok: false, error: "服务响应解析失败 (" + res.status + ")" };
+    }
+    if (!res.ok) {
+      if (res.status === 401) {
+        return { ok: false, status: 401, error: "访问令牌已过期，请在微信发送 /web 获取最新控制台链接" };
+      }
+      return {
+        ok: false,
+        status: res.status,
+        error: (data && data.error) ? data.error : ("请求失败 (" + res.status + ")")
+      };
+    }
+    return data || { ok: true };
+  } catch (err) {
+    return { ok: false, error: "网络连接异常，请稍后重试" };
+  }
 }
 
 function renderRemovableChips(containerId, items, category, badgeClass){
@@ -789,22 +922,88 @@ function renderRemovableChips(containerId, items, category, badgeClass){
     '<span class="chip-del" data-cat="' + esc(category) + '" data-val="' + esc(val) + '">×</span></span>'
   ).join("");
   el.querySelectorAll('.chip-del').forEach(btn => {
-    btn.onclick = () => removeProfileTag(btn.dataset.cat, btn.dataset.val);
+    btn.onclick = () => removeProfileTag(btn.getAttribute('data-cat'), btn.getAttribute('data-val'));
   });
+}
+
+function renderChannels(ch){
+  const info = ch || {};
+  const topCh = info.topChannels || [];
+  const total = info.total || 0;
+  const openCount = info.circuitOpenCount || 0;
+  const healthBadge = document.getElementById("channelsHealthBadge");
+  if (healthBadge) {
+    healthBadge.textContent = Math.max(0, total - openCount) + " / " + total;
+  }
+  const cb = document.getElementById("channelsBox");
+  if (!cb) return;
+  cb.innerHTML = topCh.length
+    ? topCh.map(c =>
+        '<div class="list-row"><span class="list-main">@' + esc(c.channelId) + '</span>' +
+        '<div class="list-actions"><span class="badge ' + (c.circuitOpen ? 'danger' : 'success') + '">' + (c.score || 0) + '分 · ' + (c.avgLatencyMs || 0) + 'ms</span>' +
+        (c.circuitOpen ? '<button class="pill-btn warning js-ch-reset" data-id="' + esc(c.channelId) + '">重置</button>' : '') +
+        '</div></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">暂无频道数据</div>';
+  cb.querySelectorAll(".js-ch-reset").forEach(b => {
+    b.onclick = function(){ resetChannel(this.getAttribute("data-id"), this); };
+  });
+  return topCh;
+}
+
+async function probeChannelsNow(manual, btnEl){
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "测速中...";
+  }
+  try {
+    const r = await api("/api/panel/channels/probe", {});
+    if (r && r.ok !== false && r.channels) {
+      renderChannels(r.channels);
+      if (manual) toast("频道健康度已更新");
+      return true;
+    }
+    if (manual) toast((r && r.error) || "频道测速失败");
+    return false;
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = "测速刷新";
+    }
+  }
+}
+
+async function refreshPanel(btnEl){
+  const label = document.getElementById("refreshLabel");
+  if (btnEl) btnEl.disabled = true;
+  if (label) label.textContent = "刷新中...";
+  try {
+    const okState = await load(false);
+    await probeChannelsNow(false);
+    if (okState) {
+      toast("已同步最新状态");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+    if (label) label.textContent = "刷新";
+  }
 }
 
 async function load(manual){
   const d = await api("/api/panel/state");
-  if (!d || d.error) {
-    showToast(d?.error || "数据加载失败", "error");
-    return;
+  if (!d || d.ok === false || d.error) {
+    toast((d && d.error) || "数据加载失败");
+    return false;
   }
 
-  document.getElementById("headerBadge").textContent = "TVDAZI · " + (d.settings.alias || d.userId);
-  document.getElementById("kpiSearches").textContent = d.stats?.totalSearches || 0;
-  document.getElementById("kpiSaves").textContent = d.stats?.totalSaves || 0;
-  document.getElementById("kpiWatchlist").textContent = (d.watchlist || []).length;
-  document.getElementById("kpiTasks").textContent = (d.tasks || []).filter(t => t.enabled).length;
+  try {
+    const settings = d.settings || {};
+    const stats = d.stats || {};
+    document.getElementById("headerBadge").textContent = "TVDAZI · " + (settings.alias || d.userId || "");
+    document.getElementById("kpiSearches").textContent = stats.totalSearches || 0;
+    document.getElementById("kpiSaves").textContent = stats.totalSaves || 0;
+    document.getElementById("kpiWatchlist").textContent = (d.watchlist || []).length;
+    document.getElementById("kpiTasks").textContent = (d.tasks || []).filter(t => t && t.enabled).length;
 
   const tp = d.tasteProfile || {};
   const likes = tp.explicitLikes || { genres:[], regions:[], directors:[], actors:[], favoriteSeeds:[] };
@@ -885,28 +1084,41 @@ async function load(manual){
         '<div class="list-actions"><button class="pill-btn js-watch-done" data-title="' + esc(w.title) + '">已看</button><button class="pill-btn danger js-watch-del" data-title="' + esc(w.title) + '">删</button></div></div>'
       ).join("")
     : '<div style="color:var(--text-sec);font-size:13px;">暂无片单</div>';
-  wb.querySelectorAll(".js-watch-done").forEach(b => b.onclick = () => setStatus(b.dataset.title, "completed"));
-  wb.querySelectorAll(".js-watch-del").forEach(b => b.onclick = () => delWatch(b.dataset.title));
+  wb.querySelectorAll(".js-watch-done").forEach(b => {
+    b.onclick = function(){ setStatus(this.getAttribute("data-title"), "completed", this); };
+  });
+  wb.querySelectorAll(".js-watch-del").forEach(b => {
+    b.onclick = function(){ delWatch(this.getAttribute("data-title"), this); };
+  });
 
-  const tasks = d.tasks || [];
+  const tasks = (d.tasks || []).filter(t => t && t.id);
   document.getElementById("tasksCountBadge").textContent = tasks.length + " 个";
   const tb = document.getElementById("tasksBox");
   tb.innerHTML = tasks.length
-    ? tasks.map(t =>
-        '<div class="list-row"><span class="list-main">' + esc(t.title) + ' <span class="badge ' + (t.enabled ? 'success' : 'neutral') + '">' + (t.enabled ? '运行中' : '已暂停') + '</span></span>' +
-        '<div class="list-actions"><button class="pill-btn js-task-tog" data-id="' + esc(t.id) + '">' + (t.enabled ? '暂停' : '恢复') + '</button><button class="pill-btn danger js-task-del" data-id="' + esc(t.id) + '">删</button></div></div>'
-      ).join("")
+    ? tasks.map(t => {
+        const typeLabel = TASK_TYPE_LABELS[t.type] || "监控";
+        const statusCls = t.enabled ? "success" : (t.status === "completed" ? "accent" : "neutral");
+        const statusLabel = t.enabled ? "运行中" : (t.status === "completed" ? "已命中" : "已暂停");
+        return '<div class="list-row"><span class="list-main">' + esc(t.title) +
+          ' <span class="badge purple">' + esc(typeLabel) + '</span>' +
+          ' <span class="badge ' + statusCls + '">' + statusLabel + '</span></span>' +
+          '<div class="list-actions"><button class="pill-btn js-task-tog" data-id="' + esc(t.id) + '">' + (t.enabled ? '暂停' : '恢复') + '</button><button class="pill-btn danger js-task-del" data-id="' + esc(t.id) + '">删</button></div></div>';
+      }).join("")
     : '<div style="color:var(--text-sec);font-size:13px;">暂无定时任务</div>';
-  tb.querySelectorAll(".js-task-tog").forEach(b => b.onclick = () => toggleTask(b.dataset.id));
-  tb.querySelectorAll(".js-task-del").forEach(b => b.onclick = () => delTask(b.dataset.id));
+  tb.querySelectorAll(".js-task-tog").forEach(b => {
+    b.onclick = function(){ toggleTask(this.getAttribute("data-id"), this); };
+  });
+  tb.querySelectorAll(".js-task-del").forEach(b => {
+    b.onclick = function(){ delTask(this.getAttribute("data-id"), this); };
+  });
 
   // Settings Tab
-  document.getElementById("aliasName").value = d.settings.alias || "";
-  document.getElementById("publicBaseUrl").value = d.settings.publicBaseUrl || "";
-  document.getElementById("effectiveDomainTip").textContent = "生效前缀: " + (d.settings.effectiveBaseUrl || "");
-  document.getElementById("saveRootDir").value = d.settings.saveRootDir || "";
-  document.getElementById("preferredQuality").value = d.settings.preferredQuality || "any";
-  document.getElementById("webhookUrl").value = d.settings.webhookUrl || "";
+  document.getElementById("aliasName").value = settings.alias || "";
+  document.getElementById("publicBaseUrl").value = settings.publicBaseUrl || "";
+  document.getElementById("effectiveDomainTip").textContent = "生效前缀: " + (settings.effectiveBaseUrl || "");
+  document.getElementById("saveRootDir").value = settings.saveRootDir || "";
+  document.getElementById("preferredQuality").value = settings.preferredQuality || "any";
+  document.getElementById("webhookUrl").value = settings.webhookUrl || "";
 
   const contacts = d.contacts || [];
   document.getElementById("contactsCountBadge").textContent = contacts.length + " 人";
@@ -916,28 +1128,28 @@ async function load(manual){
       ).join("")
     : '<div style="color:var(--text-sec);font-size:13px;">暂无联系人</div>';
 
-  const ch = d.channels || {};
-  const topCh = ch.topChannels || [];
-  document.getElementById("channelsHealthBadge").textContent = Math.max(0, (ch.total || 0) - (ch.circuitOpenCount || 0)) + " / " + (ch.total || 0);
-  const cb = document.getElementById("channelsBox");
-  cb.innerHTML = topCh.map(c =>
-    '<div class="list-row"><span class="list-main">@' + esc(c.channelId) + '</span>' +
-    '<div class="list-actions"><span class="badge ' + (c.circuitOpen ? 'danger' : 'success') + '">' + c.score + '分 · ' + c.avgLatencyMs + 'ms</span>' +
-    (c.circuitOpen ? '<button class="pill-btn warning js-ch-reset" data-id="' + esc(c.channelId) + '">重置</button>' : '') +
-    '</div></div>'
-  ).join("");
-  cb.querySelectorAll(".js-ch-reset").forEach(b => b.onclick = () => resetChannel(b.dataset.id));
+  const topCh = renderChannels(d.channels) || [];
+  const needInitProbe = topCh.length > 0 && topCh.every(c => !c.avgLatencyMs && !c.successCount && !c.failCount);
+  if (!autoProbedOnce && needInitProbe) {
+    autoProbedOnce = true;
+    setTimeout(function(){ probeChannelsNow(false); }, 60);
+  }
 
-  if (manual) showToast("已同步最新状态", "success");
+  if (manual) toast("已同步最新状态");
+  return true;
+  } catch (renderErr) {
+    toast("页面渲染异常，请重试");
+    return false;
+  }
 }
 
 async function submitProfileAdd(category, value){
   const r = await api("/api/panel/profile", { action: "add", category, value });
-  if (r && r.ok) {
-    showToast("画像偏好已更新", "success");
-    load();
+  if (r && r.ok !== false) {
+    toast("画像偏好已更新");
+    await load(false);
   } else {
-    showToast(r?.error || "更新失败", "error");
+    toast((r && r.error) || "更新失败");
   }
 }
 
@@ -951,16 +1163,22 @@ async function addProfileTag(category, inputId){
 
 async function removeProfileTag(category, value){
   const r = await api("/api/panel/profile", { action: "remove", category, value });
-  if (r && r.ok) {
-    showToast("已移除 " + value, "info");
-    load();
+  if (r && r.ok !== false) {
+    toast("已移除 " + value);
+    await load(false);
+  } else {
+    toast((r && r.error) || "移除失败");
   }
 }
 
 async function resetProfile(){
-  await api("/api/panel/profile", { action: "reset" });
-  showToast("画像已清空重建", "warning");
-  load();
+  const r = await api("/api/panel/profile", { action: "reset" });
+  if (r && r.ok === false) {
+    toast(r.error || "重置失败");
+    return;
+  }
+  toast("画像已清空重建");
+  await load(false);
 }
 
 async function saveSettings(){
@@ -975,27 +1193,137 @@ async function saveSettings(){
     pan115Cookie: document.getElementById("pan115Cookie").value,
   });
   if (r && r.ok === false) {
-    showToast(r.error || "保存失败", "error");
+    toast(r.error || "保存失败");
     return;
   }
-  showToast("配置已保存并生效", "success");
-  load();
+  toast("配置已保存并生效");
+  await load(false);
+}
+
+async function createWatch(btnEl){
+  const input = document.getElementById("watchTitle");
+  const title = (input && input.value ? input.value : "").trim();
+  if (!title) {
+    toast("请输入电影或剧集片名");
+    return;
+  }
+  const modeEl = document.getElementById("watchMode");
+  const intervalEl = document.getElementById("watchInterval");
+  const autoSaveEl = document.getElementById("watchAutoSave");
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/tasks", {
+      action: "create_watch",
+      title: title,
+      mode: modeEl ? modeEl.value : "resource_watch",
+      intervalMinutes: intervalEl ? Number(intervalEl.value) : 30,
+      autoSave: autoSaveEl ? Boolean(autoSaveEl.checked) : false
+    });
+    if (r && r.ok !== false) {
+      input.value = "";
+      toast("已开启追更监控，有更新将微信通知");
+      await load(false);
+    } else {
+      toast((r && r.error) || "添加追更失败");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
 }
 
 async function importList(){
   const rawText = document.getElementById("batchImport").value;
   if (!rawText.trim()) return;
   const r = await api("/api/panel/watchlist", { action: "import", rawText });
+  if (r && r.ok === false) {
+    toast(r.error || "导入失败");
+    return;
+  }
   document.getElementById("batchImport").value = "";
-  showToast("新增收录 " + (r?.added?.length || 0) + " 部", "success");
-  load();
+  const addedCount = (r && r.added && r.added.length) ? r.added.length : 0;
+  toast("新增收录 " + addedCount + " 部");
+  await load(false);
 }
 
-async function setStatus(title, status){ await api("/api/panel/watchlist", { action:"status", title, status }); showToast("已标为已看", "success"); load(); }
-async function delWatch(title){ await api("/api/panel/watchlist", { action:"remove", title }); showToast("已移出片单", "info"); load(); }
-async function toggleTask(taskId){ await api("/api/panel/tasks", { action:"toggle", taskId }); showToast("任务状态已切换", "info"); load(); }
-async function delTask(taskId){ await api("/api/panel/tasks", { action:"delete", taskId }); showToast("已删除任务", "warning"); load(); }
-async function resetChannel(channelId){ await api("/api/panel/channels/reset", { channelId }); showToast("频道熔断已重置", "success"); load(); }
+async function setStatus(title, status, btnEl){
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", { action:"status", title:title, status:status });
+    if (r && r.ok === false) {
+      toast(r.error || "更新片单失败");
+      return;
+    }
+    toast("已标为已看");
+    await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function delWatch(title, btnEl){
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", { action:"remove", title:title });
+    if (r && r.ok === false) {
+      toast(r.error || "移除片单失败");
+      return;
+    }
+    toast("已移出片单");
+    await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function toggleTask(taskId, btnEl){
+  if (!taskId) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/tasks", { action:"toggle", taskId:taskId });
+    if (r && r.ok === false) {
+      toast(r.error || "切换任务失败");
+      await load(false);
+      return;
+    }
+    toast("任务状态已切换");
+    await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function delTask(taskId, btnEl){
+  if (!taskId) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/tasks", { action:"delete", taskId:taskId });
+    if (r && r.ok === false) {
+      toast(r.error || "删除任务失败");
+      await load(false);
+      return;
+    }
+    toast("已删除任务");
+    await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function resetChannel(channelId, btnEl){
+  if (!channelId) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/channels/reset", { channelId:channelId });
+    if (r && r.ok === false) {
+      toast(r.error || "重置失败");
+      return;
+    }
+    toast("频道熔断已重置");
+    await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
 
 load();
 </script>

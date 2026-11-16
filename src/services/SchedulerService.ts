@@ -96,7 +96,22 @@ export class SchedulerService {
         const raw = fs.readFileSync(this.tasksFilePath, 'utf-8');
         const parsed = JSON.parse(raw);
         if (Array.isArray(parsed)) {
-          this.tasks = parsed;
+          const seenIds = new Set<string>();
+          let repaired = false;
+          this.tasks = parsed.map((t: any, idx: number) => {
+            const rawId = typeof t?.id === 'string' ? t.id.trim() : '';
+            if (!rawId || seenIds.has(rawId)) {
+              repaired = true;
+              const newId = `task_${Date.now()}_${idx}_${Math.random().toString(36).slice(2, 6)}`;
+              seenIds.add(newId);
+              return { ...t, id: newId };
+            }
+            seenIds.add(rawId);
+            return t;
+          });
+          if (repaired) {
+            this.saveTasks();
+          }
         }
       }
     } catch (err: any) {
@@ -114,7 +129,9 @@ export class SchedulerService {
   }
 
   public toggleUserTaskById(userId: string, taskId: string): ScheduledTask | null {
-    const task = this.tasks.find((t) => t.userId === userId && t.id === taskId);
+    const cleanId = String(taskId || '').trim();
+    if (!cleanId) return null;
+    const task = this.tasks.find((t) => t.userId === userId && t.id === cleanId);
     if (!task) return null;
     task.enabled = !task.enabled;
     task.status = task.enabled ? 'active' : 'paused';
@@ -123,11 +140,80 @@ export class SchedulerService {
   }
 
   public deleteUserTaskById(userId: string, taskId: string): boolean {
-    const idx = this.tasks.findIndex((t) => t.userId === userId && t.id === taskId);
+    const cleanId = String(taskId || '').trim();
+    if (!cleanId) return false;
+    const idx = this.tasks.findIndex((t) => t.userId === userId && t.id === cleanId);
     if (idx === -1) return false;
     this.tasks.splice(idx, 1);
     this.saveTasks();
     return true;
+  }
+
+  /**
+   * 供 Web 控制台片单页面创建电影蹲守 / 剧集追更 / 4K洗版任务，命中更新时通过微信 Bot 推送通知
+   */
+  public createPanelWatchTask(params: {
+    userId: string;
+    title: string;
+    mode?: 'episode_chase' | 'resource_watch' | 'quality_upgrade';
+    intervalMinutes?: number;
+    autoSave?: boolean;
+    runInitialCheck?: boolean;
+  }): ScheduledTask {
+    const cleanTitle = String(params.title || '').replace(/[《》]/g, '').trim();
+    if (!cleanTitle) {
+      throw new Error('请输入有效的影视作品名称');
+    }
+
+    const mode: 'episode_chase' | 'resource_watch' | 'quality_upgrade' =
+      params.mode === 'episode_chase' || params.mode === 'quality_upgrade' ? params.mode : 'resource_watch';
+    const rawInterval = Number(params.intervalMinutes);
+    const intervalMinutes = Number.isFinite(rawInterval)
+      ? Math.min(1440, Math.max(5, Math.round(rawInterval)))
+      : 30;
+    const autoSave = Boolean(params.autoSave);
+
+    const taskTitle =
+      mode === 'episode_chase'
+        ? `追更《${cleanTitle}》`
+        : mode === 'quality_upgrade'
+          ? `《${cleanTitle}》4K高画质洗版监控`
+          : `蹲守《${cleanTitle}》全网更新`;
+
+    const task = this.addTask({
+      userId: params.userId,
+      type: mode,
+      title: taskTitle,
+      keyword: cleanTitle,
+      enabled: true,
+      intervalMinutes,
+      autoSave,
+      ...(mode === 'episode_chase' ? { lastEpisode: 0, knownShareIds: [] } : {}),
+      ...(mode === 'quality_upgrade' ? { targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'] } : {}),
+    });
+
+    this.userManager.addToWatchlist(params.userId, cleanTitle);
+
+    if (params.runInitialCheck && this.pushCallback) {
+      void this.triggerInitialPanelCheck(task).catch(() => {});
+    }
+
+    return task;
+  }
+
+  private async triggerInitialPanelCheck(task: ScheduledTask): Promise<void> {
+    if (!task.enabled || task.status === 'completed') return;
+    let msg: string | null = null;
+    if (task.type === 'episode_chase') {
+      msg = await this.runEpisodeChase(task, false);
+    } else if (task.type === 'quality_upgrade') {
+      msg = await this.runQualityUpgrade(task, false);
+    } else if (task.type === 'resource_watch') {
+      msg = await this.runResourceWatch(task, false);
+    }
+    if (msg && this.pushCallback) {
+      await this.pushCallback(task.userId, msg);
+    }
   }
 
   /**
