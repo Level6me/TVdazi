@@ -1,5 +1,23 @@
 import { UserManager, UserPlan } from './UserManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
+import { CategoryClassifier } from './CategoryClassifier';
+
+export const ALL_SUPPORTED_MEDIA_TYPES = [
+  '电影',
+  '电视剧',
+  '国产剧',
+  '美剧',
+  '韩剧',
+  '日剧',
+  '英剧',
+  '港剧',
+  '台剧',
+  '泰剧',
+  '动画',
+  '综艺',
+  '纪录片',
+  '短剧',
+] as const;
 
 export type ImplicitAction = 'save' | 'share' | 'search' | 'skip';
 
@@ -174,8 +192,11 @@ export class UserProfileService {
     const plan = this.userManager.getUserPlan(userId);
     const profile = this.ensureProfile(plan);
 
-    this.mergeUnique(profile.explicitLikes.mediaTypes!, opts.likeMediaTypes, 8);
-    this.mergeUnique(profile.explicitDislikes.mediaTypes!, opts.dislikeMediaTypes, 8);
+    const normLikeMedia = opts.likeMediaTypes?.map((m) => UserProfileService.normalizeMediaType(m)).filter(Boolean);
+    const normDislikeMedia = opts.dislikeMediaTypes?.map((m) => UserProfileService.normalizeMediaType(m)).filter(Boolean);
+
+    this.mergeUnique(profile.explicitLikes.mediaTypes!, normLikeMedia, 14);
+    this.mergeUnique(profile.explicitDislikes.mediaTypes!, normDislikeMedia, 10);
     this.mergeUnique(profile.explicitLikes.genres, opts.likeGenres, 15);
     this.mergeUnique(profile.explicitLikes.regions, opts.likeRegions, 10);
     this.mergeUnique(profile.explicitLikes.directors, opts.likeDirectors, 15);
@@ -220,11 +241,13 @@ export class UserProfileService {
     title: string,
     action: ImplicitAction,
     meta?: {
+      mediaType?: string;
       genres?: string[];
       region?: string;
       directors?: string[];
       actors?: string[];
       year?: string;
+      episodesCount?: string;
       skipLookup?: boolean;
     }
   ): Promise<void> {
@@ -236,6 +259,7 @@ export class UserProfileService {
     let directors = meta?.directors || [];
     let actors = meta?.actors || [];
     let decade = this.extractDecade(meta?.year);
+    let episodesCount = meta?.episodesCount;
 
     if (genres.length === 0 && !region && !meta?.skipLookup) {
       try {
@@ -246,6 +270,7 @@ export class UserProfileService {
         if (sub) {
           genres = sub.types || genres;
           region = sub.region || region;
+          episodesCount = sub.episodesCount || episodesCount;
           if (sub.directors) directors = sub.directors.split('/').map((s) => s.trim()).filter(Boolean);
           if (sub.actors) actors = sub.actors.split('/').map((s) => s.trim()).filter(Boolean);
           decade = this.extractDecade(sub.year) || decade;
@@ -253,12 +278,23 @@ export class UserProfileService {
       } catch {}
     }
 
+    const fallbackCategory =
+      !meta?.mediaType && genres.length === 0 && !region
+        ? CategoryClassifier.classify(cleanTitle)
+        : meta?.mediaType;
+    const inferredTypes = this.inferSubjectMediaTypes(
+      { title: cleanTitle, types: genres, region, episodesCount },
+      fallbackCategory
+    );
+    const primaryMediaType = inferredTypes[0];
+
     const plan = this.userManager.getUserPlan(userId);
     const profile = this.ensureProfile(plan);
 
     profile.implicitEvents.push({
       title: cleanTitle,
       action,
+      mediaType: primaryMediaType,
       genres: genres.slice(0, 5),
       region,
       directors: directors.slice(0, 3),
@@ -277,6 +313,70 @@ export class UserProfileService {
   /**
    * 计算带 30 天指数时间衰减的用户个人口味特征向量
    */
+  public static normalizeMediaType(raw: string): string {
+    const s = String(raw || '').trim();
+    if (!s) return '';
+    if (/^(?:动漫|动画片|番剧|国漫|日漫)$/i.test(s)) return '动画';
+    if (/^(?:真人秀|脱口秀|恋综|音综)$/i.test(s)) return '综艺';
+    if (/^(?:连续剧|剧集|网剧)$/i.test(s)) return '电视剧';
+    if (/^(?:陆剧|大陆剧|内地剧|华语剧)$/i.test(s)) return '国产剧';
+    return s;
+  }
+
+  /**
+   * 推断任意作品所属的标准化全影视形态列表（支持电影、电视剧、国产剧、美剧、韩剧、日剧、英剧、港剧、台剧、泰剧、动画、综艺、纪录片、短剧）
+   */
+  public inferSubjectMediaTypes(subject: Partial<DoubanSubject>, explicitCategory?: string): string[] {
+    const result: string[] = [];
+    const pushMt = (mt: string) => {
+      const norm = UserProfileService.normalizeMediaType(mt);
+      if (norm && !result.includes(norm)) result.push(norm);
+    };
+
+    if (explicitCategory && explicitCategory !== '其他') {
+      pushMt(explicitCategory);
+    }
+
+    const types = subject.types || [];
+    const region = subject.region || '';
+    const epNum = subject.episodesCount ? parseInt(String(subject.episodesCount), 10) : 0;
+    const isSeries = Number.isFinite(epNum) && epNum > 1;
+
+    if (types.some((t) => /动画|动漫/i.test(t))) {
+      pushMt('动画');
+    }
+    if (types.some((t) => /真人秀|脱口秀|综艺/i.test(t))) {
+      pushMt('综艺');
+    }
+    if (types.some((t) => /纪录片/i.test(t))) {
+      pushMt('纪录片');
+    }
+    if (types.some((t) => /短片|短剧/i.test(t)) || /短剧/.test(subject.title || '')) {
+      pushMt('短剧');
+    }
+
+    const isNonDramaFormat = result.some((r) => r === '动画' || r === '综艺' || r === '纪录片' || r === '短剧');
+    if (!isNonDramaFormat && (isSeries || /剧/.test(explicitCategory || ''))) {
+      if (/韩国/.test(region)) pushMt('韩剧');
+      else if (/美国/.test(region)) pushMt('美剧');
+      else if (/英国/.test(region)) pushMt('英剧');
+      else if (/日本/.test(region)) pushMt('日剧');
+      else if (/香港/.test(region)) pushMt('港剧');
+      else if (/台湾/.test(region)) pushMt('台剧');
+      else if (/泰国/.test(region)) pushMt('泰剧');
+      else if (/中国大陆|内地|大陆/.test(region)) pushMt('国产剧');
+      pushMt('电视剧');
+    }
+
+    if (result.length === 0) {
+      pushMt('电影');
+    }
+    if (result.some((r) => ['国产剧', '美剧', '韩剧', '日剧', '英剧', '港剧', '台剧', '泰剧'].includes(r))) {
+      pushMt('电视剧');
+    }
+    return result;
+  }
+
   public computeTagVector(userId: string, nowMs: number = Date.now()): TagWeightVector {
     const profile = this.getProfile(userId);
     const vec: TagWeightVector = {
@@ -295,7 +395,10 @@ export class UserProfileService {
     };
 
     // 1. 显式偏好（永久基础高权重 +5.0）
-    for (const m of profile.explicitLikes.mediaTypes || []) addWeight(vec.mediaTypes, m, 5.0);
+    for (const m of profile.explicitLikes.mediaTypes || []) {
+      const norm = UserProfileService.normalizeMediaType(m);
+      addWeight(vec.mediaTypes, norm, 5.0);
+    }
     for (const g of profile.explicitLikes.genres) addWeight(vec.genres, g, 5.0);
     for (const r of profile.explicitLikes.regions) addWeight(vec.regions, r, 5.0);
     for (const d of profile.explicitLikes.directors) addWeight(vec.directors, d, 5.0);
@@ -306,7 +409,13 @@ export class UserProfileService {
       const ageMs = Math.max(0, nowMs - ev.timestamp);
       const decay = Math.pow(0.5, ageMs / HALF_LIFE_MS);
       const w = ACTION_BASE_WEIGHTS[ev.action] * decay;
-      if (ev.mediaType) addWeight(vec.mediaTypes, ev.mediaType, w * 0.9);
+      if (ev.mediaType) {
+        const normMt = UserProfileService.normalizeMediaType(ev.mediaType);
+        addWeight(vec.mediaTypes, normMt, w * 0.95);
+        if (['国产剧', '美剧', '韩剧', '日剧', '英剧', '港剧', '台剧', '泰剧'].includes(normMt)) {
+          addWeight(vec.mediaTypes, '电视剧', w * 0.35);
+        }
+      }
       for (const g of ev.genres) addWeight(vec.genres, g, w);
       if (ev.region) addWeight(vec.regions, ev.region, w * 0.8);
       for (const d of ev.directors || []) addWeight(vec.directors, d, w * 1.1);
@@ -324,8 +433,16 @@ export class UserProfileService {
     const plan = this.userManager.getUserPlan(userId);
     const profile = this.ensureProfile(plan);
     const types = subject.types || [];
+    const inferredMediaTypes = this.inferSubjectMediaTypes(subject);
 
-    // 1. 显式排雷过滤
+    // 1. 显式排雷过滤（题材 + 影视形态 + 特定片名）
+    const dislikedMediaSet = new Set(
+      (profile.explicitDislikes.mediaTypes || []).map((dm) => UserProfileService.normalizeMediaType(dm).toLowerCase())
+    );
+    if (inferredMediaTypes.some((mt) => dislikedMediaSet.has(mt.toLowerCase()))) {
+      return -Infinity;
+    }
+
     if (
       profile.explicitDislikes.genres.some((dg) =>
         types.some((t) => t.toLowerCase() === dg.toLowerCase())
@@ -340,6 +457,14 @@ export class UserProfileService {
 
     const vec = this.computeTagVector(userId, nowMs);
     let matchScore = 0;
+
+    // 影视形态匹配加权（电影 / 美剧 / 韩剧 / 日剧 / 国产剧 / 动画 / 综艺 / 纪录片 / 短剧）
+    let bestMediaScore = 0;
+    for (const mt of inferredMediaTypes) {
+      const w = vec.mediaTypes[mt] || 0;
+      if (w > bestMediaScore) bestMediaScore = w;
+    }
+    matchScore += bestMediaScore;
 
     for (const g of types) {
       if (vec.genres[g]) matchScore += vec.genres[g];
@@ -475,10 +600,18 @@ export class UserProfileService {
     if (!raw) return out;
 
     const mediaDict: Array<[RegExp, string]> = [
-      [/(?:电影|院线片|大片|影片|movie)/i, '电影'],
-      [/(?:电视剧|连续剧|剧集|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|陆剧)/i, '电视剧'],
+      [/(?:电影|院线片|大片|影片|movie|韩影|日影|港片)/i, '电影'],
+      [/(?:美剧|欧美剧)/i, '美剧'],
+      [/(?:韩剧|韩国剧)/i, '韩剧'],
+      [/(?:日剧|日本剧)/i, '日剧'],
+      [/(?:英剧|英国剧)/i, '英剧'],
+      [/(?:港剧|tvb剧)/i, '港剧'],
+      [/(?:台剧|台湾剧)/i, '台剧'],
+      [/(?:泰剧|泰国剧)/i, '泰剧'],
+      [/(?:国产剧|陆剧|内地剧|大陆剧|华语剧)/i, '国产剧'],
+      [/(?:电视剧|连续剧|剧集|网剧|追剧)/i, '电视剧'],
       [/(?:综艺|真人秀|脱口秀|恋综|音综|搞笑综艺|下饭综艺|晚会)/i, '综艺'],
-      [/(?:动漫|动画|番剧|国漫|日漫|二次元)/i, '动漫'],
+      [/(?:动画|动漫|番剧|国漫|日漫|二次元)/i, '动画'],
       [/(?:纪录片|纪实)/i, '纪录片'],
       [/(?:短剧|微短剧|爽剧)/i, '短剧'],
     ];
@@ -581,7 +714,7 @@ export class UserProfileService {
       trimmed
     );
     if (!hasPrefVerb) return false;
-    const hasMediaOrTaste = /(?:电影|电视剧|剧集|连续剧|网剧|综艺|真人秀|脱口秀|动漫|动画|纪录片|短剧|悬疑|科幻|犯罪|动作|喜剧|搞笑|爱情|剧情|战争|恐怖|惊悚|奇幻|古装|家庭|韩剧|美剧|日剧|港剧|国产|欧美|《)/.test(
+    const hasMediaOrTaste = /(?:电影|电视剧|剧集|连续剧|网剧|综艺|真人秀|脱口秀|恋综|音综|动漫|动画|番剧|国漫|日漫|纪录片|短剧|悬疑|科幻|犯罪|动作|喜剧|搞笑|爱情|剧情|战争|恐怖|惊悚|奇幻|古装|家庭|韩剧|美剧|日剧|英剧|港剧|台剧|泰剧|国产剧|陆剧|国产|欧美|《)/.test(
       trimmed
     );
     return hasMediaOrTaste;
@@ -780,7 +913,15 @@ export class UserProfileService {
 
   public removeExplicitItem(
     userId: string,
-    category: 'likeMediaTypes' | 'likeGenres' | 'likeRegions' | 'likeDirectors' | 'likeActors' | 'favoriteSeeds' | 'dislikeGenres',
+    category:
+      | 'likeMediaTypes'
+      | 'dislikeMediaTypes'
+      | 'likeGenres'
+      | 'likeRegions'
+      | 'likeDirectors'
+      | 'likeActors'
+      | 'favoriteSeeds'
+      | 'dislikeGenres',
     value: string
   ): UserTasteProfile {
     const plan = this.userManager.getUserPlan(userId);
@@ -789,6 +930,9 @@ export class UserProfileService {
     const filterArr = (arr: string[]) => arr.filter((x) => x.trim().toLowerCase() !== target);
 
     if (category === 'likeMediaTypes') profile.explicitLikes.mediaTypes = filterArr(profile.explicitLikes.mediaTypes || []);
+    else if (category === 'dislikeMediaTypes') {
+      profile.explicitDislikes.mediaTypes = filterArr(profile.explicitDislikes.mediaTypes || []);
+    }
     else if (category === 'likeGenres') profile.explicitLikes.genres = filterArr(profile.explicitLikes.genres);
     else if (category === 'likeRegions') profile.explicitLikes.regions = filterArr(profile.explicitLikes.regions);
     else if (category === 'likeDirectors') profile.explicitLikes.directors = filterArr(profile.explicitLikes.directors);
@@ -824,7 +968,8 @@ export class UserProfileService {
       a.topGenres.length === 0 &&
       a.topRegions.length === 0 &&
       a.favoriteSeeds.length === 0 &&
-      a.dislikedGenres.length === 0
+      a.dislikedGenres.length === 0 &&
+      a.dislikedMediaTypes.length === 0
     ) {
       return [
         '🎯 【我的影视口味画像】',

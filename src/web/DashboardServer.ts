@@ -473,6 +473,7 @@ export class DashboardServer {
       const action = String(body.action || '');
       const category = String(body.category || '') as
         | 'likeMediaTypes'
+        | 'dislikeMediaTypes'
         | 'likeGenres'
         | 'likeRegions'
         | 'likeDirectors'
@@ -488,7 +489,16 @@ export class DashboardServer {
         return true;
       }
 
-      const validCats = ['likeMediaTypes', 'likeGenres', 'likeRegions', 'likeDirectors', 'likeActors', 'favoriteSeeds', 'dislikeGenres'];
+      const validCats = [
+        'likeMediaTypes',
+        'dislikeMediaTypes',
+        'likeGenres',
+        'likeRegions',
+        'likeDirectors',
+        'likeActors',
+        'favoriteSeeds',
+        'dislikeGenres',
+      ];
       if (!validCats.includes(category) || !rawValue) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: '无效的画像分类或空值' }));
@@ -629,6 +639,18 @@ ${AUI_BUNDLE_CSS}
   <main id="p-profile" class="page">
     <div class="card">
       <div class="card-header">
+        <div class="card-title">全影视形态偏好</div>
+        <span class="badge purple" id="personaSummaryPill">冷启动分析中</span>
+      </div>
+      <div class="chip-wrap" id="quickMediaChips"></div>
+      <div class="inline-add" style="margin-top:10px;">
+        <input class="form-control" id="inLikeMediaTypes" placeholder="自定义形态，如：纪录片, 短剧, 港剧" />
+        <button class="btn" onclick="addProfileTag('likeMediaTypes','inLikeMediaTypes')">添加</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
         <div class="card-title">快捷题材点选</div>
         <button class="pill-btn danger" onclick="resetProfile()">清空重建</button>
       </div>
@@ -678,13 +700,20 @@ ${AUI_BUNDLE_CSS}
     <div class="grid-2">
       <div class="card">
         <div class="card-header">
-          <div class="card-title">排雷屏蔽题材</div>
+          <div class="card-title">排雷屏蔽（题材与形态）</div>
           <span class="badge danger">硬过滤</span>
         </div>
+        <div class="form-label">屏蔽题材</div>
         <div class="chip-wrap" id="chipsDislikeGenres"></div>
         <div class="inline-add">
           <input class="form-control" id="inDislikeGenres" placeholder="如：恐怖, 古装" />
           <button class="btn danger" onclick="addProfileTag('dislikeGenres','inDislikeGenres')">屏蔽</button>
+        </div>
+        <div class="form-label" style="margin-top:14px;">屏蔽形态</div>
+        <div class="chip-wrap" id="chipsDislikeMediaTypes"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inDislikeMediaTypes" placeholder="如：短剧, 综艺" />
+          <button class="btn danger" onclick="addProfileTag('dislikeMediaTypes','inDislikeMediaTypes')">屏蔽</button>
         </div>
       </div>
 
@@ -851,6 +880,7 @@ ${AUI_BUNDLE_JS}
 </script>
 <script>
 const TOKEN = "${safeToken}";
+const QUICK_MEDIA_TYPES = ["电影","电视剧","国产剧","美剧","韩剧","日剧","英剧","港剧","台剧","泰剧","动画","综艺","纪录片","短剧"];
 const QUICK_GENRES = ["悬疑","科幻","犯罪","动作","喜剧","爱情","剧情","战争","动画","纪录片","奇幻","恐怖"];
 const ACTION_LABELS = { save:"转存", share:"安利", search:"搜片", skip:"跳过" };
 const ACTION_BADGES = { save:"success", share:"purple", search:"accent", skip:"warning" };
@@ -1007,11 +1037,12 @@ async function load(manual){
     document.getElementById("kpiTasks").textContent = (d.tasks || []).filter(t => t && t.enabled).length;
 
   const tp = d.tasteProfile || {};
-  const likes = tp.explicitLikes || { genres:[], regions:[], directors:[], actors:[], favoriteSeeds:[] };
-  const dislikes = tp.explicitDislikes || { genres:[] };
+  const likes = tp.explicitLikes || { mediaTypes:[], genres:[], regions:[], directors:[], actors:[], favoriteSeeds:[] };
+  const dislikes = tp.explicitDislikes || { mediaTypes:[], genres:[] };
 
   // Overview: 权重条
   const bars = [
+    ...(tp.topMediaTypes || []).map(m => ({ label: m.name, val: m.score, color: "var(--warning)", tag: "形态" })),
     ...(tp.topGenres || []).map(g => ({ label: g.name, val: g.score, color: "var(--accent)", tag: "题材" })),
     ...(tp.topRegions || []).map(r => ({ label: r.name, val: r.score, color: "var(--purple)", tag: "地区" })),
     ...(tp.topDirectors || []).map(x => ({ label: x.name, val: x.score, color: "var(--success)", tag: "导演" })),
@@ -1027,8 +1058,10 @@ async function load(manual){
 
   document.getElementById("overviewEventBadge").textContent = (tp.eventCount || 0) + " 条行为";
   const allQuickChips = [
+    ...(likes.mediaTypes || []).map(m => '<span class="badge warning">📺 ' + esc(m) + '</span>'),
     ...(likes.genres || []).map(g => '<span class="badge accent">❤️ ' + esc(g) + '</span>'),
     ...(likes.favoriteSeeds || []).map(s => '<span class="badge purple">🎬 《' + esc(s) + '》</span>'),
+    ...(dislikes.mediaTypes || []).map(m => '<span class="badge danger">🚫 ' + esc(m) + '</span>'),
     ...(dislikes.genres || []).map(g => '<span class="badge danger">🚫 ' + esc(g) + '</span>'),
   ];
   document.getElementById("overviewProfileChips").innerHTML = allQuickChips.length
@@ -1047,6 +1080,25 @@ async function load(manual){
   ).join("");
 
   // Profile Tab
+  const personaPill = document.getElementById("personaSummaryPill");
+  if (personaPill) {
+    personaPill.textContent = (tp.personaLabel || "冷启动") + " · 置信度 " + (tp.confidence || 0) + "%";
+  }
+  const likedMediaSet = new Set((likes.mediaTypes || []).map(m => m.toLowerCase()));
+  const qmEl = document.getElementById("quickMediaChips");
+  if (qmEl) {
+    qmEl.innerHTML = QUICK_MEDIA_TYPES.map(m => {
+      const active = likedMediaSet.has(m.toLowerCase());
+      return '<button class="pill-btn ' + (active ? 'accent' : '') + '" data-mt="' + esc(m) + '" data-active="' + (active ? '1' : '0') + '">' + (active ? '✓ ' : '+ ') + esc(m) + '</button>';
+    }).join("");
+    qmEl.querySelectorAll('button').forEach(btn => {
+      btn.onclick = async () => {
+        if (btn.getAttribute('data-active') === '1') await removeProfileTag('likeMediaTypes', btn.getAttribute('data-mt'));
+        else await submitProfileAdd('likeMediaTypes', btn.getAttribute('data-mt'));
+      };
+    });
+  }
+
   const likedGenreSet = new Set((likes.genres || []).map(g => g.toLowerCase()));
   const qgEl = document.getElementById("quickGenreChips");
   qgEl.innerHTML = QUICK_GENRES.map(g => {
@@ -1065,6 +1117,7 @@ async function load(manual){
   renderRemovableChips("chipsLikeDirectors", likes.directors, "likeDirectors", "success");
   renderRemovableChips("chipsFavoriteSeeds", likes.favoriteSeeds, "favoriteSeeds", "purple");
   renderRemovableChips("chipsDislikeGenres", dislikes.genres, "dislikeGenres", "danger");
+  renderRemovableChips("chipsDislikeMediaTypes", dislikes.mediaTypes || [], "dislikeMediaTypes", "danger");
 
   const events = tp.recentEvents || [];
   document.getElementById("recentEventsBox").innerHTML = events.length

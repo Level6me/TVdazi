@@ -656,12 +656,12 @@ export class DeepSeekAgent {
                 like_media_types: {
                   type: 'array',
                   items: { type: 'string' },
-                  description: '用户喜欢的影视形态品类（如 ["电影", "电视剧", "综艺", "动漫", "纪录片", "短剧"]）',
+                  description: '用户喜欢的影视形态品类（如 ["电影", "电视剧", "国产剧", "美剧", "韩剧", "日剧", "英剧", "港剧", "台剧", "泰剧", "动画", "综艺", "纪录片", "短剧"]）',
                 },
                 dislike_media_types: {
                   type: 'array',
                   items: { type: 'string' },
-                  description: '用户不看或排斥的影视形态（如 ["短剧", "动漫"]）',
+                  description: '用户不看或排斥的影视形态（如 ["短剧", "综艺", "动画"]）',
                 },
                 like_genres: {
                   type: 'array',

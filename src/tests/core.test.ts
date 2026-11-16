@@ -539,6 +539,8 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
       assert.doesNotThrow(() => new vm.Script(scriptBody, { filename: `panel_script_${idx}.js` }));
     });
     const pageScript = scripts[1];
+    assert.ok(html.includes('id="quickMediaChips"'));
+    assert.ok(html.includes('id="personaSummaryPill"'));
     assert.ok(pageScript.includes('function refreshPanel'));
     assert.ok(pageScript.includes('function createWatch'));
     assert.ok(pageScript.includes('function probeChannelsNow'));
@@ -615,6 +617,25 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     assert.ok(probeJson.channels.topChannels.length > 0);
     assert.ok(probeJson.channels.topChannels[0].avgLatencyMs > 0);
     assert.ok(probeJson.channels.topChannels[0].score > 75);
+
+    // 5. Web 画像 API 支持全影视形态（电影/美剧/韩剧/动画/综艺等）增删与排雷
+    const mtAddRes = await fetch(`${baseUrl}/api/panel/profile?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', category: 'likeMediaTypes', value: '美剧, 韩剧, 动画, 综艺' }),
+    });
+    assert.equal(mtAddRes.status, 200);
+    const mtAddJson: any = await mtAddRes.json();
+    assert.deepEqual(mtAddJson.tasteProfile.explicitLikes.mediaTypes, ['美剧', '韩剧', '动画', '综艺']);
+
+    const mtDisRes = await fetch(`${baseUrl}/api/panel/profile?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', category: 'dislikeMediaTypes', value: '短剧' }),
+    });
+    assert.equal(mtDisRes.status, 200);
+    const mtDisJson: any = await mtDisRes.json();
+    assert.deepEqual(mtDisJson.tasteProfile.explicitDislikes.mediaTypes, ['短剧']);
   } finally {
     (axios as any).get = origAxiosGet;
     if (!hadHealthFile && fs.existsSync(healthFile)) {
@@ -638,13 +659,18 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
   svc.clearProfile(testUser);
 
   try {
-    const input = '我平时喜欢看韩国悬疑电影和搞笑综艺，最近也爱追《漫长的季节》这种剧，但是不喜欢恐怖片';
+    const input = '我平时喜欢看韩国悬疑电影、美剧、韩剧、动画和搞笑综艺，最近也爱追《漫长的季节》这种国产剧，但是不喜欢恐怖片和短剧';
     assert.equal(UserProfileService.isNaturalPreferenceStatement(input), true);
     assert.equal(UserProfileService.isNaturalPreferenceStatement('帮我搜一下流浪地球'), false);
 
     const { parsed, analysis } = svc.applyNaturalLanguagePreference(testUser, input);
     assert.ok(parsed.likeMediaTypes.includes('电影'));
+    assert.ok(parsed.likeMediaTypes.includes('美剧'));
+    assert.ok(parsed.likeMediaTypes.includes('韩剧'));
+    assert.ok(parsed.likeMediaTypes.includes('动画'));
     assert.ok(parsed.likeMediaTypes.includes('综艺'));
+    assert.ok(parsed.likeMediaTypes.includes('国产剧'));
+    assert.ok(parsed.dislikeMediaTypes.includes('短剧'));
     assert.ok(parsed.likeGenres.includes('悬疑'));
     assert.ok(parsed.likeGenres.includes('喜剧'));
     assert.ok(parsed.likeRegions.includes('韩国'));
@@ -652,13 +678,59 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
     assert.ok(parsed.dislikeGenres.includes('恐怖'));
 
     assert.ok(analysis.confidence > 0);
-    assert.ok(analysis.mediaTypeDistribution.length >= 2);
+    assert.ok(analysis.mediaTypeDistribution.length >= 4);
     assert.ok(analysis.personaLabel.length > 2);
     assert.ok(analysis.recommendationStrategy.includes('MMR'));
+
+    // 验证算法打分支持全影视形态（美剧加分、动画加分、被屏蔽形态短剧返回 -Infinity）
+    const usDramaScore = svc.scoreCandidate(testUser, {
+      id: 'm1',
+      title: '绝命毒师',
+      rate: '9.7',
+      region: '美国',
+      episodesCount: '13',
+      types: ['剧情', '犯罪'],
+      cover: '',
+      url: '',
+    });
+    const animeScore = svc.scoreCandidate(testUser, {
+      id: 'a1',
+      title: '葬送的芙莉莲',
+      rate: '9.5',
+      region: '日本',
+      episodesCount: '28',
+      types: ['动画', '奇幻'],
+      cover: '',
+      url: '',
+    });
+    const shortDramaScore = svc.scoreCandidate(testUser, {
+      id: 's1',
+      title: '霸总短剧',
+      rate: '6.0',
+      types: ['短剧'],
+      cover: '',
+      url: '',
+    });
+    assert.ok(usDramaScore > 0);
+    assert.ok(animeScore > 0);
+    assert.equal(shortDramaScore, -Infinity);
+
+    // 验证隐式行为也可按全影视形态累计权重
+    await svc.recordImplicitBehavior(testUser, '请回答1988', 'save', {
+      mediaType: '韩剧',
+      genres: ['剧情', '喜剧'],
+      region: '韩国',
+      year: '2015',
+      skipLookup: true,
+    });
+    const webDetail = svc.getDetailedProfileForWeb(testUser);
+    assert.ok(webDetail.topMediaTypes.some((m) => m.name === '韩剧' && m.score > 5));
 
     const card = svc.renderProfileCard(testUser);
     assert.ok(card.includes('专属观影口味画像 · AI 算法分析'));
     assert.ok(card.includes('影视形态'));
+    assert.ok(card.includes('美剧'));
+    assert.ok(card.includes('动画'));
     assert.ok(card.includes('综艺'));
     assert.ok(card.includes('恐怖'));
 
@@ -667,9 +739,11 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
     delete process.env.DEEPSEEK_API_KEY;
     try {
       const agent = new DeepSeekAgent();
-      const reply = await agent.chat('我比较爱看美国科幻电影和脱口秀，不看古装剧', '__nl_agent_offline_test__');
+      const reply = await agent.chat('我比较爱看美剧、日剧、纪录片和脱口秀，不看古装剧', '__nl_agent_offline_test__');
       assert.ok(reply.includes('专属观影口味画像 · AI 算法分析'));
-      assert.ok(reply.includes('科幻'));
+      assert.ok(reply.includes('美剧'));
+      assert.ok(reply.includes('日剧'));
+      assert.ok(reply.includes('纪录片'));
       assert.ok(reply.includes('古装'));
     } finally {
       if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;

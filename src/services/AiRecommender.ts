@@ -196,26 +196,65 @@ export class AiRecommender {
     // 3. 解析载体类型 (mediaType & doubanTag)
     let mediaType: 'movie' | 'tv' = isFollowUp && prevSlots ? prevSlots.mediaType : fallbackType;
     let doubanTag = isFollowUp && prevSlots ? prevSlots.doubanTag : mediaType === 'movie' ? '电影' : '电视剧';
+    let hasExplicitMediaOrCountry = false;
 
     if (/(?:电影|大片|院线|影院|高分片|科幻片|动作片|恐怖片|喜剧片|爱情片|悬疑片|犯罪片|战争片|灾难片|港片)/.test(text)) {
       mediaType = 'movie';
       doubanTag = '电影';
+      hasExplicitMediaOrCountry = true;
     } else if (/(?:动漫|动画|番剧|日漫|国漫)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '动画';
-    } else if (/(?:综艺|真人秀|脱口秀|恋综)/.test(text)) {
+      hasExplicitMediaOrCountry = true;
+    } else if (/(?:综艺|真人秀|脱口秀|恋综|音综)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '综艺';
+      hasExplicitMediaOrCountry = true;
     } else if (/(?:纪录片)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '纪录片';
-    } else if (/(?:剧|韩剧|美剧|英剧|日剧|国产剧|港剧|台剧|泰剧|连续剧|网剧)/.test(text)) {
+      hasExplicitMediaOrCountry = true;
+    } else if (/(?:短剧|微短剧|剧|韩剧|美剧|英剧|日剧|国产剧|港剧|台剧|泰剧|连续剧|网剧)/.test(text)) {
       mediaType = 'tv';
       doubanTag = '电视剧';
+      hasExplicitMediaOrCountry = true;
+    }
+
+    // 若用户未显式限定形态/地区（如“按我口味推荐”“猜我喜欢”），从用户画像继承最偏好的形态与地区
+    let profilePreferredCountry: string | undefined;
+    if (!hasExplicitMediaOrCountry && !isFollowUp && userId && (!fallbackTag || fallbackTag === '热门')) {
+      const topMedia = UserProfileService.getInstance().analyzeUserProfile(userId).mediaTypeDistribution[0]?.name;
+      if (topMedia === '电影') {
+        mediaType = 'movie';
+        doubanTag = '电影';
+      } else if (topMedia === '动画') {
+        mediaType = 'tv';
+        doubanTag = '动画';
+      } else if (topMedia === '综艺') {
+        mediaType = 'tv';
+        doubanTag = '综艺';
+      } else if (topMedia === '纪录片') {
+        mediaType = 'tv';
+        doubanTag = '纪录片';
+      } else if (topMedia && /(?:剧)$/.test(topMedia)) {
+        mediaType = 'tv';
+        doubanTag = '电视剧';
+        const regionFromMt: Record<string, string> = {
+          美剧: '美国',
+          韩剧: '韩国',
+          日剧: '日本',
+          英剧: '英国',
+          港剧: '中国香港',
+          台剧: '中国台湾',
+          泰剧: '泰国',
+          国产剧: '中国大陆',
+        };
+        profilePreferredCountry = regionFromMt[topMedia];
+      }
     }
 
     // 4. 解析国家/地区偏好 (country，支持豆瓣 14+ 常见国家地区)
-    let country: string | undefined = isFollowUp && prevSlots ? prevSlots.country : undefined;
+    let country: string | undefined = isFollowUp && prevSlots ? prevSlots.country : profilePreferredCountry;
     const combined = `${text} ${fallbackTag}`;
     if (/韩剧|韩国|韩影/.test(combined)) country = '韩国';
     else if (/美剧|美国|好莱坞/.test(combined)) country = '美国';

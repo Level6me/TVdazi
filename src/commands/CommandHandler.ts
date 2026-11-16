@@ -600,9 +600,11 @@ export class CommandHandler {
         const skipped = hotSession.items[0];
         UserProfileService.getInstance()
           .recordImplicitBehavior(userId, skipped.title, 'skip', {
+            mediaType: hotSession.type === 'movie' ? '电影' : hotSession.tag && hotSession.tag !== '热门' ? hotSession.tag : undefined,
             genres: skipped.types || [],
             region: skipped.region,
             year: skipped.year,
+            episodesCount: skipped.episodesCount,
             skipLookup: true,
           })
           .catch(() => {});
@@ -679,7 +681,9 @@ export class CommandHandler {
         if (res.success) {
           this.userManager.recordSave(userId, item.title, item.shareUrl, category);
           UserProfileService.getInstance()
-            .recordImplicitBehavior(userId, standardTitle || item.title, 'save')
+            .recordImplicitBehavior(userId, standardTitle || item.title, 'save', {
+              mediaType: category,
+            })
             .catch(() => {});
           WebhookService.notifyMediaSaved(userPlan.webhookUrl, {
             userId,
@@ -837,9 +841,11 @@ export class CommandHandler {
           this.userManager.recordSave(userId, title, cand.shareUrl, category);
           UserProfileService.getInstance()
             .recordImplicitBehavior(userId, title, 'save', {
+              mediaType: category,
               genres: subject.types || [],
               region: subject.region,
               year: subject.year,
+              episodesCount: subject.episodesCount,
             })
             .catch(() => {});
           const failoverTip = idx > 0 ? `（前 ${idx} 条链接已失效，已自动为你顺延命中有效活链 ⚡）` : '';
@@ -1195,6 +1201,7 @@ export class CommandHandler {
     const sessionKeyword = standardTitle || searchWord;
     UserProfileService.getInstance()
       .recordImplicitBehavior(userId, sessionKeyword, 'search', {
+        mediaType: searchMeta?.mediaType === 'movie' ? '电影' : res.items[0]?.category,
         year: searchMeta?.year || resolvedInfo?.year || doubanYear,
       })
       .catch(() => {});
