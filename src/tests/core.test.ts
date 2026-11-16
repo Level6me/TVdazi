@@ -23,6 +23,7 @@ import { RelayService } from '../services/RelayService';
 import { SessionManager } from '../services/SessionManager';
 import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 import { UserProfileService } from '../services/UserProfileService';
+import { UserManager } from '../services/UserManager';
 
 test('Logger.maskSensitive hides API keys, cookies and slash commands', () => {
   assert.equal(maskSensitive('/set-quark __pus=abc123; __kp=xyz'), '/set-quark [REDACTED]');
@@ -129,6 +130,9 @@ test('WatchlistService extracts movie titles from Xiaohongshu-style text and mul
 
   const fromLines = WatchlistService.extractTitlesFromText('1. 功夫\n2. 霸王别姬\n3. 无间道');
   assert.deepEqual(fromLines, ['功夫', '霸王别姬', '无间道']);
+
+  const fromMixed = WatchlistService.extractTitlesFromText('《沙丘2》\n2. 功夫\n3. 无间道');
+  assert.deepEqual(fromMixed, ['沙丘2', '功夫', '无间道']);
 });
 
 test('ScheduleTimeParser parses relative delays, clocks and movie titles accurately', () => {
@@ -783,5 +787,111 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
         } catch {}
       }, 60);
     }
+  }
+});
+
+test('Watchlist full lifecycle: episode tracking, cloud save sync, profile-weighted pick, markdown export & Web API', async () => {
+  const testUser = '__watchlist_full_test__';
+  const um = UserManager.getInstance();
+  const profileSvc = UserProfileService.getInstance();
+  const token = DashboardServer.issueUserToken(testUser);
+
+  const server = http.createServer((req, res) => {
+    DashboardServer.handleHttpRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    // 1. 验证 HTML 包含新版片单管理控件和弹窗
+    const htmlRes = await fetch(`${baseUrl}/panel?token=${encodeURIComponent(token)}`);
+    assert.equal(htmlRes.status, 200);
+    const html = await htmlRes.text();
+    assert.ok(html.includes('id="wlStatusTabs"'));
+    assert.ok(html.includes('id="wlQuickTitle"'));
+    assert.ok(html.includes('id="mediaActionModal"'));
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    assert.equal(/\?\./.test(scripts[1]), false);
+    assert.doesNotThrow(() => new vm.Script(scripts[1], { filename: 'panel_watchlist_check.js' }));
+
+    // 2. 添加剧集 + 更新集数至满集自动完成 + 备注
+    const addRes = await fetch(`${baseUrl}/api/panel/watchlist?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', title: '漫长的季节', category: '国产剧', enrich: false }),
+    });
+    assert.equal(addRes.status, 200);
+    um.updateWatchlistItem(testUser, '漫长的季节', { rating: '9.4', totalEpisodes: 2, genres: ['悬疑', '犯罪'] });
+
+    const ep1Res = await fetch(`${baseUrl}/api/panel/watchlist?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'episode', title: '漫长的季节', delta: 1 }),
+    });
+    const ep1Json: any = await ep1Res.json();
+    assert.equal(ep1Json.item.currentEpisode, 1);
+    assert.equal(ep1Json.item.status, 'saving');
+
+    const ep2Res = await fetch(`${baseUrl}/api/panel/watchlist?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'episode', title: '漫长的季节', delta: 1 }),
+    });
+    const ep2Json: any = await ep2Res.json();
+    assert.equal(ep2Json.item.currentEpisode, 2);
+    assert.equal(ep2Json.item.status, 'completed');
+
+    // 3. 验证画像抽签（推荐待看的高匹配高分片）
+    um.addToWatchlist(testUser, '信号', '韩剧');
+    um.updateWatchlistItem(testUser, '信号', { rating: '9.2', genres: ['悬疑', '犯罪'], region: '韩国' });
+    um.addToWatchlist(testUser, '普通电影', '电影');
+    um.updateWatchlistItem(testUser, '普通电影', { rating: '5.5', genres: ['爱情'] });
+    profileSvc.recordExplicitPreference(testUser, { likeMediaTypes: ['韩剧'], likeGenres: ['悬疑'] });
+
+    const pickRes = await fetch(`${baseUrl}/api/panel/watchlist?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'pick', count: 2 }),
+    });
+    const pickJson: any = await pickRes.json();
+    assert.equal(pickJson.ok, true);
+    assert.equal(pickJson.picks[0].item.title, '信号');
+
+    // 4. recordSave 自动将片单中作品标为已看且网盘已有
+    um.recordSave(testUser, '信号', 'https://pan.quark.cn/s/signal123', '韩剧', '/我的资源/韩剧/信号');
+    const savedSignal = um.getUserPlan(testUser).watchlist.find((w) => w.title === '信号');
+    assert.equal(savedSignal?.status, 'completed');
+    assert.equal(savedSignal?.inCloudDisk, true);
+    assert.equal(savedSignal?.cloudPath, '/我的资源/韩剧/信号');
+
+    // 5. Markdown 导出 & 命令联动（/片单抽签, /追剧 导出）
+    const expRes = await fetch(`${baseUrl}/api/panel/watchlist?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'export' }),
+    });
+    const expJson: any = await expRes.json();
+    assert.ok(expJson.markdown.includes('漫长的季节'));
+    assert.ok(expJson.markdown.includes('网盘已有'));
+
+    const handler = new CommandHandler();
+    const cmdList = await handler.handle('/追剧', testUser);
+    assert.ok(cmdList.includes('漫长的季节'));
+    assert.ok(cmdList.includes('网盘已有'));
+  } finally {
+    profileSvc.clearProfile(testUser);
+    const f = path.resolve(process.cwd(), 'data/users', `${Buffer.from(testUser).toString('hex')}.json`);
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {}
+    }, 60);
+    server.close();
   }
 });

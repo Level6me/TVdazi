@@ -12,6 +12,9 @@ import { ChannelManager } from '../services/ChannelManager';
 import { WatchlistService } from '../services/WatchlistService';
 import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
+import { ResourceSearcher } from '../services/Searcher';
+import { QuarkService } from '../services/QuarkService';
+import { CategoryClassifier } from '../services/CategoryClassifier';
 import { maskSensitive } from '../utils/Logger';
 import { upsertEnvVar } from '../utils/FileUtils';
 import { AUI_BUNDLE_CSS, AUI_BUNDLE_JS } from './auiBundle';
@@ -347,32 +350,231 @@ export class DashboardServer {
     }
 
     if (req.method === 'POST' && pathname === '/api/panel/watchlist') {
-      const action = String(body.action || '');
+      const action = String(body.action || '').trim();
+      const profileSvc = UserProfileService.getInstance();
+
       if (action === 'add' && body.title) {
-        const result = userManager.addToWatchlist(userId, String(body.title));
+        const cleanTitle = String(body.title).replace(/[《》]/g, '').trim();
+        const cat = typeof body.category === 'string' ? body.category.trim() : '';
+        const note = typeof body.note === 'string' ? body.note.trim() : '';
+        const result = userManager.addToWatchlist(userId, cleanTitle, cat, note);
+        if (result.success && body.enrich !== false) {
+          void WatchlistService.enrichWatchlistItem(userId, cleanTitle).catch(() => {});
+        }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify(result));
+        res.end(
+          JSON.stringify({
+            ok: result.success,
+            ...result,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
         return true;
       }
       if (action === 'import' && body.rawText) {
-        const titles = await WatchlistService.parseBatchInput(String(body.rawText));
-        const imported = userManager.importToWatchlist(userId, titles);
+        const parsed = await WatchlistService.parseBatchInputWithMeta(String(body.rawText));
+        const imported = userManager.importToWatchlist(
+          userId,
+          parsed.titles,
+          typeof body.category === 'string' ? body.category.trim() : ''
+        );
+        for (const t of imported.added.slice(0, 6)) {
+          void WatchlistService.enrichWatchlistItem(userId, t).catch(() => {});
+        }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: true, ...imported }));
+        res.end(
+          JSON.stringify({
+            ok: true,
+            ...imported,
+            notice: parsed.notice,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
         return true;
       }
       if (action === 'status' && body.title && body.status) {
-        const ok = userManager.updateWatchlistStatus(userId, String(body.title), body.status);
+        const nextStatus = body.status as 'planned' | 'saving' | 'completed';
+        const cleanTitle = String(body.title).replace(/[《》]/g, '').trim();
+        const ok = userManager.updateWatchlistStatus(userId, cleanTitle, nextStatus);
+        if (ok && nextStatus === 'completed') {
+          const item = userManager
+            .getUserPlan(userId)
+            .watchlist.find((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
+          void profileSvc
+            .recordImplicitBehavior(userId, cleanTitle, 'save', {
+              mediaType: item?.category,
+              genres: item?.genres || [],
+              region: item?.region,
+              year: item?.year,
+              episodesCount: item?.totalEpisodes ? String(item.totalEpisodes) : undefined,
+              skipLookup: Boolean(item?.genres && item.genres.length > 0),
+            })
+            .catch(() => {});
+        }
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok }));
+        res.end(JSON.stringify({ ok, watchlist: userManager.getUserPlan(userId).watchlist }));
+        return true;
+      }
+      if (action === 'episode' && body.title) {
+        const cleanTitle = String(body.title).replace(/[《》]/g, '').trim();
+        let updated = null;
+        if (typeof body.currentEpisode === 'number' && Number.isFinite(body.currentEpisode)) {
+          updated = userManager.updateWatchlistItem(userId, cleanTitle, {
+            currentEpisode: Math.max(0, Math.round(body.currentEpisode)),
+          });
+        } else {
+          const delta = Number(body.delta || 1);
+          updated = userManager.incrementWatchlistEpisode(userId, cleanTitle, Number.isFinite(delta) ? delta : 1);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: Boolean(updated),
+            item: updated,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
+        return true;
+      }
+      if (action === 'note' && body.title) {
+        const updated = userManager.updateWatchlistItem(userId, String(body.title), {
+          note: String(body.note || '').trim(),
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: Boolean(updated), item: updated, watchlist: userManager.getUserPlan(userId).watchlist }));
+        return true;
+      }
+      if (action === 'enrich') {
+        let enrichedCount = 0;
+        if (typeof body.title === 'string' && body.title.trim()) {
+          const item = await WatchlistService.enrichWatchlistItem(userId, body.title.trim());
+          if (item) enrichedCount = 1;
+        } else {
+          enrichedCount = await WatchlistService.enrichPendingItems(userId, 8);
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            enrichedCount,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
+        return true;
+      }
+      if (action === 'pick') {
+        const count = Math.min(5, Math.max(1, Number(body.count || 3)));
+        const picks = WatchlistService.pickFromWatchlist(userId, count);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, picks }));
+        return true;
+      }
+      if (action === 'sync_cloud') {
+        const syncRes = await WatchlistService.syncWithCloudDisk(userId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            ...syncRes,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
+        return true;
+      }
+      if (action === 'export') {
+        const markdown = WatchlistService.exportMarkdown(userId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, markdown }));
+        return true;
+      }
+      if (action === 'share' && body.title && body.targetName) {
+        const shareRes = await RelayService.getInstance().shareMovieToUser(userId, String(body.targetName), {
+          movieTitle: String(body.title),
+          recommendReason: typeof body.note === 'string' ? body.note : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: shareRes.success, message: shareRes.replyToSender }));
         return true;
       }
       if (action === 'remove' && body.title) {
         const ok = userManager.removeFromWatchlist(userId, String(body.title));
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok }));
+        res.end(JSON.stringify({ ok, watchlist: userManager.getUserPlan(userId).watchlist }));
         return true;
       }
+      res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: false, error: '无效的片单操作或缺少参数' }));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/panel/watchlist/search') {
+      const action = String(body.action || 'search').trim();
+      const title = String(body.title || '').replace(/[《》]/g, '').trim();
+      if (!title) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: '缺少片名' }));
+        return true;
+      }
+
+      if (action === 'save') {
+        const shareId = String(body.shareId || '').trim();
+        const passcode = String(body.passcode || '').trim();
+        const shareUrl = String(body.shareUrl || '').trim();
+        if (!shareId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '缺少网盘 shareId' }));
+          return true;
+        }
+        const plan = userManager.getUserPlan(userId);
+        const quark = new QuarkService();
+        const category = CategoryClassifier.classify(title, String(body.category || ''));
+        const saveRes = await quark.saveShareFiles(shareId, passcode, category, {
+          customCookie: plan.quarkCookie,
+          rootDir: plan.saveRootDir,
+          standardTitle: title,
+          userId,
+        });
+        if (saveRes.success) {
+          userManager.recordSave(userId, title, shareUrl || `https://pan.quark.cn/s/${shareId}`, category, saveRes.targetPath);
+          void UserProfileService.getInstance().recordImplicitBehavior(userId, title, 'save', { mediaType: category }).catch(() => {});
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: saveRes.success,
+            message: saveRes.message,
+            targetPath: saveRes.targetPath,
+            watchlist: userManager.getUserPlan(userId).watchlist,
+          })
+        );
+        return true;
+      }
+
+      const searcher = new ResourceSearcher();
+      const plan = userManager.getUserPlan(userId);
+      const searchRes = await searcher.search({
+        keyword: title,
+        quality: plan.preferences?.preferredQuality,
+        maxResults: 8,
+      });
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          title,
+          items: (searchRes.items || []).slice(0, 8).map((item) => ({
+            title: item.title,
+            panType: item.panType,
+            shareUrl: item.shareUrl,
+            shareId: item.shareId,
+            passcode: item.passcode || '',
+            category: item.category,
+            qualityBadges: item.qualityTags?.badges || [],
+            sourceChannel: item.sourceChannel || '',
+          })),
+        })
+      );
+      return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/panel/tasks') {
@@ -638,6 +840,16 @@ ${AUI_BUNDLE_CSS}
 .viz-rank-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;font-weight:600;min-width:0;}
 .viz-rank-row span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .viz-strategy{margin-top:12px;padding:10px 12px;border-radius:12px;background:var(--accent-bg);color:var(--accent);font-size:12px;font-weight:600;line-height:1.6;}
+.wl-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;}
+.wl-card{padding:11px 0;border-bottom:1px solid var(--border-subtle);}
+.wl-card:last-child{border-bottom:none;}
+.wl-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;}
+.wl-title-wrap{min-width:0;flex:1;}
+.wl-title-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-weight:700;font-size:13.5px;}
+.wl-meta-line{display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--text-sec);margin-top:4px;}
+.wl-progress-row{display:flex;align-items:center;gap:8px;margin-top:6px;}
+.wl-progress-row .progress-track{flex:1;margin:0;}
+.wl-actions-row{display:flex;align-items:center;gap:6px;flex-wrap:wrap;margin-top:8px;}
 @media(max-width:960px){.viz-grid-3{grid-template-columns:repeat(2,minmax(0,1fr));}}
 @media(max-width:680px){.profile-hero{grid-template-columns:48px minmax(0,1fr);gap:12px;padding:16px;border-radius:18px;}.profile-mark{width:46px;height:46px;border-radius:15px;font-size:23px;}.profile-hero h2{font-size:18px;}.profile-hero-actions{grid-column:1/-1;justify-content:flex-end;}.profile-chart-row{grid-template-columns:minmax(72px,90px) minmax(40px,1fr) 34px;gap:7px;}.viz-grid-3{grid-template-columns:1fr;}.viz-people{grid-template-columns:1fr;}.viz-box{min-height:170px;}}
 </style>
@@ -895,14 +1107,65 @@ ${AUI_BUNDLE_CSS}
 
     <div class="card">
       <div class="card-header">
-        <div class="card-title">追剧片单与批量导入</div>
-        <span class="badge purple" id="watchlistCountBadge">0 部</span>
+        <div class="card-title">追剧片单与智能管理</div>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
+          <span class="badge purple" id="watchlistCountBadge">0 部</span>
+        </div>
       </div>
-      <textarea class="form-control" id="batchImport" rows="2" placeholder="粘贴豆瓣豆列链接、含《片名》文案或多行片名"></textarea>
-      <div style="margin-top:10px;display:flex;gap:8px;">
-        <button class="btn" onclick="importList()">批量导入</button>
+
+      <div class="inline-add" style="margin-top:0;">
+        <input class="form-control" id="wlQuickTitle" placeholder="输入想看的电影 / 剧集 / 动画 / 综艺" />
+        <select class="select-custom" id="wlQuickCat" style="max-width:110px;">
+          <option value="自动">自动分类</option>
+          <option value="电影">电影</option>
+          <option value="国产剧">国产剧</option>
+          <option value="美剧">美剧</option>
+          <option value="韩剧">韩剧</option>
+          <option value="日剧">日剧</option>
+          <option value="动画">动画</option>
+          <option value="综艺">综艺</option>
+          <option value="纪录片">纪录片</option>
+        </select>
+        <button class="btn" id="btnQuickAddWatch" onclick="quickAddWatch(this)">加入片单</button>
       </div>
-      <div id="watchlistBox" style="margin-top:12px;"></div>
+
+      <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
+        <button class="pill-btn accent" onclick="pickWatchlistTonight(this)">🎲 今晚看哪部</button>
+        <button class="pill-btn" onclick="enrichWatchlistNow(this)">✨ 补全豆瓣评分</button>
+        <button class="pill-btn" onclick="syncWatchlistCloud(this)">☁️ 网盘库存对账</button>
+        <button class="pill-btn" onclick="exportWatchlistNow(this)">📤 导出片单</button>
+      </div>
+
+      <div class="wl-toolbar">
+        <div class="segmented-control" id="wlStatusTabs" style="flex:1;min-width:210px;">
+          <button class="segment-btn active" data-st="all" onclick="setWlStatusFilter('all', this)">全部</button>
+          <button class="segment-btn" data-st="planned" onclick="setWlStatusFilter('planned', this)">想看</button>
+          <button class="segment-btn" data-st="saving" onclick="setWlStatusFilter('saving', this)">在追</button>
+          <button class="segment-btn" data-st="completed" onclick="setWlStatusFilter('completed', this)">已看</button>
+        </div>
+        <select class="select-custom" id="wlCatFilter" onchange="renderWatchlist()">
+          <option value="all">全部分类</option>
+        </select>
+        <select class="select-custom" id="wlSortBy" onchange="renderWatchlist()">
+          <option value="newest">最新加入</option>
+          <option value="rating">豆瓣高分</option>
+        </select>
+      </div>
+
+      <div class="search-box" style="margin-bottom:10px;">
+        <svg viewBox="0 0 24 24"><path d="M15.5 14h-.79l-.28-.27A6.471 6.471 0 0016 9.5 6.5 6.5 0 109.5 16c1.61 0 3.09-.59 4.23-1.57l.27.28v.79l5 4.99L20.49 19l-4.99-5zm-6 0C7.01 14 5 11.99 5 9.5S7.01 5 9.5 5 14 7.01 14 9.5 11.99 14 9.5 14z"/></svg>
+        <input id="wlSearch" placeholder="按片名、题材或备注筛选片单..." oninput="renderWatchlist()" />
+      </div>
+
+      <div id="watchlistBox"></div>
+
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--border-subtle);">
+        <div class="form-label">批量导入（豆瓣链接 / 《片名》文案 / 多行片名）</div>
+        <textarea class="form-control" id="batchImport" rows="2" placeholder="粘贴豆瓣豆列链接、含《片名》文案或多行片名"></textarea>
+        <div style="margin-top:8px;display:flex;gap:8px;">
+          <button class="btn secondary" onclick="importList()">批量导入</button>
+        </div>
+      </div>
     </div>
 
     <div class="card">
@@ -988,6 +1251,16 @@ ${AUI_BUNDLE_CSS}
     </div>
     <div class="bottom-spacer"></div>
   </main>
+</div>
+
+<div class="modal-overlay" id="mediaActionModal">
+  <div class="modal-card">
+    <div class="card-header" style="margin-bottom:10px;">
+      <div class="card-title" id="mediaModalTitle">详情</div>
+      <button class="icon-btn" onclick="closeModal('mediaActionModal')">✕</button>
+    </div>
+    <div id="mediaModalBody"></div>
+  </div>
 </div>
 
 <nav class="dock">
@@ -1462,21 +1735,16 @@ async function load(manual){
     : '<div style="color:var(--text-sec);font-size:13px;">暂无行为记录</div>';
 
   // Media & Tasks Tab
-  const wl = d.watchlist || [];
-  document.getElementById("watchlistCountBadge").textContent = wl.length + " 部";
-  const wb = document.getElementById("watchlistBox");
-  wb.innerHTML = wl.length
-    ? wl.map(w =>
-        '<div class="list-row"><span class="list-main">《' + esc(w.title) + '》 <span class="badge ' + (w.status === 'completed' ? 'success' : 'accent') + '">' + esc(w.status) + '</span></span>' +
-        '<div class="list-actions"><button class="pill-btn js-watch-done" data-title="' + esc(w.title) + '">已看</button><button class="pill-btn danger js-watch-del" data-title="' + esc(w.title) + '">删</button></div></div>'
-      ).join("")
-    : '<div style="color:var(--text-sec);font-size:13px;">暂无片单</div>';
-  wb.querySelectorAll(".js-watch-done").forEach(b => {
-    b.onclick = function(){ setStatus(this.getAttribute("data-title"), "completed", this); };
-  });
-  wb.querySelectorAll(".js-watch-del").forEach(b => {
-    b.onclick = function(){ delWatch(this.getAttribute("data-title"), this); };
-  });
+  window.__watchlistData = d.watchlist || [];
+  window.__contactsData = (d.contacts || []).filter(c => !c.isSelf);
+  const catSel = document.getElementById("wlCatFilter");
+  if (catSel) {
+    const prevCat = catSel.value || "all";
+    const cats = Array.from(new Set(window.__watchlistData.map(w => w.category || "未分类").filter(Boolean)));
+    catSel.innerHTML = '<option value="all">全部分类</option>' + cats.map(c => '<option value="' + esc(c) + '">' + esc(c) + '</option>').join("");
+    if (cats.indexOf(prevCat) !== -1) catSel.value = prevCat;
+  }
+  renderWatchlist();
 
   const tasks = (d.tasks || []).filter(t => t && t.id);
   document.getElementById("tasksCountBadge").textContent = tasks.length + " 个";
@@ -1618,6 +1886,144 @@ async function createWatch(btnEl){
   }
 }
 
+let wlStatusFilter = "all";
+const WL_STATUS_TEXT = { planned: "想看", saving: "在追", completed: "已看" };
+const WL_STATUS_BADGE = { planned: "accent", saving: "warning", completed: "success" };
+
+function setWlStatusFilter(st, btnEl){
+  wlStatusFilter = st || "all";
+  const wrap = document.getElementById("wlStatusTabs");
+  if (wrap) {
+    wrap.querySelectorAll("button").forEach(b => b.classList.remove("active"));
+    if (btnEl) btnEl.classList.add("active");
+  }
+  renderWatchlist();
+}
+
+function renderWatchlist(){
+  const all = window.__watchlistData || [];
+  const badge = document.getElementById("watchlistCountBadge");
+  const catEl = document.getElementById("wlCatFilter");
+  const sortEl = document.getElementById("wlSortBy");
+  const searchEl = document.getElementById("wlSearch");
+  const catVal = catEl ? catEl.value : "all";
+  const sortVal = sortEl ? sortEl.value : "newest";
+  const q = (searchEl && searchEl.value ? searchEl.value : "").trim().toLowerCase();
+
+  let filtered = all.filter(w => {
+    if (wlStatusFilter !== "all" && w.status !== wlStatusFilter) return false;
+    if (catVal !== "all" && (w.category || "未分类") !== catVal) return false;
+    if (q) {
+      const hay = ((w.title || "") + " " + (w.category || "") + " " + (w.note || "") + " " + ((w.genres || []).join(" "))).toLowerCase();
+      if (hay.indexOf(q) === -1) return false;
+    }
+    return true;
+  });
+
+  if (sortVal === "rating") {
+    filtered = filtered.slice().sort((a, b) => (parseFloat(b.rating || "0") || 0) - (parseFloat(a.rating || "0") || 0));
+  } else {
+    filtered = filtered.slice().sort((a, b) => (Number(b.addedAt) || 0) - (Number(a.addedAt) || 0));
+  }
+
+  if (badge) badge.textContent = filtered.length + " / " + all.length + " 部";
+  const wb = document.getElementById("watchlistBox");
+  if (!wb) return;
+  if (!filtered.length) {
+    wb.innerHTML = '<div style="color:var(--text-sec);font-size:13px;padding:12px 0;">' + (all.length ? "当前筛选条件下没有匹配作品" : "暂无片单，在上方输入片名或粘贴豆列即可导入") + '</div>';
+    return;
+  }
+
+  wb.innerHTML = filtered.map(w => {
+    const st = w.status || "planned";
+    const stLabel = WL_STATUS_TEXT[st] || st;
+    const stCls = WL_STATUS_BADGE[st] || "accent";
+    const nextStatus = st === "completed" ? "planned" : "completed";
+    const nextBtnText = st === "completed" ? "改想看" : "标已看";
+    const epCur = Number(w.currentEpisode) || 0;
+    const epTot = Number(w.totalEpisodes) || 0;
+    const showEp = w.type === "tv" || epCur > 0 || epTot > 0;
+    const pct = epTot > 0 ? Math.min(100, Math.round(epCur / epTot * 100)) : (epCur > 0 ? 45 : 0);
+
+    const metaParts = [];
+    if (w.category) metaParts.push(esc(w.category));
+    if (w.year) metaParts.push(esc(w.year));
+    if (w.region) metaParts.push(esc(w.region));
+    if (w.genres && w.genres.length) metaParts.push(esc(w.genres.slice(0, 3).join("/")));
+    if (w.note) metaParts.push("📝 " + esc(w.note));
+
+    return '<div class="wl-card">' +
+      '<div class="wl-top"><div class="wl-title-wrap">' +
+        '<div class="wl-title-line"><span>《' + esc(w.title) + '》</span>' +
+          '<span class="badge ' + stCls + '">' + esc(stLabel) + '</span>' +
+          (w.rating ? '<span class="badge warning">⭐ ' + esc(w.rating) + '</span>' : '') +
+          (w.inCloudDisk ? '<span class="badge success">☁️ 已存</span>' : '') +
+        '</div>' +
+        (metaParts.length ? '<div class="wl-meta-line">' + metaParts.join(" · ") + '</div>' : '') +
+      '</div></div>' +
+      (showEp ? '<div class="wl-progress-row"><div class="progress-track"><div class="progress-fill ' + (pct >= 100 ? 'success' : '') + '" style="width:' + pct + '%"></div></div><span class="mono-sub" style="margin:0;white-space:nowrap;">' + (epTot > 0 ? ('第 ' + epCur + '/' + epTot + ' 集') : ('已看 ' + epCur + ' 集')) + '</span><button class="pill-btn js-watch-ep" data-title="' + esc(w.title) + '">+1集</button></div>' : '') +
+      '<div class="wl-actions-row">' +
+        '<button class="pill-btn accent js-watch-search" data-title="' + esc(w.title) + '" data-cat="' + esc(w.category || '') + '">搜链转存</button>' +
+        '<button class="pill-btn js-watch-chase" data-title="' + esc(w.title) + '" data-type="' + esc(w.type || 'movie') + '">转追更</button>' +
+        (st === "planned" ? '<button class="pill-btn js-watch-status" data-title="' + esc(w.title) + '" data-status="saving">设为在追</button>' : '') +
+        '<button class="pill-btn js-watch-status" data-title="' + esc(w.title) + '" data-status="' + nextStatus + '">' + nextBtnText + '</button>' +
+        '<button class="pill-btn js-watch-share" data-title="' + esc(w.title) + '">安利</button>' +
+        '<button class="pill-btn js-watch-note" data-title="' + esc(w.title) + '" data-note="' + esc(w.note || '') + '">备注</button>' +
+        '<button class="pill-btn danger js-watch-del" data-title="' + esc(w.title) + '">删</button>' +
+      '</div>' +
+    '</div>';
+  }).join("");
+
+  wb.querySelectorAll(".js-watch-status").forEach(b => {
+    b.onclick = function(){ setStatus(this.getAttribute("data-title"), this.getAttribute("data-status"), this); };
+  });
+  wb.querySelectorAll(".js-watch-ep").forEach(b => {
+    b.onclick = function(){ bumpEpisode(this.getAttribute("data-title"), this); };
+  });
+  wb.querySelectorAll(".js-watch-search").forEach(b => {
+    b.onclick = function(){ searchWatchItem(this.getAttribute("data-title"), this.getAttribute("data-cat"), this); };
+  });
+  wb.querySelectorAll(".js-watch-chase").forEach(b => {
+    b.onclick = function(){ watchItemToChase(this.getAttribute("data-title"), this.getAttribute("data-type"), this); };
+  });
+  wb.querySelectorAll(".js-watch-share").forEach(b => {
+    b.onclick = function(){ openShareWatchModal(this.getAttribute("data-title")); };
+  });
+  wb.querySelectorAll(".js-watch-note").forEach(b => {
+    b.onclick = function(){ editWatchNote(this.getAttribute("data-title"), this.getAttribute("data-note")); };
+  });
+  wb.querySelectorAll(".js-watch-del").forEach(b => {
+    b.onclick = function(){ delWatch(this.getAttribute("data-title"), this); };
+  });
+}
+
+async function quickAddWatch(btnEl){
+  const input = document.getElementById("wlQuickTitle");
+  const catEl = document.getElementById("wlQuickCat");
+  const title = (input && input.value ? input.value : "").trim();
+  if (!title) {
+    toast("请输入电影或剧集片名");
+    return;
+  }
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", {
+      action: "add",
+      title: title,
+      category: catEl ? catEl.value : "自动"
+    });
+    if (r && r.ok !== false) {
+      input.value = "";
+      toast("已加入片单，后台正在补全豆瓣信息");
+      await load(false);
+    } else {
+      toast((r && (r.message || r.error)) || "添加失败");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
 async function importList(){
   const rawText = document.getElementById("batchImport").value;
   if (!rawText.trim()) return;
@@ -1628,7 +2034,11 @@ async function importList(){
   }
   document.getElementById("batchImport").value = "";
   const addedCount = (r && r.added && r.added.length) ? r.added.length : 0;
-  toast("新增收录 " + addedCount + " 部");
+  if (r && r.notice && addedCount === 0) {
+    toast(r.notice, 3800);
+  } else {
+    toast("新增收录 " + addedCount + " 部");
+  }
   await load(false);
 }
 
@@ -1640,8 +2050,243 @@ async function setStatus(title, status, btnEl){
       toast(r.error || "更新片单失败");
       return;
     }
-    toast("已标为已看");
+    toast(status === "completed" ? "已标为已看并学习偏好" : status === "saving" ? "已设为在追" : "已改回想看");
     await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function bumpEpisode(title, btnEl){
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", { action:"episode", title:title, delta:1 });
+    if (r && r.ok !== false) {
+      const ep = r.item ? r.item.currentEpisode : "";
+      toast("《" + title + "》已看到第 " + ep + " 集");
+      await load(false);
+    } else {
+      toast((r && r.error) || "更新进度失败");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function editWatchNote(title, prevNote){
+  const next = window.prompt("为《" + title + "》添加备注：", prevNote || "");
+  if (next === null) return;
+  const r = await api("/api/panel/watchlist", { action:"note", title:title, note:next });
+  if (r && r.ok !== false) {
+    toast("备注已保存");
+    await load(false);
+  } else {
+    toast((r && r.error) || "保存备注失败");
+  }
+}
+
+async function pickWatchlistTonight(btnEl){
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", { action:"pick", count:3 });
+    if (!r || r.ok === false) {
+      toast((r && r.error) || "抽签失败");
+      return;
+    }
+    const picks = r.picks || [];
+    document.getElementById("mediaModalTitle").textContent = "🎲 今晚看哪部 · 画像加权推荐";
+    document.getElementById("mediaModalBody").innerHTML = picks.length
+      ? picks.map((p, i) => {
+          const it = p.item || {};
+          return '<div class="diag-row-item"><div class="diag-row-header"><span style="font-weight:700;font-size:14px;">' + (i + 1) + '. 《' + esc(it.title) + '》</span>' +
+            (it.rating ? '<span class="badge warning">⭐ ' + esc(it.rating) + '</span>' : '') + '</div>' +
+            '<div class="mono-sub" style="margin:4px 0 8px;">' + esc((p.reasons || []).join(" · ")) + '</div>' +
+            '<div style="display:flex;gap:8px;"><button class="pill-btn accent js-pick-search" data-title="' + esc(it.title) + '" data-cat="' + esc(it.category || '') + '">立即搜链转存</button></div></div>';
+        }).join("")
+      : '<div style="color:var(--text-sec);font-size:13px;">片单暂无待看作品，先加入几部电影或剧集吧~</div>';
+    document.getElementById("mediaModalBody").querySelectorAll(".js-pick-search").forEach(b => {
+      b.onclick = function(){
+        closeModal("mediaActionModal");
+        searchWatchItem(this.getAttribute("data-title"), this.getAttribute("data-cat"));
+      };
+    });
+    openModal("mediaActionModal");
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function enrichWatchlistNow(btnEl){
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = "补全中..."; }
+  try {
+    const r = await api("/api/panel/watchlist", { action:"enrich" });
+    if (r && r.ok !== false) {
+      toast("已补全 " + (r.enrichedCount || 0) + " 部作品豆瓣信息");
+      await load(false);
+    } else {
+      toast((r && r.error) || "补全失败");
+    }
+  } finally {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = "✨ 补全豆瓣评分"; }
+  }
+}
+
+async function syncWatchlistCloud(btnEl){
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = "对账中..."; }
+  try {
+    const r = await api("/api/panel/watchlist", { action:"sync_cloud" });
+    if (!r || r.ok === false) {
+      toast((r && r.error) || "网盘对账失败");
+      return;
+    }
+    if (!r.configured) {
+      toast("请先在设置页绑定夸克 Cookie 后对账");
+      return;
+    }
+    toast("已扫描 " + (r.checkedFolders || 0) + " 个目录，命中 " + ((r.matchedTitles && r.matchedTitles.length) || 0) + " 部已存作品");
+    await load(false);
+  } finally {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = "☁️ 网盘库存对账"; }
+  }
+}
+
+async function exportWatchlistNow(btnEl){
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", { action:"export" });
+    if (!r || r.ok === false) {
+      toast((r && r.error) || "导出失败");
+      return;
+    }
+    const md = r.markdown || "";
+    document.getElementById("mediaModalTitle").textContent = "📤 片单 Markdown 导出";
+    document.getElementById("mediaModalBody").innerHTML =
+      '<textarea class="form-control" id="wlExportArea" rows="10" readonly>' + esc(md) + '</textarea>' +
+      '<div style="margin-top:10px;display:flex;justify-content:flex-end;gap:8px;"><button class="btn" onclick="copyWlExport()">一键复制</button></div>';
+    openModal("mediaActionModal");
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+function copyWlExport(){
+  const el = document.getElementById("wlExportArea");
+  if (!el) return;
+  el.select();
+  try { document.execCommand("copy"); toast("已复制到剪贴板"); } catch (e) { toast("请长按全选复制"); }
+}
+
+async function searchWatchItem(title, category, btnEl){
+  if (!title) return;
+  if (btnEl) btnEl.disabled = true;
+  document.getElementById("mediaModalTitle").textContent = "🔍 搜链转存 · 《" + title + "》";
+  document.getElementById("mediaModalBody").innerHTML = '<div style="color:var(--text-sec);font-size:13px;padding:14px 0;">正在检索 50+ 资源频道...</div>';
+  openModal("mediaActionModal");
+  try {
+    const r = await api("/api/panel/watchlist/search", { action:"search", title:title });
+    const items = (r && r.items) || [];
+    if (!items.length) {
+      document.getElementById("mediaModalBody").innerHTML =
+        '<div style="color:var(--text-sec);font-size:13px;margin-bottom:12px;">暂未搜到《' + esc(title) + '》公开活链，可以一键加入后台蹲守监控，出资源立刻微信通知你！</div>' +
+        '<button class="btn js-empty-chase" data-title="' + esc(title) + '">转入新片蹲守</button>';
+      const chaseBtn = document.getElementById("mediaModalBody").querySelector(".js-empty-chase");
+      if (chaseBtn) {
+        chaseBtn.onclick = function(){
+          closeModal("mediaActionModal");
+          watchItemToChase(this.getAttribute("data-title"), "movie");
+        };
+      }
+      return;
+    }
+    document.getElementById("mediaModalBody").innerHTML = items.map(it => {
+      const canSave = it.panType === "quark" && it.shareId;
+      const badges = (it.qualityBadges || []).slice(0, 3).map(b => '<span class="badge neutral">' + esc(b) + '</span>').join(" ");
+      return '<div class="diag-row-item"><div class="diag-row-header"><span style="font-weight:700;font-size:13px;">' + esc(it.title) + '</span><span class="badge accent">' + esc(it.panType) + '</span></div>' +
+        (badges ? '<div class="chip-wrap" style="margin:4px 0 6px;">' + badges + '</div>' : '') +
+        '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;"><span class="mono-sub" style="margin:0;">@' + esc(it.sourceChannel || "tg") + '</span>' +
+        (canSave ? '<button class="pill-btn success js-save-cand" data-title="' + esc(title) + '" data-sid="' + esc(it.shareId) + '" data-pwd="' + esc(it.passcode || '') + '" data-url="' + esc(it.shareUrl || '') + '" data-cat="' + esc(category || it.category || '') + '">转存夸克</button>' : '<a class="pill-btn" href="' + esc(it.shareUrl) + '" target="_blank">打开链接</a>') +
+        '</div></div>';
+    }).join("");
+    document.getElementById("mediaModalBody").querySelectorAll(".js-save-cand").forEach(b => {
+      b.onclick = function(){
+        saveWatchCandidate(this.getAttribute("data-title"), this.getAttribute("data-sid"), this.getAttribute("data-pwd"), this.getAttribute("data-url"), this.getAttribute("data-cat"), this);
+      };
+    });
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function saveWatchCandidate(title, shareId, passcode, shareUrl, category, btnEl){
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = "转存中..."; }
+  try {
+    const r = await api("/api/panel/watchlist/search", {
+      action:"save", title:title, shareId:shareId, passcode:passcode, shareUrl:shareUrl, category:category
+    });
+    if (r && r.ok) {
+      toast("转存成功：" + (r.targetPath || "已存入夸克网盘"));
+      closeModal("mediaActionModal");
+      await load(false);
+    } else {
+      toast((r && r.message) || "转存失败，请尝试其他链接");
+      if (btnEl) { btnEl.disabled = false; btnEl.textContent = "转存夸克"; }
+    }
+  } catch (e) {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = "转存夸克"; }
+  }
+}
+
+async function watchItemToChase(title, mediaType, btnEl){
+  if (!title) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const mode = mediaType === "tv" ? "episode_chase" : "resource_watch";
+    const r = await api("/api/panel/tasks", {
+      action:"create_watch", title:title, mode:mode, intervalMinutes:30, autoSave:true
+    });
+    if (r && r.ok !== false) {
+      toast("已为《" + title + "》开启追更通知");
+      await load(false);
+    } else {
+      toast((r && r.error) || "创建追更失败");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+function openShareWatchModal(title){
+  const contacts = window.__contactsData || [];
+  document.getElementById("mediaModalTitle").textContent = "💌 安利《" + title + "》给好友";
+  if (!contacts.length) {
+    document.getElementById("mediaModalBody").innerHTML = '<div style="color:var(--text-sec);font-size:13px;">通讯录暂无其他微信好友，让朋友也给 Bot 发条消息就会出现在这里~</div>';
+    openModal("mediaActionModal");
+    return;
+  }
+  document.getElementById("mediaModalBody").innerHTML =
+    '<div class="form-group"><label class="form-label">选择好友</label><select class="form-control" id="shareTargetSelect">' +
+    contacts.map(c => '<option value="' + esc(c.displayName) + '">' + esc(c.displayName) + '</option>').join("") +
+    '</select></div>' +
+    '<div class="form-group"><label class="form-label">附带推荐语</label><input class="form-control" id="shareNoteInput" value="这部很不错，推荐给你看看！" /></div>' +
+    '<div style="display:flex;justify-content:flex-end;"><button class="btn js-confirm-share" data-title="' + esc(title) + '">发送安利卡片</button></div>';
+  const shareBtn = document.getElementById("mediaModalBody").querySelector(".js-confirm-share");
+  if (shareBtn) {
+    shareBtn.onclick = function(){ confirmShareWatch(this.getAttribute("data-title"), this); };
+  }
+  openModal("mediaActionModal");
+}
+
+async function confirmShareWatch(title, btnEl){
+  const sel = document.getElementById("shareTargetSelect");
+  const noteEl = document.getElementById("shareNoteInput");
+  if (!sel) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/watchlist", {
+      action:"share", title:title, targetName:sel.value, note:noteEl ? noteEl.value : ""
+    });
+    toast((r && r.message) || (r && r.ok ? "已发送安利" : "发送失败"));
+    if (r && r.ok) closeModal("mediaActionModal");
   } finally {
     if (btnEl) btnEl.disabled = false;
   }

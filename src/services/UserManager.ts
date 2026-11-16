@@ -1,6 +1,28 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { SerializedJsonStore } from '../utils/StorageQueue';
+import { CategoryClassifier } from './CategoryClassifier';
+
+export interface WatchlistItem {
+  title: string;
+  type: 'movie' | 'tv';
+  category?: string;
+  status: 'planned' | 'saving' | 'completed';
+  currentEpisode?: number;
+  totalEpisodes?: number;
+  addedAt: number;
+  updatedAt?: number;
+  lastSavedUrl?: string;
+  note?: string;
+  rating?: string;
+  year?: string;
+  region?: string;
+  genres?: string[];
+  cover?: string;
+  doubanId?: string;
+  inCloudDisk?: boolean;
+  cloudPath?: string;
+}
 
 export interface UserPlan {
   // 基础身份
@@ -27,16 +49,15 @@ export interface UserPlan {
   deepseekModel?: string;
 
   // 影视追剧规划 / 订阅列表
-  watchlist: {
+  watchlist: WatchlistItem[];
+
+  /** 近期推荐记录，用于跨重启去重；仅保存必要的片名、豆瓣编号和时间。 */
+  recommendationHistory?: Array<{
     title: string;
-    type: 'movie' | 'tv';
-    category?: string;
-    status: 'planned' | 'saving' | 'completed';
-    currentEpisode?: number;
-    addedAt: number;
-    lastSavedUrl?: string;
-    note?: string;
-  }[];
+    id?: string;
+    year?: string;
+    recommendedAt: number;
+  }>;
 
   // 专属偏好设置
   preferences: {
@@ -247,7 +268,7 @@ export class UserManager {
     this.saveUserPlan(plan);
   }
 
-  recordSave(userId: string, title?: string, shareUrl?: string, category?: string) {
+  recordSave(userId: string, title?: string, shareUrl?: string, category?: string, cloudPath?: string) {
     const plan = this.getUserPlan(userId);
     plan.stats.totalSaves += 1;
     plan.stats.lastActiveAt = Date.now();
@@ -255,40 +276,52 @@ export class UserManager {
     if (title) {
       const cleanTitle = title.replace(/[《》]/g, '').trim();
       const existing = plan.watchlist.find((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
+      const resolvedCat = category || CategoryClassifier.classify(cleanTitle);
       const inferredType: 'movie' | 'tv' =
-        category && /剧|动漫|综艺|纪录片/.test(category) ? 'tv' : 'movie';
+        resolvedCat && /剧|动漫|动画|综艺|纪录片/.test(resolvedCat) ? 'tv' : 'movie';
       if (existing) {
         existing.status = 'completed';
-        existing.lastSavedUrl = shareUrl;
+        if (shareUrl) existing.lastSavedUrl = shareUrl;
+        existing.inCloudDisk = true;
+        if (cloudPath) existing.cloudPath = cloudPath;
+        existing.updatedAt = Date.now();
         if (category) existing.category = category;
       } else {
         plan.watchlist.push({
           title: cleanTitle,
           type: inferredType,
-          category,
+          category: resolvedCat,
           status: 'completed',
           addedAt: Date.now(),
+          updatedAt: Date.now(),
           lastSavedUrl: shareUrl,
+          inCloudDisk: true,
+          cloudPath,
         });
       }
     }
     this.saveUserPlan(plan);
   }
 
-  addToWatchlist(userId: string, title: string, category: string = '剧集', note: string = ''): { success: boolean; message: string } {
+  addToWatchlist(userId: string, title: string, category: string = '', note: string = ''): { success: boolean; message: string } {
     const plan = this.getUserPlan(userId);
     const cleanTitle = title.replace(/[《》]/g, '').trim();
+    if (!cleanTitle) {
+      return { success: false, message: '请输入有效的影视片名。' };
+    }
     const exists = plan.watchlist.some((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
     if (exists) {
       return { success: false, message: `《${cleanTitle}》已经在您的影视追剧清单中了。` };
     }
 
+    const resolvedCat = category && category !== '自动' ? category : CategoryClassifier.classify(cleanTitle);
     plan.watchlist.push({
       title: cleanTitle,
-      type: /剧|动漫|综艺|纪录片/.test(category) ? 'tv' : 'movie',
-      category,
+      type: /剧|动漫|动画|综艺|纪录片/.test(resolvedCat) ? 'tv' : 'movie',
+      category: resolvedCat,
       status: 'planned',
       addedAt: Date.now(),
+      updatedAt: Date.now(),
       note,
     });
     this.saveUserPlan(plan);
@@ -359,7 +392,7 @@ export class UserManager {
   importToWatchlist(
     userId: string,
     titles: string[],
-    category: string = '剧集'
+    category: string = ''
   ): { added: string[]; skipped: string[] } {
     const plan = this.getUserPlan(userId);
     const added: string[] = [];
@@ -373,12 +406,14 @@ export class UserManager {
         skipped.push(cleanTitle);
         continue;
       }
+      const resolvedCat = category && category !== '自动' ? category : CategoryClassifier.classify(cleanTitle);
       plan.watchlist.push({
         title: cleanTitle,
-        type: /电影/.test(category) ? 'movie' : 'tv',
-        category,
+        type: /剧|动漫|动画|综艺|纪录片/.test(resolvedCat) ? 'tv' : 'movie',
+        category: resolvedCat,
         status: 'planned',
         addedAt: Date.now(),
+        updatedAt: Date.now(),
       });
       added.push(cleanTitle);
     }
@@ -400,11 +435,44 @@ export class UserManager {
     const item = plan.watchlist.find((w) => w.title.trim().toLowerCase() === clean);
     if (!item) return false;
     item.status = status;
+    item.updatedAt = Date.now();
     if (currentEpisode !== undefined && Number.isFinite(currentEpisode)) {
-      item.currentEpisode = currentEpisode;
+      item.currentEpisode = Math.max(0, Math.round(currentEpisode));
     }
     this.saveUserPlan(plan);
     return true;
+  }
+
+  updateWatchlistItem(
+    userId: string,
+    title: string,
+    patch: Partial<Omit<WatchlistItem, 'title' | 'addedAt'>>
+  ): WatchlistItem | null {
+    const plan = this.getUserPlan(userId);
+    const clean = title.replace(/[《》]/g, '').trim().toLowerCase();
+    const item = plan.watchlist.find((w) => w.title.trim().toLowerCase() === clean);
+    if (!item) return null;
+    Object.assign(item, patch, { updatedAt: Date.now() });
+    this.saveUserPlan(plan);
+    return item;
+  }
+
+  incrementWatchlistEpisode(userId: string, title: string, delta: number = 1): WatchlistItem | null {
+    const plan = this.getUserPlan(userId);
+    const clean = title.replace(/[《》]/g, '').trim().toLowerCase();
+    const item = plan.watchlist.find((w) => w.title.trim().toLowerCase() === clean);
+    if (!item) return null;
+    const prev = Number(item.currentEpisode) || 0;
+    const next = Math.max(0, prev + delta);
+    item.currentEpisode = next;
+    if (item.totalEpisodes && item.totalEpisodes > 0 && next >= item.totalEpisodes) {
+      item.status = 'completed';
+    } else if (next > 0 && item.status === 'planned') {
+      item.status = 'saving';
+    }
+    item.updatedAt = Date.now();
+    this.saveUserPlan(plan);
+    return item;
   }
 
   setUserDeepSeekKey(userId: string, apiKey: string): void {

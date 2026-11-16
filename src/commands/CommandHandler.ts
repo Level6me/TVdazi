@@ -13,6 +13,7 @@ import { getPanRegistry } from '../services/pan';
 import { WebhookService } from '../services/WebhookService';
 import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
+import { WatchlistService } from '../services/WatchlistService';
 import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
@@ -78,7 +79,7 @@ export class CommandHandler {
 
     if (
       trimmed.startsWith('/') ||
-      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表|我的画像|观影画像|我的口味)(?:\s+.*)?$/i.test(
+      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|片单抽签|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表|我的画像|观影画像|我的口味)(?:\s+.*)?$/i.test(
         trimmed
       ) ||
       /^(?:我叫|叫我|我的名字叫|我的名字是)\s*[^\s，。！!？?]{1,20}$/.test(trimmed) ||
@@ -253,6 +254,10 @@ export class CommandHandler {
 
     if (['/watchlist', '/plan', '/追剧', '追剧', '追剧清单', '我的追剧', '/片单', '片单', '我的片单', '查看片单'].includes(cmd)) {
       return this.renderWatchlist(userId, args);
+    }
+
+    if (['/片单抽签', '片单抽签'].includes(cmd)) {
+      return this.renderWatchlist(userId, ['pick', ...args]);
     }
 
     if (['/hot', '/discover', '/排行', '排行榜', '/热门', '热门'].includes(cmd)) {
@@ -679,9 +684,9 @@ export class CommandHandler {
           userId: userId,
         });
         if (res.success) {
-          this.userManager.recordSave(userId, item.title, item.shareUrl, category);
+          this.userManager.recordSave(userId, item.title, item.shareUrl, category, res.targetPath);
           UserProfileService.getInstance()
-            .recordImplicitBehavior(userId, standardTitle || item.title, 'save', {
+            .recordImplicitBehavior(userId, item.title, 'save', {
               mediaType: category,
             })
             .catch(() => {});
@@ -838,7 +843,7 @@ export class CommandHandler {
           userId: userId,
         });
         if (saveRes.success) {
-          this.userManager.recordSave(userId, title, cand.shareUrl, category);
+          this.userManager.recordSave(userId, title, cand.shareUrl, category, saveRes.targetPath);
           UserProfileService.getInstance()
             .recordImplicitBehavior(userId, title, 'save', {
               mediaType: category,
@@ -1021,6 +1026,7 @@ export class CommandHandler {
               ...(correction.candidateKeywords || []),
             ],
             year: searchMeta?.year,
+            mediaType: searchMeta?.mediaType,
             userId,
             forceLlm: !searchMeta && hasForeign,
           })
@@ -1246,6 +1252,9 @@ export class CommandHandler {
         return '告诉我片名呀，例如：`/追剧 添加 庆余年2`';
       }
       const res = this.userManager.addToWatchlist(userId, title);
+      if (res.success) {
+        void WatchlistService.enrichWatchlistItem(userId, title).catch(() => {});
+      }
       return res.message;
     }
 
@@ -1258,6 +1267,55 @@ export class CommandHandler {
       return ok ? `好嘞，已从追剧清单中移除《${title}》` : `在你的清单里没找到《${title}》呢。`;
     }
 
+    if (['done', '已看', '看完'].includes(subCmd)) {
+      const title = args.slice(1).join(' ').trim();
+      if (!title) return '请指定片名，例如：`/追剧 已看 沙丘2`';
+      const ok = this.userManager.updateWatchlistStatus(userId, title, 'completed');
+      if (ok) {
+        void UserProfileService.getInstance().recordImplicitBehavior(userId, title, 'save').catch(() => {});
+        return `✅ 已将《${title}》标为「已看」，并同步学习至你的观影画像！`;
+      }
+      return `在你的片单里没找到《${title}》呢。`;
+    }
+
+    if (['watching', '在追', '追'].includes(subCmd)) {
+      const title = args.slice(1).join(' ').trim();
+      if (!title) return '请指定片名，例如：`/追剧 在追 漫长的季节`';
+      const ok = this.userManager.updateWatchlistStatus(userId, title, 'saving');
+      return ok ? `🔥 已将《${title}》设为「在追」状态！` : `在你的片单里没找到《${title}》呢。`;
+    }
+
+    if (['+1', 'ep', '进度', '看了一集'].includes(subCmd)) {
+      const title = args.slice(1).join(' ').trim();
+      if (!title) return '请指定片名，例如：`/追剧 +1 庆余年`';
+      const updated = this.userManager.incrementWatchlistEpisode(userId, title, 1);
+      if (!updated) return `在你的片单里没找到《${title}》呢。`;
+      const epStr = updated.totalEpisodes ? `第 ${updated.currentEpisode}/${updated.totalEpisodes} 集` : `第 ${updated.currentEpisode} 集`;
+      return updated.status === 'completed'
+        ? `🎉 《${updated.title}》已看到 ${epStr}，自动标为「已看」啦！`
+        : `📺 《${updated.title}》进度已更新至 ${epStr}~`;
+    }
+
+    if (['pick', '抽签', '今晚看哪部', '选一部'].includes(subCmd)) {
+      const picks = WatchlistService.pickFromWatchlist(userId, 3);
+      if (picks.length === 0) {
+        return '你的待看片单目前为空，先用 `/追剧 添加 <片名>` 或 `/import-list` 存几部吧~';
+      }
+      const lines = ['🎲 【今晚看哪部 · 画像智能抽签】', '----------------------------------------'];
+      picks.forEach((p, idx) => {
+        const rate = p.item.rating ? ` ⭐${p.item.rating}` : '';
+        const cat = p.item.category ? `[${p.item.category}] ` : '';
+        lines.push(`${idx + 1}. ${cat}《${p.item.title}》${rate}\n   💡 ${p.reasons.join(' · ')}`);
+      });
+      lines.push('----------------------------------------');
+      lines.push('💬 想看哪部，直接把片名发给我就帮你全网搜资源！');
+      return lines.join('\n');
+    }
+
+    if (['export', '导出'].includes(subCmd)) {
+      return WatchlistService.exportMarkdown(userId);
+    }
+
     const plan = this.userManager.getUserPlan(userId);
     const list = plan.watchlist;
     if (!list || list.length === 0) {
@@ -1267,18 +1325,27 @@ export class CommandHandler {
         '你的清单目前还是空的哦~',
         '💡 玩法技巧：',
         '• 发送「/追剧 添加 <剧名>」添加你想追的剧',
+        '• 发送「/片单抽签」让算法帮你从片单挑今晚看的片',
         '• 每次挑选序号转存成功后，我也会自动帮你收录到片单里！',
       ].join('\n');
     }
 
     let text = `📋 【你的个人追剧片单 (${list.length}部)】:\n----------------------------------------\n`;
     list.forEach((w, idx) => {
-      const statusIcon = w.status === 'completed' ? '✅ 已转存' : '⏳ 待看/更新中';
-      const dateStr = new Date(w.addedAt).toLocaleDateString('zh-CN');
-      text += `${idx + 1}. 《${w.title}》 [${statusIcon}] (${dateStr})\n`;
+      const statusLabel = w.status === 'completed' ? '✅已看' : w.status === 'saving' ? '🔥在追' : '⏳想看';
+      const catTag = w.category ? `[${w.category}] ` : '';
+      const rateTag = w.rating ? ` ⭐${w.rating}` : '';
+      const epTag =
+        w.currentEpisode && w.currentEpisode > 0
+          ? w.totalEpisodes
+            ? ` · ${w.currentEpisode}/${w.totalEpisodes}集`
+            : ` · 第${w.currentEpisode}集`
+          : '';
+      const cloudTag = w.inCloudDisk ? ' · ☁️网盘已有' : '';
+      text += `${idx + 1}. ${catTag}《${w.title}》${rateTag} [${statusLabel}${epTag}${cloudTag}]\n`;
     });
     text += `----------------------------------------\n`;
-    text += `💡 随时告诉我片名帮你搜资源；也可以发「/追剧 删除 <剧名>」清理记录。`;
+    text += `💡 支持 \`/追剧 已看 <片名>\`、\`/追剧 +1 <片名>\`、\`/片单抽签\` 或 \`/追剧 导出\``;
     return text.trim();
   }
 
