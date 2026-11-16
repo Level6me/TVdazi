@@ -773,10 +773,10 @@ ${AUI_BUNDLE_CSS}
 
       <div class="card">
         <div class="card-header">
-          <div class="card-title">快捷题材点选</div>
-          <span class="badge neutral">点选即可更新</span>
+          <div class="card-title">全题材细分类点选</div>
+          <span class="badge neutral" id="genreCatalogCount">39 类 · 点选更新</span>
       </div>
-      <div class="chip-wrap" id="quickGenreChips"></div>
+      <div id="quickGenreChips"></div>
     </div>
 
     <div class="grid-2">
@@ -788,7 +788,7 @@ ${AUI_BUNDLE_CSS}
         <div class="form-label">题材标签</div>
         <div class="chip-wrap" id="chipsLikeGenres"></div>
         <div class="inline-add">
-          <input class="form-control" id="inLikeGenres" placeholder="如：悬疑, 科幻" />
+          <input class="form-control" id="inLikeGenres" placeholder="更多自定义题材，如：公路, 克苏鲁, 黑色幽默" />
           <button class="btn" onclick="addProfileTag('likeGenres','inLikeGenres')">添加</button>
         </div>
         <div class="form-label" style="margin-top:14px;">国家 / 地区</div>
@@ -1015,7 +1015,12 @@ ${AUI_BUNDLE_JS}
 <script>
 const TOKEN = "${safeToken}";
 const QUICK_MEDIA_TYPES = ["电影","电视剧","国产剧","美剧","韩剧","日剧","英剧","港剧","台剧","泰剧","动画","综艺","纪录片","短剧"];
-const QUICK_GENRES = ["悬疑","科幻","犯罪","动作","喜剧","爱情","剧情","战争","动画","纪录片","奇幻","恐怖"];
+const QUICK_GENRE_GROUPS = [
+  { name:"悬疑与动作", items:["悬疑","犯罪","惊悚","恐怖","动作","冒险","灾难","谍战","黑帮"] },
+  { name:"脑洞与史诗", items:["科幻","奇幻","武侠","仙侠","末日","赛博朋克","历史","战争","西部"] },
+  { name:"情感与生活", items:["剧情","喜剧","爱情","家庭","青春","校园","治愈","职场","文艺"] },
+  { name:"专题与舞台", items:["古装","年代","传记","律政","医疗","运动","音乐","歌舞","美食","旅行","真人秀","脱口秀"] }
+];
 const ACTION_LABELS = { save:"转存", share:"安利", search:"搜片", skip:"跳过" };
 const ACTION_BADGES = { save:"success", share:"purple", search:"accent", skip:"warning" };
 
@@ -1422,14 +1427,17 @@ async function load(manual){
 
   const likedGenreSet = new Set((likes.genres || []).map(g => g.toLowerCase()));
   const qgEl = document.getElementById("quickGenreChips");
-  qgEl.innerHTML = QUICK_GENRES.map(g => {
-    const active = likedGenreSet.has(g.toLowerCase());
-    return '<button class="pill-btn ' + (active ? 'accent' : '') + '" data-genre="' + g + '" data-active="' + (active ? '1' : '0') + '">' + (active ? '✓ ' : '+ ') + g + '</button>';
-  }).join("");
+  qgEl.innerHTML = QUICK_GENRE_GROUPS.map((grp, idx) =>
+    '<div style="' + (idx > 0 ? 'margin-top:12px;' : '') + '"><div class="form-label" style="margin-bottom:6px;">' + esc(grp.name) + '</div><div class="chip-wrap">' +
+    grp.items.map(g => {
+      const active = likedGenreSet.has(g.toLowerCase());
+      return '<button class="pill-btn ' + (active ? 'accent' : '') + '" data-genre="' + esc(g) + '" data-active="' + (active ? '1' : '0') + '">' + (active ? '✓ ' : '+ ') + esc(g) + '</button>';
+    }).join("") + '</div></div>'
+  ).join("");
   qgEl.querySelectorAll('button').forEach(btn => {
     btn.onclick = async () => {
-      if (btn.dataset.active === '1') await removeProfileTag('likeGenres', btn.dataset.genre);
-      else await submitProfileAdd('likeGenres', btn.dataset.genre);
+      if (btn.getAttribute('data-active') === '1') await removeProfileTag('likeGenres', btn.getAttribute('data-genre'));
+      else await submitProfileAdd('likeGenres', btn.getAttribute('data-genre'));
     };
   });
 

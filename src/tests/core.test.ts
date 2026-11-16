@@ -547,6 +547,10 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     assert.ok(html.includes('id="vizTrend"'));
     assert.ok(html.includes('id="vizDecades"'));
     assert.ok(html.includes('id="vizPeople"'));
+    assert.ok(html.includes('QUICK_GENRE_GROUPS'));
+    assert.ok(html.includes('赛博朋克'));
+    assert.ok(html.includes('谍战'));
+    assert.ok(html.includes('律政'));
     assert.ok(pageScript.includes('function renderVizRadar'));
     assert.ok(pageScript.includes('function renderVizTrend'));
     assert.ok(pageScript.includes('function refreshPanel'));
@@ -681,6 +685,14 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
     assert.ok(parsed.dislikeMediaTypes.includes('短剧'));
     assert.ok(parsed.likeGenres.includes('悬疑'));
     assert.ok(parsed.likeGenres.includes('喜剧'));
+    const richParsed = svc.parseNaturalLanguagePreference('我平时喜欢看赛博朋克、谍战、律政、医疗、美食和治愈系电影，不喜欢惊悚');
+    assert.ok(richParsed.likeGenres.includes('赛博朋克'));
+    assert.ok(richParsed.likeGenres.includes('谍战'));
+    assert.ok(richParsed.likeGenres.includes('律政'));
+    assert.ok(richParsed.likeGenres.includes('医疗'));
+    assert.ok(richParsed.likeGenres.includes('美食'));
+    assert.ok(richParsed.likeGenres.includes('治愈'));
+    assert.ok(richParsed.dislikeGenres.includes('惊悚'));
     assert.ok(parsed.likeRegions.includes('韩国'));
     assert.ok(parsed.favoriteSeeds.includes('漫长的季节'));
     assert.ok(parsed.dislikeGenres.includes('恐怖'));

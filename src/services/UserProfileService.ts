@@ -19,6 +19,15 @@ export const ALL_SUPPORTED_MEDIA_TYPES = [
   '短剧',
 ] as const;
 
+export const GENRE_CATEGORIES: Array<{ group: string; items: string[] }> = [
+  { group: '悬疑与动作', items: ['悬疑', '犯罪', '惊悚', '恐怖', '动作', '冒险', '灾难', '谍战', '黑帮'] },
+  { group: '脑洞与史诗', items: ['科幻', '奇幻', '武侠', '仙侠', '末日', '赛博朋克', '历史', '战争', '西部'] },
+  { group: '情感与生活', items: ['剧情', '喜剧', '爱情', '家庭', '青春', '校园', '治愈', '职场', '文艺'] },
+  { group: '专题与舞台', items: ['古装', '年代', '传记', '律政', '医疗', '运动', '音乐', '歌舞', '美食', '旅行', '真人秀', '脱口秀'] },
+];
+
+export const ALL_SUPPORTED_GENRES = GENRE_CATEGORIES.flatMap((c) => c.items);
+
 export type ImplicitAction = 'save' | 'share' | 'search' | 'skip';
 
 export interface UserTasteProfile {
@@ -211,12 +220,12 @@ export class UserProfileService {
 
     this.mergeUnique(profile.explicitLikes.mediaTypes!, normLikeMedia, 14);
     this.mergeUnique(profile.explicitDislikes.mediaTypes!, normDislikeMedia, 10);
-    this.mergeUnique(profile.explicitLikes.genres, opts.likeGenres, 15);
-    this.mergeUnique(profile.explicitLikes.regions, opts.likeRegions, 10);
-    this.mergeUnique(profile.explicitLikes.directors, opts.likeDirectors, 15);
-    this.mergeUnique(profile.explicitLikes.actors, opts.likeActors, 15);
-    this.mergeUnique(profile.explicitLikes.favoriteSeeds, opts.favoriteSeeds, 20);
-    this.mergeUnique(profile.explicitDislikes.genres, opts.dislikeGenres, 15);
+    this.mergeUnique(profile.explicitLikes.genres, opts.likeGenres, 40);
+    this.mergeUnique(profile.explicitLikes.regions, opts.likeRegions, 15);
+    this.mergeUnique(profile.explicitLikes.directors, opts.likeDirectors, 20);
+    this.mergeUnique(profile.explicitLikes.actors, opts.likeActors, 20);
+    this.mergeUnique(profile.explicitLikes.favoriteSeeds, opts.favoriteSeeds, 30);
+    this.mergeUnique(profile.explicitDislikes.genres, opts.dislikeGenres, 30);
     this.mergeUnique(profile.explicitDislikes.titles, opts.dislikeTitles, 30);
 
     if (opts.likeMediaTypes && opts.likeMediaTypes.length > 0) {
@@ -655,21 +664,45 @@ export class UserProfileService {
     ];
 
     const genreDict: Array<[RegExp, string]> = [
-      [/(?:悬疑|推理|烧脑|探案|破案)/i, '悬疑'],
-      [/(?:科幻|太空|赛博|星际|未来)/i, '科幻'],
-      [/(?:犯罪|警匪|黑帮|扫黑|刑侦)/i, '犯罪'],
-      [/(?:动作|武侠|功夫|打戏|特工|枪战)/i, '动作'],
-      [/(?:喜剧|搞笑|幽默|沙雕|下饭|轻松|欢乐)/i, '喜剧'],
+      [/(?:悬疑|推理|烧脑|探案|破案|密室)/i, '悬疑'],
+      [/(?:犯罪|警匪|扫黑|刑侦|法医|缉毒)/i, '犯罪'],
+      [/(?:黑帮|教父|帮派|江湖黑道)/i, '黑帮'],
+      [/(?:惊悚|心理战|压迫感|悬念)/i, '惊悚'],
+      [/(?:恐怖|鬼片|灵异|吓人|丧尸惊魂)/i, '恐怖'],
+      [/(?:动作|打戏|特工|枪战|格斗|爽片)/i, '动作'],
+      [/(?:冒险|探险|寻宝|荒野|盗墓)/i, '冒险'],
+      [/(?:灾难|求生|地震|海啸|病毒)/i, '灾难'],
+      [/(?:谍战|特务|潜伏|暗战)/i, '谍战'],
+      [/(?:科幻|太空|星际|未来|机甲|外星|时间循环)/i, '科幻'],
+      [/(?:赛博朋克|赛博|废土风)/i, '赛博朋克'],
+      [/(?:末日|丧尸|废土|生存)/i, '末日'],
+      [/(?:奇幻|魔幻|魔法|异世界|无限流)/i, '奇幻'],
+      [/(?:武侠|侠客|江湖|功夫)/i, '武侠'],
+      [/(?:仙侠|玄幻|修仙|古偶|神魔)/i, '仙侠'],
+      [/(?:历史|正剧|朝代|王朝|帝王)/i, '历史'],
+      [/(?:战争|军事|抗战|二战|军旅)/i, '战争'],
+      [/(?:西部|牛仔|荒原)/i, '西部'],
+      [/(?:剧情|现实|人性|口碑|群像|伦理)/i, '剧情'],
+      [/(?:喜剧|搞笑|幽默|沙雕|下饭|轻松|欢乐|无厘头|黑色幽默)/i, '喜剧'],
       [/(?:爱情|恋爱|甜宠|浪漫|偶像|言情|恋综)/i, '爱情'],
-      [/(?:剧情|文艺|现实|人性|口碑)/i, '剧情'],
-      [/(?:战争|军事|谍战|抗战)/i, '战争'],
-      [/(?:恐怖|鬼片|惊悚|灵异|吓人)/i, '恐怖'],
-      [/(?:奇幻|魔幻|仙侠|玄幻|魔法)/i, '奇幻'],
-      [/(?:古装|历史|宫斗|权谋|朝堂|武林)/i, '古装'],
-      [/(?:家庭|伦理|亲情|治愈|温情|生活)/i, '家庭'],
-      [/(?:真人秀|慢综艺|旅游|旅行|美食|竞速)/i, '真人秀'],
-      [/(?:脱口秀|吐槽|单口|相声)/i, '脱口秀'],
-      [/(?:音乐|音综|演唱会|歌舞)/i, '音乐'],
+      [/(?:家庭|亲情|父母|婚姻|生活|烟火气)/i, '家庭'],
+      [/(?:青春|少年|成长|初恋)/i, '青春'],
+      [/(?:校园|大学|高中|学生)/i, '校园'],
+      [/(?:治愈|温情|温暖|催泪|慢节奏)/i, '治愈'],
+      [/(?:职场|商战|创业|打工人)/i, '职场'],
+      [/(?:文艺|独立电影|作者电影|小众美学)/i, '文艺'],
+      [/(?:古装|宫斗|权谋|宅斗|朝堂)/i, '古装'],
+      [/(?:年代|复古|八九十年代|怀旧)/i, '年代'],
+      [/(?:传记|真实事件|真实改编|人物传)/i, '传记'],
+      [/(?:律政|律师|法庭|庭审)/i, '律政'],
+      [/(?:医疗|医生|医院|急诊)/i, '医疗'],
+      [/(?:运动|体育|竞技|热血|篮球|足球|赛车)/i, '运动'],
+      [/(?:音乐|音综|乐队|演唱会|摇滚|说唱)/i, '音乐'],
+      [/(?:歌舞|音乐剧)/i, '歌舞'],
+      [/(?:美食|下饭菜|烹饪|料理|吃播)/i, '美食'],
+      [/(?:旅行|旅游|慢综艺|公路|自驾)/i, '旅行'],
+      [/(?:真人秀|竞速|户外挑战)/i, '真人秀'],
+      [/(?:脱口秀|吐槽|单口|相声|漫才)/i, '脱口秀'],
     ];
 
     const regionDict: Array<[RegExp, string]> = [
@@ -998,11 +1031,11 @@ export class UserProfileService {
       .slice(-6)
       .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
 
-    // 题材雷达（取前 6 个正向题材，保证至少 3 轴才有意义）
+    // 题材雷达（取前 8 个正向题材，最多 8 轴展示丰富维度）
     const genreRadar = Object.entries(vec.genres)
       .filter(([, v]) => v > 0.2)
       .sort((a, b) => b[1] - a[1])
-      .slice(0, 6)
+      .slice(0, 8)
       .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
 
     // 近 8 周行为趋势（按周分桶，周 0 为最早）
