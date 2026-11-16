@@ -541,6 +541,14 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     const pageScript = scripts[1];
     assert.ok(html.includes('id="quickMediaChips"'));
     assert.ok(html.includes('id="personaSummaryPill"'));
+    assert.ok(html.includes('id="vizRadar"'));
+    assert.ok(html.includes('id="vizMediaDonut"'));
+    assert.ok(html.includes('id="vizGauges"'));
+    assert.ok(html.includes('id="vizTrend"'));
+    assert.ok(html.includes('id="vizDecades"'));
+    assert.ok(html.includes('id="vizPeople"'));
+    assert.ok(pageScript.includes('function renderVizRadar'));
+    assert.ok(pageScript.includes('function renderVizTrend'));
     assert.ok(pageScript.includes('function refreshPanel'));
     assert.ok(pageScript.includes('function createWatch'));
     assert.ok(pageScript.includes('function probeChannelsNow'));
@@ -725,6 +733,10 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
     });
     const webDetail = svc.getDetailedProfileForWeb(testUser);
     assert.ok(webDetail.topMediaTypes.some((m) => m.name === '韩剧' && m.score > 5));
+    assert.ok(Array.isArray(webDetail.genreRadar) && webDetail.genreRadar.length >= 2);
+    assert.equal(webDetail.weeklyActivity.length, 8);
+    assert.ok(webDetail.signalMix.explicit > 0);
+    assert.ok(webDetail.topDecades.some((d) => d.name === '2010s'));
 
     const card = svc.renderProfileCard(testUser);
     assert.ok(card.includes('专属观影口味画像 · AI 算法分析'));

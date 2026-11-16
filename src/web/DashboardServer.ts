@@ -479,7 +479,8 @@ export class DashboardServer {
         | 'likeDirectors'
         | 'likeActors'
         | 'favoriteSeeds'
-        | 'dislikeGenres';
+        | 'dislikeGenres'
+        | 'dislikeTitles';
       const rawValue = String(body.value || '').trim();
 
       if (action === 'reset') {
@@ -498,6 +499,7 @@ export class DashboardServer {
         'likeActors',
         'favoriteSeeds',
         'dislikeGenres',
+        'dislikeTitles',
       ];
       if (!validCats.includes(category) || !rawValue) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -569,6 +571,75 @@ ${AUI_BUNDLE_CSS}
 .list-main{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:13px;}
 .list-actions{display:flex;align-items:center;gap:6px;flex-shrink:0;}
 .mono-sub{font-family:var(--font-mono);font-size:11px;color:var(--text-sec);margin-top:4px;word-break:break-all;}
+.profile-hero{display:grid;grid-template-columns:68px minmax(0,1fr) auto;align-items:center;gap:18px;padding:22px;border:1px solid rgba(0,122,255,.18);border-radius:22px;background:linear-gradient(125deg,rgba(0,122,255,.13),rgba(139,92,246,.08) 58%,rgba(48,209,88,.07));}
+.profile-mark{width:64px;height:64px;border-radius:20px;display:grid;place-items:center;font-size:30px;background:linear-gradient(145deg,rgba(0,122,255,.22),rgba(139,92,246,.2));box-shadow:inset 0 1px rgba(255,255,255,.35);}
+.profile-eyebrow{font-size:10px;font-weight:800;letter-spacing:.14em;color:var(--accent);text-transform:uppercase;}
+.profile-hero h2{margin:5px 0 4px;font-size:21px;letter-spacing:-.03em;}
+.profile-hero p{margin:0;color:var(--text-sec);font-size:12px;line-height:1.6;}
+.profile-confidence{display:flex;align-items:center;gap:9px;margin-top:13px;max-width:460px;}
+.profile-confidence-track{height:7px;flex:1;border-radius:99px;background:rgba(120,120,128,.18);overflow:hidden;}
+.profile-confidence-fill{height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--accent),#8b5cf6);transition:width .35s ease;}
+.profile-confidence-label{font-size:11px;font-weight:750;white-space:nowrap;}
+.profile-hero-actions{display:flex;gap:8px;align-items:center;}
+.profile-metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:12px;margin:14px 0;}
+.profile-metric{padding:15px 16px;border:1px solid var(--border-subtle);border-radius:17px;background:var(--card-sec);min-width:0;}
+.profile-metric-label{font-size:11px;color:var(--text-sec);}
+.profile-metric-value{font-size:20px;font-weight:800;letter-spacing:-.03em;margin-top:5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.profile-metric-note{font-size:10px;color:var(--text-sec);margin-top:4px;}
+.profile-insight-grid{display:grid;grid-template-columns:minmax(0,1.45fr) minmax(250px,.85fr);gap:14px;margin-bottom:14px;}
+.profile-chart{display:flex;flex-direction:column;gap:12px;}
+.profile-chart-row{display:grid;grid-template-columns:minmax(78px,105px) minmax(50px,1fr) 38px;align-items:center;gap:10px;}
+.profile-chart-label{font-size:11px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.profile-chart-track{height:8px;border-radius:99px;background:rgba(120,120,128,.15);overflow:hidden;}
+.profile-chart-fill{height:100%;border-radius:inherit;}
+.profile-chart-value{font-family:var(--font-mono);font-size:10px;text-align:right;color:var(--text-sec);}
+.profile-chart-empty{padding:20px 10px;text-align:center;color:var(--text-sec);font-size:12px;line-height:1.7;}
+.profile-diversity-wrap{display:flex;align-items:center;gap:18px;min-height:160px;}
+.profile-donut{width:112px;height:112px;border-radius:50%;display:grid;place-items:center;flex-shrink:0;background:conic-gradient(var(--accent) 0deg, #8b5cf6 180deg, rgba(120,120,128,.16) 180deg);position:relative;}
+.profile-donut:before{content:"";position:absolute;inset:10px;border-radius:50%;background:var(--bg);}
+.profile-donut-center{position:relative;text-align:center;}
+.profile-donut-value{font-size:21px;font-weight:850;line-height:1;}
+.profile-donut-caption{font-size:9px;color:var(--text-sec);margin-top:5px;}
+.profile-diversity-copy{min-width:0;}
+.profile-diversity-copy strong{display:block;font-size:13px;margin-bottom:6px;}
+.profile-diversity-copy p{font-size:11px;color:var(--text-sec);line-height:1.65;margin:0;}
+.profile-action-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin:10px 0 14px;}
+.profile-action-item{padding:11px 12px;border-radius:14px;background:var(--card-sec);border:1px solid var(--border-subtle);}
+.profile-action-count{font-size:17px;font-weight:800;}
+.profile-action-label{font-size:10px;color:var(--text-sec);margin-top:3px;}
+.profile-event-meta{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.viz-grid-3{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:14px;}
+.viz-grid-3>.card{margin-bottom:0;}
+.viz-card{display:flex;flex-direction:column;}
+.viz-box{width:100%;display:flex;align-items:center;justify-content:center;min-height:190px;}
+.viz-box svg{width:100%;height:auto;max-width:280px;overflow:visible;}
+.viz-axis-label{font-size:10px;font-weight:700;fill:var(--text-sec);}
+.viz-center-big{font-size:20px;font-weight:800;fill:var(--text);}
+.viz-center-sub{font-size:10px;font-weight:600;fill:var(--text-sec);}
+.viz-legend{display:flex;flex-wrap:wrap;gap:6px 12px;margin-top:10px;justify-content:center;}
+.viz-legend-item{display:inline-flex;align-items:center;gap:5px;font-size:11px;font-weight:600;color:var(--text-sec);}
+.viz-dot{width:8px;height:8px;border-radius:50%;flex-shrink:0;}
+.viz-empty{color:var(--text-sec);font-size:12px;text-align:center;line-height:1.7;padding:18px 6px;}
+.viz-gauges{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;min-height:150px;}
+.viz-gauge{display:flex;flex-direction:column;align-items:center;gap:4px;}
+.viz-gauge svg{width:100%;max-width:120px;height:auto;}
+.viz-gauge-label{font-size:11px;font-weight:700;color:var(--text-sec);text-align:center;}
+.viz-mix{margin-top:12px;}
+.viz-mix-track{display:flex;height:8px;border-radius:99px;overflow:hidden;background:rgba(120,120,128,.14);}
+.viz-mix-seg{height:100%;transition:width .4s var(--ease-spring);}
+.viz-mix-meta{display:flex;justify-content:space-between;font-size:11px;color:var(--text-sec);margin-top:6px;font-weight:600;}
+.viz-decades{display:flex;align-items:flex-end;gap:8px;height:96px;padding-top:6px;}
+.viz-decade{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%;gap:4px;min-width:0;}
+.viz-decade-bar{width:100%;max-width:34px;border-radius:7px 7px 3px 3px;background:linear-gradient(180deg,var(--purple),var(--accent));min-height:4px;transition:height .4s var(--ease-spring);}
+.viz-decade-label{font-size:10px;font-weight:700;color:var(--text-sec);font-family:var(--font-mono);}
+.viz-people{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;}
+.viz-people-col{background:var(--card-sec);border:1px solid var(--border-subtle);border-radius:14px;padding:10px 12px;min-width:0;}
+.viz-people-title{font-size:11px;font-weight:700;color:var(--text-sec);margin-bottom:8px;letter-spacing:.02em;}
+.viz-rank-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:13px;font-weight:600;min-width:0;}
+.viz-rank-row span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.viz-strategy{margin-top:12px;padding:10px 12px;border-radius:12px;background:var(--accent-bg);color:var(--accent);font-size:12px;font-weight:600;line-height:1.6;}
+@media(max-width:960px){.viz-grid-3{grid-template-columns:repeat(2,minmax(0,1fr));}}
+@media(max-width:680px){.profile-hero{grid-template-columns:48px minmax(0,1fr);gap:12px;padding:16px;border-radius:18px;}.profile-mark{width:46px;height:46px;border-radius:15px;font-size:23px;}.profile-hero h2{font-size:18px;}.profile-hero-actions{grid-column:1/-1;justify-content:flex-end;}.profile-chart-row{grid-template-columns:minmax(72px,90px) minmax(40px,1fr) 34px;gap:7px;}.viz-grid-3{grid-template-columns:1fr;}.viz-people{grid-template-columns:1fr;}.viz-box{min-height:170px;}}
 </style>
 </head>
 <body>
@@ -637,6 +708,57 @@ ${AUI_BUNDLE_CSS}
 
   <!-- Tab 2: 观影画像 -->
   <main id="p-profile" class="page">
+    <section class="profile-hero">
+      <div class="profile-mark" aria-hidden="true">✦</div>
+      <div>
+        <div class="profile-eyebrow">PERSONAL TASTE MAP</div>
+        <h2 id="profilePersonaTitle">正在认识你的口味</h2>
+        <p id="profilePersonaDesc">偏好会根据你主动设置的标签和近期观影行为逐步更新。</p>
+        <div class="profile-confidence">
+          <div class="profile-confidence-track"><div class="profile-confidence-fill" id="profileConfidenceFill" style="width:0%"></div></div>
+          <span class="profile-confidence-label" id="profileConfidenceText">画像把握度 0%</span>
+        </div>
+      </div>
+      <div class="profile-hero-actions"><span class="badge neutral" id="profileUpdatedAt">等待数据</span><button class="pill-btn danger" onclick="resetProfile()">重建画像</button></div>
+    </section>
+
+    <section class="viz-grid-3">
+      <div class="card viz-card">
+        <div class="card-header"><div class="card-title">题材雷达</div><span class="badge accent" id="vizRadarBadge">0 轴</span></div>
+        <div class="viz-box" id="vizRadar"></div>
+      </div>
+      <div class="card viz-card">
+        <div class="card-header"><div class="card-title">影视形态构成</div><span class="badge warning" id="vizMediaBadge">0 类</span></div>
+        <div class="viz-box" id="vizMediaDonut"></div>
+        <div class="viz-legend" id="vizMediaLegend"></div>
+      </div>
+      <div class="card viz-card">
+        <div class="card-header"><div class="card-title">画像健康度</div><span class="badge neutral" id="vizUpdatedBadge">—</span></div>
+        <div class="viz-gauges" id="vizGauges"></div>
+        <div class="viz-mix" id="vizSignalMix"></div>
+      </div>
+    </section>
+
+    <section class="grid-2">
+      <div class="card viz-card">
+        <div class="card-header"><div class="card-title">近 8 周观影行为</div><span class="badge neutral">30 天半衰期</span></div>
+        <div class="viz-box" id="vizTrend"></div>
+        <div class="viz-legend" id="vizTrendLegend"></div>
+      </div>
+      <div class="card viz-card">
+        <div class="card-header"><div class="card-title">地区与年代</div><span class="badge purple" id="vizRegionBadge">0 地区</span></div>
+        <div id="vizRegions"></div>
+        <div class="form-label" style="margin-top:14px;">年代分布</div>
+        <div class="viz-decades" id="vizDecades"></div>
+      </div>
+    </section>
+
+    <div class="card viz-card">
+      <div class="card-header"><div class="card-title">主创与心头好</div><span class="badge success">影响排序</span></div>
+      <div class="viz-people" id="vizPeople"></div>
+      <div class="viz-strategy" id="vizStrategy"></div>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <div class="card-title">全影视形态偏好</div>
@@ -649,10 +771,10 @@ ${AUI_BUNDLE_CSS}
       </div>
     </div>
 
-    <div class="card">
-      <div class="card-header">
-        <div class="card-title">快捷题材点选</div>
-        <button class="pill-btn danger" onclick="resetProfile()">清空重建</button>
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">快捷题材点选</div>
+          <span class="badge neutral">点选即可更新</span>
       </div>
       <div class="chip-wrap" id="quickGenreChips"></div>
     </div>
@@ -688,6 +810,12 @@ ${AUI_BUNDLE_CSS}
           <input class="form-control" id="inLikeDirectors" placeholder="如：克里斯托弗·诺兰" />
           <button class="btn" onclick="addProfileTag('likeDirectors','inLikeDirectors')">添加</button>
         </div>
+        <div class="form-label" style="margin-top:14px;">偏爱演员</div>
+        <div class="chip-wrap" id="chipsLikeActors"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inLikeActors" placeholder="如：周迅, 梁朝伟" />
+          <button class="btn" onclick="addProfileTag('likeActors','inLikeActors')">添加</button>
+        </div>
         <div class="form-label" style="margin-top:14px;">心头好电影</div>
         <div class="chip-wrap" id="chipsFavoriteSeeds"></div>
         <div class="inline-add">
@@ -714,6 +842,12 @@ ${AUI_BUNDLE_CSS}
         <div class="inline-add">
           <input class="form-control" id="inDislikeMediaTypes" placeholder="如：短剧, 综艺" />
           <button class="btn danger" onclick="addProfileTag('dislikeMediaTypes','inDislikeMediaTypes')">屏蔽</button>
+        </div>
+        <div class="form-label" style="margin-top:14px;">屏蔽片名</div>
+        <div class="chip-wrap" id="chipsDislikeTitles"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inDislikeTitles" placeholder="如：已看过或不想再看到的作品" />
+          <button class="btn danger" onclick="addProfileTag('dislikeTitles','inDislikeTitles')">屏蔽</button>
         </div>
       </div>
 
@@ -957,6 +1091,192 @@ function renderRemovableChips(containerId, items, category, badgeClass){
   });
 }
 
+const VIZ_PALETTE = ["#007aff","#af52de","#34c759","#ff9500","#ff2d55","#5ac8fa","#5856d6","#ffcc00","#ff3b30","#30b0c7","#a2845e","#8e8e93","#64d2ff","#bf5af2"];
+const VIZ_ACTION_COLORS = { save:"#34c759", share:"#af52de", search:"#007aff", skip:"#ff9500" };
+
+function vizRing(value, color, big, sub){
+  const r = 44, c = 2 * Math.PI * r;
+  const v = Math.max(0, Math.min(1, value));
+  return '<svg viewBox="0 0 120 120"><circle cx="60" cy="60" r="' + r + '" fill="none" stroke="rgba(120,120,128,0.16)" stroke-width="10"/>' +
+    '<circle cx="60" cy="60" r="' + r + '" fill="none" stroke="' + color + '" stroke-width="10" stroke-linecap="round" stroke-dasharray="' + (c * v).toFixed(1) + ' ' + c.toFixed(1) + '" transform="rotate(-90 60 60)"/>' +
+    '<text x="60" y="62" text-anchor="middle" class="viz-center-big">' + esc(big) + '</text>' +
+    '<text x="60" y="78" text-anchor="middle" class="viz-center-sub">' + esc(sub) + '</text></svg>';
+}
+
+function renderVizRadar(rows){
+  const box = document.getElementById("vizRadar");
+  document.getElementById("vizRadarBadge").textContent = rows.length + " 轴";
+  if (rows.length < 3) {
+    box.innerHTML = '<div class="viz-empty">至少需要 3 个题材信号<br>点选下方题材或多搜几部片即可生成雷达</div>';
+    return;
+  }
+  const cx = 140, cy = 118, R = 82, n = rows.length;
+  const maxV = Math.max(1, ...rows.map(x => Number(x.score) || 0));
+  const pt = (i, k) => {
+    const a = -Math.PI / 2 + i * 2 * Math.PI / n;
+    return [cx + Math.cos(a) * R * k, cy + Math.sin(a) * R * k];
+  };
+  let svg = '<svg viewBox="0 0 280 236">';
+  [0.25, 0.5, 0.75, 1].forEach(k => {
+    svg += '<polygon points="' + rows.map((_, i) => pt(i, k).map(v => v.toFixed(1)).join(",")).join(" ") + '" fill="none" stroke="rgba(120,120,128,0.18)" stroke-width="1"/>';
+  });
+  rows.forEach((_, i) => {
+    const p = pt(i, 1);
+    svg += '<line x1="' + cx + '" y1="' + cy + '" x2="' + p[0].toFixed(1) + '" y2="' + p[1].toFixed(1) + '" stroke="rgba(120,120,128,0.18)"/>';
+  });
+  const shape = rows.map((x, i) => pt(i, Math.max(0.08, (Number(x.score) || 0) / maxV)));
+  svg += '<polygon points="' + shape.map(p => p[0].toFixed(1) + "," + p[1].toFixed(1)).join(" ") + '" fill="rgba(0,122,255,0.20)" stroke="#007aff" stroke-width="2" stroke-linejoin="round"/>';
+  shape.forEach(p => { svg += '<circle cx="' + p[0].toFixed(1) + '" cy="' + p[1].toFixed(1) + '" r="3.5" fill="#007aff"/>'; });
+  rows.forEach((x, i) => {
+    const p = pt(i, 1.2);
+    const anchor = Math.abs(p[0] - cx) < 8 ? "middle" : (p[0] > cx ? "start" : "end");
+    svg += '<text x="' + p[0].toFixed(1) + '" y="' + (p[1] + 4).toFixed(1) + '" text-anchor="' + anchor + '" class="viz-axis-label">' + esc(x.name) + '</text>';
+  });
+  box.innerHTML = svg + '</svg>';
+}
+
+function renderVizMediaDonut(dist){
+  const box = document.getElementById("vizMediaDonut");
+  const legend = document.getElementById("vizMediaLegend");
+  document.getElementById("vizMediaBadge").textContent = dist.length + " 类";
+  if (!dist.length) {
+    box.innerHTML = '<div class="viz-empty">还没有形态偏好<br>点选下方「电影 / 美剧 / 动画 / 综艺」等</div>';
+    legend.innerHTML = "";
+    return;
+  }
+  const r = 64, c = 2 * Math.PI * r;
+  const total = dist.reduce((s, x) => s + (Number(x.weight) || 0), 0) || 1;
+  let offset = 0;
+  let svg = '<svg viewBox="0 0 180 180"><circle cx="90" cy="90" r="' + r + '" fill="none" stroke="rgba(120,120,128,0.12)" stroke-width="22"/>';
+  dist.forEach((x, i) => {
+    const len = (Number(x.weight) || 0) / total * c;
+    const gap = dist.length > 1 ? 2 : 0;
+    svg += '<circle cx="90" cy="90" r="' + r + '" fill="none" stroke="' + VIZ_PALETTE[i % VIZ_PALETTE.length] + '" stroke-width="22" stroke-dasharray="' + Math.max(0, len - gap).toFixed(1) + ' ' + c.toFixed(1) + '" stroke-dashoffset="' + (-offset).toFixed(1) + '" transform="rotate(-90 90 90)"/>';
+    offset += len;
+  });
+  const top = dist[0];
+  svg += '<text x="90" y="90" text-anchor="middle" class="viz-center-big">' + esc(top.name) + '</text>';
+  svg += '<text x="90" y="108" text-anchor="middle" class="viz-center-sub">占比 ' + (Number(top.ratio) || 0) + '%</text></svg>';
+  box.innerHTML = svg;
+  legend.innerHTML = dist.map((x, i) =>
+    '<span class="viz-legend-item"><span class="viz-dot" style="background:' + VIZ_PALETTE[i % VIZ_PALETTE.length] + '"></span>' + esc(x.name) + ' ' + (Number(x.ratio) || 0) + '%</span>'
+  ).join("");
+}
+
+function renderVizGauges(tp){
+  const confidence = Math.max(0, Math.min(100, Number(tp.confidence) || 0));
+  const entropy = Math.max(0, Math.min(1, Number(tp.diversityEntropy) || 0));
+  const diversityShort = String(tp.diversityLabel || "待建立").replace(/（.*）/, "");
+  document.getElementById("vizGauges").innerHTML =
+    '<div class="viz-gauge">' + vizRing(confidence / 100, "#34c759", confidence + "%", "把握度") + '<div class="viz-gauge-label">信号越多越准</div></div>' +
+    '<div class="viz-gauge">' + vizRing(entropy, "#af52de", Math.round(entropy * 100) + "%", "口味广度") + '<div class="viz-gauge-label">' + esc(diversityShort) + '</div></div>';
+  const mix = tp.signalMix || {};
+  const ex = Number(mix.explicit) || 0, im = Number(mix.implicit) || 0, sum = ex + im;
+  const exPct = sum ? Math.round(ex / sum * 100) : 0;
+  document.getElementById("vizSignalMix").innerHTML =
+    '<div class="viz-mix-track"><div class="viz-mix-seg" style="width:' + exPct + '%;background:#007aff"></div><div class="viz-mix-seg" style="width:' + (sum ? 100 - exPct : 0) + '%;background:#ff9500"></div></div>' +
+    '<div class="viz-mix-meta"><span>主动告知 ' + ex + '</span><span>行为学习 ' + im + '</span></div>';
+  const updated = Number(tp.updatedAt) || 0;
+  document.getElementById("vizUpdatedBadge").textContent = updated
+    ? new Date(updated).toLocaleDateString("zh-CN", { month:"numeric", day:"numeric" }) + " 更新"
+    : "等待数据";
+}
+
+function renderVizTrend(weeks){
+  const box = document.getElementById("vizTrend");
+  const legend = document.getElementById("vizTrendLegend");
+  const actions = ["save","share","search","skip"];
+  legend.innerHTML = actions.map(a =>
+    '<span class="viz-legend-item"><span class="viz-dot" style="background:' + VIZ_ACTION_COLORS[a] + '"></span>' + esc(ACTION_LABELS[a] || a) + '</span>'
+  ).join("");
+  const totals = weeks.map(w => actions.reduce((s, a) => s + (Number(w[a]) || 0), 0));
+  const maxT = Math.max(...totals, 0);
+  if (!maxT) {
+    box.innerHTML = '<div class="viz-empty">近 8 周还没有行为记录<br>搜片、转存、分享都会被学习</div>';
+    return;
+  }
+  const W = 320, H = 170, padB = 22, padT = 12, colW = W / weeks.length, barW = Math.min(24, colW * 0.56);
+  let svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" style="max-width:360px;">';
+  [0.5, 1].forEach(k => {
+    const y = padT + (H - padT - padB) * (1 - k);
+    svg += '<line x1="0" y1="' + y.toFixed(1) + '" x2="' + W + '" y2="' + y.toFixed(1) + '" stroke="rgba(120,120,128,0.14)" stroke-dasharray="3 4"/>';
+  });
+  weeks.forEach((w, i) => {
+    const x = i * colW + (colW - barW) / 2;
+    let yCursor = H - padB;
+    actions.forEach(a => {
+      const v = Number(w[a]) || 0;
+      if (!v) return;
+      const h = v / maxT * (H - padT - padB);
+      yCursor -= h;
+      svg += '<rect x="' + x.toFixed(1) + '" y="' + yCursor.toFixed(1) + '" width="' + barW.toFixed(1) + '" height="' + Math.max(1, h).toFixed(1) + '" rx="3" fill="' + VIZ_ACTION_COLORS[a] + '"/>';
+    });
+    if (totals[i]) {
+      svg += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (yCursor - 4).toFixed(1) + '" text-anchor="middle" class="viz-axis-label">' + totals[i] + '</text>';
+    }
+    const label = Number(w.weekOffset) === 0 ? "本周" : w.weekOffset + "周前";
+    svg += '<text x="' + (x + barW / 2).toFixed(1) + '" y="' + (H - 6) + '" text-anchor="middle" class="viz-axis-label">' + label + '</text>';
+  });
+  box.innerHTML = svg + '</svg>';
+}
+
+function renderVizRegionsDecades(regions, decades){
+  document.getElementById("vizRegionBadge").textContent = regions.length + " 地区";
+  const maxR = Math.max(1, ...regions.map(x => Number(x.score) || 0));
+  document.getElementById("vizRegions").innerHTML = regions.length
+    ? regions.map((x, i) =>
+        '<div class="profile-chart-row"><div class="profile-chart-label">' + esc(x.name) + '</div>' +
+        '<div class="profile-chart-track"><div class="profile-chart-fill" style="width:' + Math.max(4, Math.round((Number(x.score) || 0) / maxR * 100)) + '%;background:' + VIZ_PALETTE[(i + 1) % VIZ_PALETTE.length] + '"></div></div>' +
+        '<div class="profile-chart-value">' + (Number(x.score) || 0).toFixed(1) + '</div></div>'
+      ).join("")
+    : '<div class="viz-empty">暂无地区偏好</div>';
+  const maxD = Math.max(1, ...decades.map(x => Number(x.score) || 0));
+  document.getElementById("vizDecades").innerHTML = decades.length
+    ? decades.map(x =>
+        '<div class="viz-decade"><div class="viz-decade-bar" style="height:' + Math.max(6, Math.round((Number(x.score) || 0) / maxD * 72)) + 'px" title="' + esc(x.name + " · " + x.score) + '"></div><div class="viz-decade-label">' + esc(String(x.name).replace(/^(\\d{2})(\\d{2})s$/, "$2年代")) + '</div></div>'
+      ).join("")
+    : '<div class="viz-empty" style="width:100%;">转存带年份的作品后显示</div>';
+}
+
+function renderVizPeople(tp){
+  const likes = tp.explicitLikes || {};
+  const col = (title, rows, color) =>
+    '<div class="viz-people-col"><div class="viz-people-title">' + title + '</div>' +
+    (rows.length
+      ? rows.slice(0, 5).map((name, i) => '<div class="viz-rank-row"><span class="rank-num ' + (i < 3 ? "top" + (i + 1) : "normal") + '">' + (i + 1) + '</span><span>' + esc(name) + '</span></div>').join("")
+      : '<div class="viz-empty" style="padding:8px 0;text-align:left;">暂无</div>') +
+    '</div>';
+  const directors = (tp.topDirectors || []).map(x => x.name);
+  const actors = (tp.topActors || []).map(x => x.name);
+  const seeds = (likes.favoriteSeeds || []).slice().reverse().map(t => "《" + t + "》");
+  document.getElementById("vizPeople").innerHTML =
+    col("钟爱导演", directors) + col("偏爱演员", actors) + col("心头好作品", seeds);
+  document.getElementById("vizStrategy").textContent = "推片策略：" + (tp.recommendationStrategy || "当前采用豆瓣高分口碑冷启动策略");
+}
+
+function renderProfileOverview(tp){
+  const confidence = Math.max(0, Math.min(100, Number(tp.confidence) || 0));
+  const persona = tp.personaLabel || "冷启动探索中";
+
+  document.getElementById("profilePersonaTitle").textContent = persona.replace(/[「」]/g, "");
+  document.getElementById("profilePersonaDesc").textContent = confidence > 0
+    ? "你的推荐会结合长期偏好与近期行为动态调整。画像越丰富，排序越贴近你的口味。"
+    : "还没有足够的偏好信号。先点选常看的类型，或记录几次搜片与转存，画像就会逐步形成。";
+  document.getElementById("profileConfidenceFill").style.width = confidence + "%";
+  document.getElementById("profileConfidenceText").textContent = "画像把握度 " + confidence + "%";
+  const updated = Number(tp.updatedAt) || 0;
+  document.getElementById("profileUpdatedAt").textContent = updated
+    ? "更新于 " + new Date(updated).toLocaleDateString("zh-CN", { month:"numeric", day:"numeric" })
+    : "等待数据";
+
+  renderVizRadar(tp.genreRadar || tp.topGenres || []);
+  renderVizMediaDonut(tp.mediaTypeDistribution || []);
+  renderVizGauges(tp);
+  renderVizTrend(tp.weeklyActivity || []);
+  renderVizRegionsDecades(tp.topRegions || [], tp.topDecades || []);
+  renderVizPeople(tp);
+}
+
 function renderChannels(ch){
   const info = ch || {};
   const topCh = info.topChannels || [];
@@ -1039,6 +1359,7 @@ async function load(manual){
   const tp = d.tasteProfile || {};
   const likes = tp.explicitLikes || { mediaTypes:[], genres:[], regions:[], directors:[], actors:[], favoriteSeeds:[] };
   const dislikes = tp.explicitDislikes || { mediaTypes:[], genres:[] };
+  renderProfileOverview(tp);
 
   // Overview: 权重条
   const bars = [
@@ -1115,17 +1436,21 @@ async function load(manual){
   renderRemovableChips("chipsLikeGenres", likes.genres, "likeGenres", "accent");
   renderRemovableChips("chipsLikeRegions", likes.regions, "likeRegions", "purple");
   renderRemovableChips("chipsLikeDirectors", likes.directors, "likeDirectors", "success");
+  renderRemovableChips("chipsLikeActors", likes.actors, "likeActors", "success");
   renderRemovableChips("chipsFavoriteSeeds", likes.favoriteSeeds, "favoriteSeeds", "purple");
   renderRemovableChips("chipsDislikeGenres", dislikes.genres, "dislikeGenres", "danger");
   renderRemovableChips("chipsDislikeMediaTypes", dislikes.mediaTypes || [], "dislikeMediaTypes", "danger");
+  renderRemovableChips("chipsDislikeTitles", dislikes.titles || [], "dislikeTitles", "danger");
 
   const events = tp.recentEvents || [];
   document.getElementById("recentEventsBox").innerHTML = events.length
-    ? events.map(ev =>
-        '<div class="list-row"><span class="list-main">《' + esc(ev.title) + '》' +
-        ((ev.genres && ev.genres.length) ? ' <span class="badge neutral">' + esc(ev.genres.slice(0,2).join('/')) + '</span>' : '') +
-        '</span><span class="badge ' + (ACTION_BADGES[ev.action] || 'neutral') + '">' + (ACTION_LABELS[ev.action] || ev.action) + '</span></div>'
-      ).join("")
+    ? events.map(ev => {
+        const age = ev.timestamp ? Math.max(0, Date.now() - Number(ev.timestamp)) : 0;
+        const when = !age ? "刚刚" : age < 3600000 ? Math.max(1, Math.floor(age / 60000)) + " 分钟前" : age < 86400000 ? Math.floor(age / 3600000) + " 小时前" : Math.floor(age / 86400000) + " 天前";
+        return '<div class="list-row"><span class="list-main">《' + esc(ev.title) + '》' +
+          ((ev.genres && ev.genres.length) ? ' <span class="badge neutral">' + esc(ev.genres.slice(0,2).join('/')) + '</span>' : '') +
+          '</span><span class="profile-event-meta"><span class="mono-sub" style="margin:0;white-space:nowrap;">' + when + '</span><span class="badge ' + (ACTION_BADGES[ev.action] || 'neutral') + '">' + (ACTION_LABELS[ev.action] || ev.action) + '</span></span></div>';
+      }).join("")
     : '<div style="color:var(--text-sec);font-size:13px;">暂无行为记录</div>';
 
   // Media & Tasks Tab

@@ -90,9 +90,23 @@ export interface ProfileAnalysisResult {
 const ACTION_BASE_WEIGHTS: Record<ImplicitAction, number> = {
   save: 3.0,
   share: 2.5,
-  search: 1.0,
+  // 搜索表达的是当下意图，不足以证明长期喜好，降低其对画像的污染。
+  search: 0.25,
   skip: -0.8,
 };
+
+function normalizeProfileFeature(value: string): string {
+  return String(value || '').normalize('NFKC').trim().toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+}
+
+function splitProfileNames(value?: string): Set<string> {
+  return new Set(
+    String(value || '')
+      .split(/[、,/，；;|｜]+/)
+      .map(normalizeProfileFeature)
+      .filter(Boolean)
+  );
+}
 
 const HALF_LIFE_MS = 30 * 24 * 60 * 60 * 1000; // 30 天半衰期
 
@@ -206,7 +220,7 @@ export class UserProfileService {
     this.mergeUnique(profile.explicitDislikes.titles, opts.dislikeTitles, 30);
 
     if (opts.likeMediaTypes && opts.likeMediaTypes.length > 0) {
-      const likeMediaSet = new Set(opts.likeMediaTypes.map((m) => m.toLowerCase()));
+      const likeMediaSet = new Set(opts.likeMediaTypes.map((m) => UserProfileService.normalizeMediaType(m).toLowerCase()));
       profile.explicitDislikes.mediaTypes = (profile.explicitDislikes.mediaTypes || []).filter(
         (m) => !likeMediaSet.has(m.toLowerCase())
       );
@@ -291,17 +305,35 @@ export class UserProfileService {
     const plan = this.userManager.getUserPlan(userId);
     const profile = this.ensureProfile(plan);
 
-    profile.implicitEvents.push({
-      title: cleanTitle,
-      action,
-      mediaType: primaryMediaType,
-      genres: genres.slice(0, 5),
-      region,
-      directors: directors.slice(0, 3),
-      actors: actors.slice(0, 4),
-      decade,
-      timestamp: Date.now(),
-    });
+    const now = Date.now();
+    const dedupeWindowMs = action === 'search' ? 6 * 60 * 60 * 1000 : 24 * 60 * 60 * 1000;
+    const duplicate = [...profile.implicitEvents].reverse().find((event) =>
+      event.action === action &&
+      normalizeProfileFeature(event.title) === normalizeProfileFeature(cleanTitle) &&
+      now - event.timestamp < dedupeWindowMs
+    );
+    if (duplicate) {
+      // 短时间重复操作只刷新最近行为，避免重复点击把同一题材无限放大。
+      duplicate.timestamp = now;
+      if (primaryMediaType) duplicate.mediaType = primaryMediaType;
+      if (genres.length > 0) duplicate.genres = genres.slice(0, 5);
+      if (region) duplicate.region = region;
+      if (directors.length > 0) duplicate.directors = directors.slice(0, 3);
+      if (actors.length > 0) duplicate.actors = actors.slice(0, 4);
+      if (decade) duplicate.decade = decade;
+    } else {
+      profile.implicitEvents.push({
+        title: cleanTitle,
+        action,
+        mediaType: primaryMediaType,
+        genres: genres.slice(0, 5),
+        region,
+        directors: directors.slice(0, 3),
+        actors: actors.slice(0, 4),
+        decade,
+        timestamp: now,
+      });
+    }
 
     if (profile.implicitEvents.length > 100) {
       profile.implicitEvents = profile.implicitEvents.slice(-100);
@@ -368,9 +400,7 @@ export class UserProfileService {
       pushMt('电视剧');
     }
 
-    if (result.length === 0) {
-      pushMt('电影');
-    }
+    // 元数据不足时保持“未知”，不要默认猜成电影；否则用户屏蔽电影时会误杀信息不全的剧集。
     if (result.some((r) => ['国产剧', '美剧', '韩剧', '日剧', '英剧', '港剧', '台剧', '泰剧'].includes(r))) {
       pushMt('电视剧');
     }
@@ -443,15 +473,12 @@ export class UserProfileService {
       return -Infinity;
     }
 
-    if (
-      profile.explicitDislikes.genres.some((dg) =>
-        types.some((t) => t.toLowerCase() === dg.toLowerCase())
-      )
-    ) {
+    const normalizedTypes = new Set(types.map(normalizeProfileFeature));
+    if (profile.explicitDislikes.genres.some((dg) => normalizedTypes.has(normalizeProfileFeature(dg)))) {
       return -Infinity;
     }
-    const cleanTitle = (subject.title || '').replace(/[《》]/g, '').trim().toLowerCase();
-    if (profile.explicitDislikes.titles.some((dt) => dt.toLowerCase() === cleanTitle)) {
+    const cleanTitle = normalizeProfileFeature(subject.title || '');
+    if (profile.explicitDislikes.titles.some((dt) => normalizeProfileFeature(dt) === cleanTitle)) {
       return -Infinity;
     }
 
@@ -467,23 +494,27 @@ export class UserProfileService {
     matchScore += bestMediaScore;
 
     for (const g of types) {
-      if (vec.genres[g]) matchScore += vec.genres[g];
+      const normalizedGenre = normalizeProfileFeature(g);
+      for (const [profileGenre, weight] of Object.entries(vec.genres)) {
+        if (normalizeProfileFeature(profileGenre) === normalizedGenre) matchScore += weight;
+      }
     }
     if (subject.region) {
+      const subjectRegions = splitProfileNames(subject.region);
       for (const [rKey, rWeight] of Object.entries(vec.regions)) {
-        if (subject.region.includes(rKey) || rKey.includes(subject.region)) {
-          matchScore += rWeight;
-        }
+        if (subjectRegions.has(normalizeProfileFeature(rKey))) matchScore += rWeight;
       }
     }
     if (subject.directors) {
+      const subjectDirectors = splitProfileNames(subject.directors);
       for (const [dKey, dWeight] of Object.entries(vec.directors)) {
-        if (subject.directors.includes(dKey)) matchScore += dWeight;
+        if (subjectDirectors.has(normalizeProfileFeature(dKey))) matchScore += dWeight;
       }
     }
     if (subject.actors) {
+      const subjectActors = splitProfileNames(subject.actors);
       for (const [aKey, aWeight] of Object.entries(vec.actors)) {
-        if (subject.actors.includes(aKey)) matchScore += aWeight;
+        if (subjectActors.has(normalizeProfileFeature(aKey))) matchScore += aWeight;
       }
     }
     const dec = this.extractDecade(subject.year);
@@ -493,7 +524,7 @@ export class UserProfileService {
 
     // 已经转存过的片适当降权，避免反复推荐已存电影
     const alreadySaved = plan.watchlist.some(
-      (w) => w.status === 'completed' && w.title.trim().toLowerCase() === cleanTitle
+      (w) => w.status === 'completed' && normalizeProfileFeature(w.title) === cleanTitle
     );
     if (alreadySaved) {
       matchScore -= 15;
@@ -503,24 +534,31 @@ export class UserProfileService {
   }
 
   private calcSubjectSimilarity(a: DoubanSubject, b: DoubanSubject): number {
-    const featA = new Set<string>([
-      ...(a.types || []),
-      ...(a.region ? [a.region] : []),
-      ...(a.directors ? a.directors.split('/').map((s) => s.trim()) : []),
-    ]);
-    const featB = new Set<string>([
-      ...(b.types || []),
-      ...(b.region ? [b.region] : []),
-      ...(b.directors ? b.directors.split('/').map((s) => s.trim()) : []),
-    ]);
+    const features = (subject: DoubanSubject): Map<string, number> => {
+      const result = new Map<string, number>();
+      for (const type of subject.types || []) result.set(`genre:${normalizeProfileFeature(type)}`, 1.2);
+      for (const type of this.inferSubjectMediaTypes(subject)) result.set(`media:${normalizeProfileFeature(type)}`, 0.5);
+      for (const region of splitProfileNames(subject.region)) result.set(`region:${region}`, 0.4);
+      for (const director of splitProfileNames(subject.directors)) result.set(`director:${director}`, 1.5);
+      for (const actor of splitProfileNames(subject.actors)) result.set(`actor:${actor}`, 0.5);
+      const decade = this.extractDecade(subject.year);
+      if (decade) result.set(`decade:${decade}`, 0.3);
+      return result;
+    };
+    const featA = features(a);
+    const featB = features(b);
     if (featA.size === 0 || featB.size === 0) return 0;
 
-    let inter = 0;
-    for (const f of featA) {
-      if (featB.has(f)) inter++;
+    let intersection = 0;
+    let union = 0;
+    const keys = new Set([...featA.keys(), ...featB.keys()]);
+    for (const key of keys) {
+      const weightA = featA.get(key) || 0;
+      const weightB = featB.get(key) || 0;
+      intersection += Math.min(weightA, weightB);
+      union += Math.max(weightA, weightB);
     }
-    const union = featA.size + featB.size - inter;
-    return union > 0 ? inter / union : 0;
+    return union > 0 ? intersection / union : 0;
   }
 
   /**
@@ -921,7 +959,8 @@ export class UserProfileService {
       | 'likeDirectors'
       | 'likeActors'
       | 'favoriteSeeds'
-      | 'dislikeGenres',
+      | 'dislikeGenres'
+      | 'dislikeTitles',
     value: string
   ): UserTasteProfile {
     const plan = this.userManager.getUserPlan(userId);
@@ -939,6 +978,7 @@ export class UserProfileService {
     else if (category === 'likeActors') profile.explicitLikes.actors = filterArr(profile.explicitLikes.actors);
     else if (category === 'favoriteSeeds') profile.explicitLikes.favoriteSeeds = filterArr(profile.explicitLikes.favoriteSeeds);
     else if (category === 'dislikeGenres') profile.explicitDislikes.genres = filterArr(profile.explicitDislikes.genres);
+    else if (category === 'dislikeTitles') profile.explicitDislikes.titles = filterArr(profile.explicitDislikes.titles);
 
     profile.updatedAt = Date.now();
     this.userManager.saveUserPlan(plan);
@@ -949,12 +989,75 @@ export class UserProfileService {
     const profile = this.getProfile(userId);
     const summary = this.getTopTags(userId);
     const analysis = this.analyzeUserProfile(userId);
+    const vec = this.computeTagVector(userId);
+
+    // 年代偏好（用于年代柱状图）
+    const topDecades = Object.entries(vec.decades)
+      .filter(([, v]) => v > 0.2)
+      .sort((a, b) => a[0].localeCompare(b[0]))
+      .slice(-6)
+      .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
+
+    // 题材雷达（取前 6 个正向题材，保证至少 3 轴才有意义）
+    const genreRadar = Object.entries(vec.genres)
+      .filter(([, v]) => v > 0.2)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 6)
+      .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
+
+    // 近 8 周行为趋势（按周分桶，周 0 为最早）
+    const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const weeklyActivity = Array.from({ length: 8 }, (_, i) => ({
+      weekOffset: 7 - i,
+      save: 0,
+      share: 0,
+      search: 0,
+      skip: 0,
+    }));
+    for (const ev of profile.implicitEvents) {
+      const age = now - Number(ev.timestamp || 0);
+      if (age < 0) continue;
+      const idx = 7 - Math.floor(age / WEEK_MS);
+      if (idx >= 0 && idx < 8 && ev.action in weeklyActivity[idx]) {
+        (weeklyActivity[idx] as any)[ev.action] += 1;
+      }
+    }
+
+    // 信号来源构成：显式偏好 vs 隐式行为（按向量贡献粗估）
+    const explicitSignalCount =
+      (profile.explicitLikes.mediaTypes?.length || 0) +
+      profile.explicitLikes.genres.length +
+      profile.explicitLikes.regions.length +
+      profile.explicitLikes.directors.length +
+      profile.explicitLikes.actors.length +
+      profile.explicitLikes.favoriteSeeds.length;
+
     return {
       ...summary,
       personaLabel: analysis.personaLabel,
       confidence: analysis.confidence,
       diversityLabel: analysis.diversityLabel,
+      diversityEntropy: analysis.diversityEntropy,
       mediaTypeDistribution: analysis.mediaTypeDistribution,
+      topActors: analysis.topActors,
+      recommendationStrategy: analysis.recommendationStrategy,
+      dislikedMediaTypes: analysis.dislikedMediaTypes,
+      topDecades,
+      genreRadar,
+      weeklyActivity,
+      signalMix: {
+        explicit: explicitSignalCount,
+        implicit: profile.implicitEvents.length,
+      },
+      updatedAt: profile.updatedAt,
+      activityCounts: profile.implicitEvents.reduce(
+        (counts, event) => {
+          counts[event.action] = (counts[event.action] || 0) + 1;
+          return counts;
+        },
+        { save: 0, share: 0, search: 0, skip: 0 } as Record<ImplicitAction, number>
+      ),
       explicitLikes: profile.explicitLikes,
       explicitDislikes: profile.explicitDislikes,
       recentEvents: [...profile.implicitEvents].reverse().slice(0, 15),
