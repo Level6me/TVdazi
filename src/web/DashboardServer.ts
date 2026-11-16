@@ -663,6 +663,33 @@ export class DashboardServer {
       return true;
     }
 
+    if (req.method === 'POST' && pathname === '/api/panel/contacts/rename') {
+      const target = String(body.target || body.index || '').trim();
+      const nickname = String(body.nickname || '').trim();
+      if (!target || !nickname) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: '请提供目标用户与新昵称' }));
+        return true;
+      }
+      const relay = RelayService.getInstance();
+      const resRename = relay.setContactRemark(userId, target, nickname);
+      res.writeHead(resRename.success ? 200 : 400, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(
+        JSON.stringify({
+          ok: resRename.success,
+          message: resRename.message,
+          contacts: relay.getDirectory(userId).map((d) => ({
+            index: d.index,
+            displayName: d.displayName,
+            maskedId: d.maskedId,
+            isSelf: d.isSelf,
+            hasCustomAlias: d.hasCustomAlias,
+          })),
+        })
+      );
+      return true;
+    }
+
     if (req.method === 'POST' && pathname === '/api/panel/profile/reset') {
       UserProfileService.getInstance().clearProfile(userId);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -1777,11 +1804,16 @@ async function load(manual){
 
   const contacts = d.contacts || [];
   document.getElementById("contactsCountBadge").textContent = contacts.length + " 人";
-  document.getElementById("contactsBox").innerHTML = contacts.length
+  const cbContacts = document.getElementById("contactsBox");
+  cbContacts.innerHTML = contacts.length
     ? contacts.map(c =>
-        '<div class="list-row"><span class="list-main">' + c.index + '. ' + esc(c.displayName) + (c.isSelf ? ' <span class="badge success">我</span>' : '') + '</span><span class="badge neutral">' + esc(c.maskedId) + '</span></div>'
+        '<div class="list-row"><span class="list-main">' + c.index + '. ' + esc(c.displayName) + (c.isSelf ? ' <span class="badge success">我</span>' : '') + '</span>' +
+        '<div class="list-actions"><span class="badge neutral">' + esc(c.maskedId) + '</span><button class="pill-btn js-contact-rename" data-idx="' + c.index + '" data-name="' + esc(c.displayName) + '">改名</button></div></div>'
       ).join("")
     : '<div style="color:var(--text-sec);font-size:13px;">暂无联系人</div>';
+  cbContacts.querySelectorAll(".js-contact-rename").forEach(b => {
+    b.onclick = function(){ renameContact(this.getAttribute("data-idx"), this.getAttribute("data-name"), this); };
+  });
 
   const topCh = renderChannels(d.channels) || [];
   const needInitProbe = topCh.length > 0 && topCh.every(c => !c.avgLatencyMs && !c.successCount && !c.failCount);
@@ -2352,6 +2384,28 @@ async function resetChannel(channelId, btnEl){
     }
     toast("频道熔断已重置");
     await load(false);
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function renameContact(idx, prevName, btnEl){
+  const next = window.prompt("设置全员可见唯一昵称（所有人看到的都是这个名字）：", prevName || "");
+  if (next === null) return;
+  const clean = next.trim();
+  if (!clean) {
+    toast("昵称不能为空");
+    return;
+  }
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/contacts/rename", { index: Number(idx), nickname: clean });
+    if (r && r.ok) {
+      toast("全局昵称已统一修改为 " + clean);
+      await load(false);
+    } else {
+      toast((r && (r.error || r.message)) || "修改昵称失败");
+    }
   } finally {
     if (btnEl) btnEl.disabled = false;
   }

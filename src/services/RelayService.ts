@@ -66,6 +66,7 @@ export class RelayService {
     };
     this.loadState();
     this.syncFromUserRoutes();
+    this.migrateLegacyPersonalAliases();
   }
 
   static getInstance(): RelayService {
@@ -185,13 +186,34 @@ export class RelayService {
     return `${clean.slice(0, 4)}..${clean.slice(-4)}`;
   }
 
-  /**
-   * 获取指定用户的对外显示名称（优先级：对方个人备注 > 用户自设昵称 > 协议捕获名 > 默认编号“用户#N”）
-   */
-  public getDisplayName(targetUserId: string, viewerUserId?: string): string {
-    if (viewerUserId && this.state.personalAliases[viewerUserId]?.[targetUserId]) {
-      return this.state.personalAliases[viewerUserId][targetUserId];
+  private migrateLegacyPersonalAliases(): void {
+    const entries = Object.values(this.state.personalAliases || {});
+    if (entries.length === 0) return;
+
+    let changed = false;
+    for (const map of entries) {
+      if (!map || typeof map !== 'object') continue;
+      for (const [targetUserId, remark] of Object.entries(map)) {
+        const clean = String(remark || '').replace(/[《》"'`\r\n]/g, '').trim();
+        if (!targetUserId || !clean) continue;
+        const plan = this.userManager.getUserPlan(targetUserId);
+        if (!plan.alias || !plan.alias.trim()) {
+          plan.alias = clean;
+          this.userManager.saveUserPlan(plan);
+        }
+        changed = true;
+      }
     }
+    this.state.personalAliases = {};
+    if (changed) {
+      this.persist();
+    }
+  }
+
+  /**
+   * 获取指定用户的全员统一显示名称（全局唯一昵称 > 协议捕获名 > 默认编号“用户#N”）
+   */
+  public getDisplayName(targetUserId: string, _viewerUserId?: string): string {
     const plan = this.userManager.getUserPlan(targetUserId);
     if (plan.alias && plan.alias.trim()) {
       return plan.alias.trim();
@@ -212,10 +234,24 @@ export class RelayService {
     const plan = this.userManager.getUserPlan(userId);
     plan.alias = clean;
     this.userManager.saveUserPlan(plan);
+    this.clearPersonalAliasForTarget(userId);
     return {
       success: true,
-      message: `好嘞，我记住你叫「${clean}」啦！以后有朋友找你或帮你传话时都会这样称呼你~`,
+      message: `好嘞，全局唯一昵称已设为「${clean}」啦！以后无论谁查看通讯录或传话都统一显示这个名字~`,
     };
+  }
+
+  private clearPersonalAliasForTarget(targetUserId: string): void {
+    let changed = false;
+    for (const viewerId of Object.keys(this.state.personalAliases || {})) {
+      if (this.state.personalAliases[viewerId] && targetUserId in this.state.personalAliases[viewerId]) {
+        delete this.state.personalAliases[viewerId][targetUserId];
+        changed = true;
+      }
+    }
+    if (changed) {
+      this.persist();
+    }
   }
 
   public setContactRemark(
@@ -225,21 +261,20 @@ export class RelayService {
   ): { success: boolean; message: string } {
     const resolved = this.resolveRecipient(viewerUserId, targetQuery, true);
     if (resolved.status !== 'found' || !resolved.user) {
-      return { success: false, message: resolved.errorMessage || '没找到你想备注的这位用户呢~' };
+      return { success: false, message: resolved.errorMessage || '没找到你想改名的这位用户呢~' };
     }
     const clean = remark.replace(/[《》"'`\r\n]/g, '').trim();
     if (!clean || clean.length > 24) {
-      return { success: false, message: '备注名请在 1~24 个字符以内哦~' };
+      return { success: false, message: '昵称长度请在 1~24 个字符以内哦~' };
     }
-    if (!this.state.personalAliases[viewerUserId]) {
-      this.state.personalAliases[viewerUserId] = {};
-    }
-    this.state.personalAliases[viewerUserId][resolved.user.userId] = clean;
-    this.persist();
+    const plan = this.userManager.getUserPlan(resolved.user.userId);
+    plan.alias = clean;
+    this.userManager.saveUserPlan(plan);
+    this.clearPersonalAliasForTarget(resolved.user.userId);
 
     return {
       success: true,
-      message: `👌 记好啦！以后在你这边，「${resolved.user.displayName}」就对应备注为「${clean}」，直接说找「${clean}」就行！`,
+      message: `👌 已将「${resolved.user.displayName}」的全局昵称统一改为「${clean}」，现在所有人看到的都是「${clean}」啦！`,
     };
   }
 
@@ -305,8 +340,8 @@ export class RelayService {
     });
     lines.push('----------------------------------------');
     lines.push('💡 玩法提示：');
-    lines.push('• 登记自己名字：直接发「我叫小明」或 `/name 小明`');
-    lines.push('• 给别人起备注：发 `/alias 2 小红`（以后就能直接说“帮我问下小红...”）');
+    lines.push('• 修改自己昵称：直接发「我叫小明」或 `/name 小明`（全员统一显示）');
+    lines.push('• 给指定序号改名：发 `/alias 2 小红`（同步设为全员可见唯一昵称）');
     lines.push('• 隔空传话：发「你问一下小红最近有什么好看的电影」或 `/say 2 在吗`');
     return lines.join('\n');
   }

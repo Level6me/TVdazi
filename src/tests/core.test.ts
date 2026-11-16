@@ -328,6 +328,15 @@ test('RelayService supports user directory, nicknames, A->B relay and B->A reply
     assert.equal(relay.getDisplayName(userA), '小明');
     assert.equal(relay.getDisplayName(userB), '小红');
 
+    // 验证唯一全局昵称：通过 setContactRemark (/alias) 改名后，自己、对方和第三方看到的都是同一个名字
+    relay.setContactRemark(userA, '2', '桃子');
+    assert.equal(relay.getDisplayName(userB, userA), '桃子');
+    assert.equal(relay.getDisplayName(userB, userB), '桃子');
+    assert.equal(relay.getDisplayName(userB, '__third_viewer__'), '桃子');
+    // 改回 '小红' 以继续后续测试
+    relay.setContactRemark(userA, '2', '小红');
+    assert.equal(relay.getDisplayName(userB, userB), '小红');
+
     // A -> B 传话
     const sendRes = await relay.sendRelayMessage(userA, '小红', '最近有什么好看的电影');
     assert.equal(sendRes.success, true);
