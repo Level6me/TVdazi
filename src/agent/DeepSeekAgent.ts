@@ -11,6 +11,7 @@ import { LlmClientFactory } from '../utils/LlmClientFactory';
 import { MetadataResolver } from '../services/MetadataResolver';
 import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
+import { humanizeWithLlm, pickVariant } from '../utils/HumanTone';
 
 export interface RecognizedImageResult {
   standardTitle: string;
@@ -795,13 +796,25 @@ export class DeepSeekAgent {
           appendUserHistory(trimmed, statusReply);
           return statusReply;
         } else if (toolCall.function.name === 'set_save_directory') {
-          const dirReply = await this.commandHandler.handle(`/set-dir ${args.directory || ''}`, userId);
+          const rawDirReply = await this.commandHandler.handle(`/set-dir ${args.directory || ''}`, userId);
+          const dirReply = await humanizeWithLlm(userId, {
+            userInput: trimmed,
+            actionDesc: `帮用户把夸克网盘保存路径改成了「${args.directory || ''}」`,
+            rawResult: rawDirReply,
+            preserveExact: args.directory ? [String(args.directory).trim()] : [],
+          });
           appendUserHistory(trimmed, dirReply);
           return dirReply;
         } else if (toolCall.function.name === 'manage_scheduled_task') {
-          const schedReply = await SchedulerService.getInstance().createStructuredTask(userId, {
+          const rawSchedReply = await SchedulerService.getInstance().createStructuredTask(userId, {
             ...args,
             instruction: args.instruction || trimmed,
+          });
+          const schedReply = await humanizeWithLlm(userId, {
+            userInput: trimmed,
+            actionDesc: '帮用户设定了定时提醒、延后搜存或后台蹲守追更',
+            rawResult: rawSchedReply,
+            preserveExact: args.keyword ? [String(args.keyword).trim()] : [],
           });
           appendUserHistory(trimmed, schedReply);
           return schedReply;
@@ -810,22 +823,41 @@ export class DeepSeekAgent {
           const targetName = String(args.target_name || '').trim();
           const msgText = String(args.message || '').trim();
           const isReply = Boolean(args.is_reply) || (!targetName && Boolean(relaySvc.getPendingReply(userId)));
-          const relayReply = isReply
+          const rawRelayReply = isReply
             ? (await relaySvc.replyToLastSender(userId, msgText)).replyToReplier
             : (await relaySvc.sendRelayMessage(userId, targetName, msgText)).replyToSender;
+          const relayReply = await humanizeWithLlm(userId, {
+            userInput: trimmed,
+            actionDesc: '帮用户在微信里给另一位朋友传话/回话后的答复',
+            rawResult: rawRelayReply,
+          });
           appendUserHistory(trimmed, relayReply);
           return relayReply;
         } else if (toolCall.function.name === 'manage_user_directory') {
           const relaySvc = RelayService.getInstance();
           let dirReply = '';
           if (args.action === 'set_my_name') {
-            dirReply = relaySvc.setMyNickname(userId, String(args.name || '')).message;
+            const newName = String(args.name || '').trim();
+            const rawRes = relaySvc.setMyNickname(userId, newName).message;
+            dirReply = await humanizeWithLlm(userId, {
+              userInput: trimmed,
+              actionDesc: `记住对方改名叫「${newName}」`,
+              rawResult: rawRes,
+              preserveExact: newName ? [newName] : [],
+            });
           } else if (args.action === 'set_contact_alias') {
-            dirReply = relaySvc.setContactRemark(
+            const newName = String(args.name || '').trim();
+            const rawRes = relaySvc.setContactRemark(
               userId,
               String(args.target_query || ''),
-              String(args.name || '')
+              newName
             ).message;
+            dirReply = await humanizeWithLlm(userId, {
+              userInput: trimmed,
+              actionDesc: `把通讯录里某位朋友改名叫「${newName}」`,
+              rawResult: rawRes,
+              preserveExact: newName ? [newName] : [],
+            });
           } else {
             dirReply = relaySvc.renderDirectoryText(userId);
           }
@@ -838,8 +870,13 @@ export class DeepSeekAgent {
             recommendReason: args.recommend_note ? String(args.recommend_note) : undefined,
             selectionIndex: typeof args.selection_index === 'number' ? args.selection_index : undefined,
           });
-          appendUserHistory(trimmed, shareRes.replyToSender);
-          return shareRes.replyToSender;
+          const shareReply = await humanizeWithLlm(userId, {
+            userInput: trimmed,
+            actionDesc: '替用户把好电影安利发给了另一位微信好友',
+            rawResult: shareRes.replyToSender,
+          });
+          appendUserHistory(trimmed, shareReply);
+          return shareReply;
         } else if (toolCall.function.name === 'update_user_taste_profile') {
           const profileSvc = UserProfileService.getInstance();
           let profileReply = '';
@@ -847,7 +884,14 @@ export class DeepSeekAgent {
             profileReply = profileSvc.renderProfileCard(userId);
           } else if (args.action === 'reset') {
             profileSvc.clearProfile(userId);
-            profileReply = '✅ 已清空你的个人观影口味画像，之后会根据你的新喜好重新学习！';
+            profileReply = await humanizeWithLlm(userId, {
+              userInput: trimmed,
+              actionDesc: '帮用户把之前的口味偏好清空重来了',
+              rawResult: pickVariant([
+                '行嘞，之前的偏好我都清空啦，后面咱们重新慢慢记~',
+                '好，给你把口味记录清干净了，你想看啥重新告诉我就是',
+              ], `prof_reset:${userId}`),
+            });
           } else {
             const nlpParsed = profileSvc.parseNaturalLanguagePreference(trimmed);
             const mergeArr = (a: unknown, b: string[]) =>
@@ -863,7 +907,16 @@ export class DeepSeekAgent {
               dislikeGenres: mergeArr(args.dislike_genres, nlpParsed.dislikeGenres),
               dislikeTitles: nlpParsed.dislikeTitles,
             });
-            profileReply = `👌 已记住你的偏好并完成算法画像分析，后续推片会精准匹配你的口味~\n\n${profileSvc.renderProfileCard(userId)}`;
+            const opener = await humanizeWithLlm(userId, {
+              userInput: trimmed,
+              actionDesc: '顺着用户的品味描述热情搭话一句，表示已经记下他的观影偏好，后面推片会照着这个来',
+              rawResult: pickVariant([
+                '懂你的点啦！这些喜好我都记下来，后面给你推片准合胃口~',
+                '可以啊品味很稳！我帮你存进小本本里了，下次推片就按这个来',
+                '记好咯~ 以后挑片优先按你喜欢的路子找，雷区也帮你避开',
+              ], `prof_upd:${userId}`),
+            });
+            profileReply = `${opener}\n\n${profileSvc.renderProfileCard(userId)}`;
           }
           appendUserHistory(trimmed, profileReply);
           return profileReply;
@@ -890,13 +943,28 @@ export class DeepSeekAgent {
     const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '早', '晚上好', '在么', '你是谁', '你叫什么'];
     const lower = text.toLowerCase().replace(/[？?！!。，,\s]/g, '');
     if (greetings.includes(lower)) {
-      return '嗨，我是你的网盘看片小助手 电视搭子 (TVdazi)！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
+      return pickVariant(
+        [
+          '嗨~ 在呢！最近剧荒还是想找哪部片子？直接把名字甩给我，我帮你翻网盘~',
+          '哈喽呀！今天想看点啥？电影、剧、综艺还是动画，喊一声就行！',
+          '在呢在呢，刚泡好茶等你点片，发片名或者说说想看啥口味都行~',
+        ],
+        `greet:${userId}`
+      );
     }
 
     if (UserProfileService.isNaturalPreferenceStatement(text)) {
       const profileSvc = UserProfileService.getInstance();
       profileSvc.applyNaturalLanguagePreference(userId, text);
-      return `👌 已记住你的偏好并完成算法画像分析，后续推片会精准匹配你的口味~\n\n${profileSvc.renderProfileCard(userId)}`;
+      const opener = pickVariant(
+        [
+          '懂你的胃口啦！我已经记下来了，后面推片就照着这口味来~',
+          '收到！这品味妥妥的，我存进你的口味档案里咯',
+          '记好啦，后面帮你挑片优先找这几类，不喜欢的直接帮你绕开~',
+        ],
+        `offline_prof:${userId}`
+      );
+      return `${opener}\n\n${profileSvc.renderProfileCard(userId)}`;
     }
 
     // 明显是日常聊天/疑问句且并非具体片名时，API 异常时友好提示而不是硬搜 50 个频道
@@ -904,7 +972,7 @@ export class DeepSeekAgent {
       text.length > 18 ||
       /(?:为什么|怎么回事|怎么样|天气|吃什么|谢谢|哈哈|好的|知道了|没事|在干嘛|干什么)/.test(text);
     if (isApiError && looksLikeChatQuestion) {
-      return '哎呀，AI 助手刚刚开了个小差 😅\n如果是想找影视资源，可以直接发送「搜 片名」（如：搜 庆余年），或者发送 /help 查看快捷指令！';
+      return '刚刚走神卡了一下 😅 要搜片直接回我「搜 片名」，或者发 /help 看看能玩啥~';
     }
 
     return await this.commandHandler.renderSearch(text, userId, { onProgress });

@@ -6,6 +6,7 @@ import { SessionManager } from './SessionManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
 import { UserProfileService } from './UserProfileService';
 import { SerializedJsonStore } from '../utils/StorageQueue';
+import { pickVariant, humanizeWithLlm } from '../utils/HumanTone';
 
 export interface ActiveWechatContact {
   userId: string;
@@ -229,7 +230,16 @@ export class RelayService {
   public setMyNickname(userId: string, nickname: string): { success: boolean; message: string } {
     const clean = nickname.replace(/[《》"'`\r\n]/g, '').trim();
     if (!clean || clean.length > 24) {
-      return { success: false, message: '昵称长度请在 1~24 个字符以内哦，例如：`/name 小明`' };
+      return {
+        success: false,
+        message: pickVariant(
+          [
+            '名字太长或空着呢，给我个 1~24 个字以内的称呼吧，比如直接说「我叫小明」~',
+            '这名字长度不太对劲呀，换个 24 字以内的简短称呼试试？',
+          ],
+          `nick_err:${userId}`
+        ),
+      };
     }
     const plan = this.userManager.getUserPlan(userId);
     plan.alias = clean;
@@ -237,7 +247,15 @@ export class RelayService {
     this.clearPersonalAliasForTarget(userId);
     return {
       success: true,
-      message: `好嘞，全局唯一昵称已设为「${clean}」啦！以后无论谁查看通讯录或传话都统一显示这个名字~`,
+      message: pickVariant(
+        [
+          `记下来啦，以后我就喊你「${clean}」了，大伙儿看通讯录也都是这个名字~`,
+          `行嘞「${clean}」！这名字好记，以后帮你递话我都这么叫`,
+          `收到~ 从现在起你这边就叫「${clean}」啦，大家都看得到的`,
+          `妥妥的，以后我就认准「${clean}」这个名儿了，传话也按这个来`,
+        ],
+        `nick_ok:${userId}`
+      ),
     };
   }
 
@@ -261,20 +279,28 @@ export class RelayService {
   ): { success: boolean; message: string } {
     const resolved = this.resolveRecipient(viewerUserId, targetQuery, true);
     if (resolved.status !== 'found' || !resolved.user) {
-      return { success: false, message: resolved.errorMessage || '没找到你想改名的这位用户呢~' };
+      return { success: false, message: resolved.errorMessage || '没翻到你想改名的那位朋友呢，发「通讯录」看下序号？' };
     }
     const clean = remark.replace(/[《》"'`\r\n]/g, '').trim();
     if (!clean || clean.length > 24) {
-      return { success: false, message: '昵称长度请在 1~24 个字符以内哦~' };
+      return { success: false, message: '昵称写 1~24 个字以内就好，太长记不住啦~' };
     }
     const plan = this.userManager.getUserPlan(resolved.user.userId);
     plan.alias = clean;
     this.userManager.saveUserPlan(plan);
     this.clearPersonalAliasForTarget(resolved.user.userId);
 
+    const oldName = resolved.user.displayName;
     return {
       success: true,
-      message: `👌 已将「${resolved.user.displayName}」的全局昵称统一改为「${clean}」，现在所有人看到的都是「${clean}」啦！`,
+      message: pickVariant(
+        [
+          `搞定！已经把「${oldName}」改成「${clean}」了，现在大家看到的都统一叫「${clean}」~`,
+          `行嘞，「${oldName}」这会儿已经换成「${clean}」啦，所有人两边都能对上号`,
+          `记下啦，通讯录里把「${oldName}」改名叫「${clean}」了，以后找他直接喊这名就行`,
+        ],
+        `alias_ok:${viewerUserId}`
+      ),
     };
   }
 
@@ -286,8 +312,20 @@ export class RelayService {
     this.persist();
 
     return enabled
-      ? '🔕 已为你开启传话免打扰，其他人暂时无法通过我给你传话啦（发送 `/dnd off` 可恢复）。'
-      : '🔔 已关闭传话免打扰，现在可以正常接收大家托我带的话啦~';
+      ? pickVariant(
+          [
+            '好，先帮你把传话免打扰打开啦，这阵子没人能托我给你带话，想关了随时跟我说一声~',
+            '收到，开启免打扰了，暂时帮你挡掉大家的传话，想恢复发 `/dnd off` 就行',
+          ],
+          `dnd_on:${userId}`
+        )
+      : pickVariant(
+          [
+            '好嘞，免打扰关掉啦，朋友们有啥话都能正常给你捎过来了~',
+            '恢复啦！现在别人给你带话我又能帮你递过来了',
+          ],
+          `dnd_off:${userId}`
+        );
   }
 
   public isDndEnabled(userId: string): boolean {
@@ -326,23 +364,17 @@ export class RelayService {
   public renderDirectoryText(viewerUserId: string): string {
     const list = this.getDirectory(viewerUserId);
     if (list.length === 0) {
-      return '当前还没有记录到已接入的微信用户呢~ 大家先和我发一条消息后就会自动出现在通讯录里啦！';
+      return '通讯录这会儿还是空的呢，等朋友也跟我聊过天就会自动出现在这儿啦~';
     }
 
-    const lines = [
-      `👥 【当前服务已接入 ${list.length} 位微信用户】`,
-      '----------------------------------------',
-    ];
+    const lines = [`👥 认识的小伙伴都在这（共 ${list.length} 位）：`];
     list.forEach((u) => {
-      const selfTag = u.isSelf ? ' (我)' : '';
-      const nameTag = u.hasCustomAlias ? u.displayName : `${u.displayName} [未设昵称]`;
-      lines.push(`${u.index}. ${nameTag}${selfTag} · 标识: ${u.maskedId}`);
+      const selfTag = u.isSelf ? '（我）' : '';
+      const nameTag = u.hasCustomAlias ? u.displayName : `${u.displayName} · 还没起名`;
+      lines.push(`${u.index}. ${nameTag}${selfTag}`);
     });
-    lines.push('----------------------------------------');
-    lines.push('💡 玩法提示：');
-    lines.push('• 修改自己昵称：直接发「我叫小明」或 `/name 小明`（全员统一显示）');
-    lines.push('• 给指定序号改名：发 `/alias 2 小红`（同步设为全员可见唯一昵称）');
-    lines.push('• 隔空传话：发「你问一下小红最近有什么好看的电影」或 `/say 2 在吗`');
+    lines.push('');
+    lines.push('想改名直接说「我叫某某」或「把2号改名叫某某」就行，找谁带话也可以直接喊名字~');
     return lines.join('\n');
   }
 
@@ -501,18 +533,33 @@ export class RelayService {
     const senderNameForTarget = this.getDisplayName(fromUserId, recipient.userId);
     const recipientNameForTarget = this.getDisplayName(recipient.userId, recipient.userId);
 
-    const outboundText = [
-      `💬 ${recipientNameForTarget}，${senderNameForTarget} 托我给你带句话：`,
-      `「${content}」`,
-      '----------------------------------------',
-      `💡 想回复的话，直接跟我说「跟他说 ...」或「/reply ...」我就会帮你原话带回去哦！`,
-    ].join('\n');
+    const baseOutbound = pickVariant(
+      [
+        `${recipientNameForTarget}，${senderNameForTarget} 刚才托我给你带句话：「${content}」\n有啥想回他的直接跟我说，我马上帮你捎回去~`,
+        `嗨 ${recipientNameForTarget}，${senderNameForTarget} 刚找我让我转告你：「${content}」\n怎么回他直接打字发我就行！`,
+        `${recipientNameForTarget} 在忙不？${senderNameForTarget} 刚让我跟你说一声：「${content}」\n想回话直接告诉我，我帮你传过去~`,
+        `刚 ${senderNameForTarget} 递了句话让我转给 ${recipientNameForTarget}：「${content}」\n回他直接说「跟他说…」就行，我随叫随到`,
+      ],
+      `relay_out:${recipient.userId}`
+    );
+
+    const outboundText = await humanizeWithLlm(fromUserId, {
+      actionDesc: `在微信上替「${senderNameForTarget}」向「${recipientNameForTarget}」传一句日常话（顺带一句自然引导说“想回他直接跟我说就行”）`,
+      rawResult: baseOutbound,
+      preserveExact: [recipientNameForTarget, senderNameForTarget, content],
+    });
 
     const delivered = await PushGateway.getInstance().sendToUser(recipient.userId, outboundText);
     if (!delivered) {
       return {
         success: false,
-        replyToSender: `哎呀，给「${recipient.displayName}」发消息时微信通道暂时没响应（可能尚未绑定推送或对方会话已过期），请稍后再试一次~`,
+        replyToSender: pickVariant(
+          [
+            `哎呀，刚才敲「${recipient.displayName}」微信没发过去（可能对方好久没跟我说过话了），过一会儿再试试？`,
+            `唔，「${recipient.displayName}」那边暂时没连上微信，等会再喊我帮你捎过去吧~`,
+          ],
+          `relay_fail:${fromUserId}`
+        ),
       };
     }
 
@@ -536,15 +583,22 @@ export class RelayService {
     }
     this.persist();
 
-
     const senderPlan = this.userManager.getUserPlan(fromUserId);
     const aliasTip = !senderPlan.alias
-      ? `\n💡 小提示：你还没设置自己的名字，现在对方看到的是「${senderNameForTarget}」；随时对我说「我叫你的名字」我就记住啦！`
+      ? `（顺便提一嘴，你还没起名字呢，对方现在看到你是「${senderNameForTarget}」，说句「叫我某某」我就能记住）`
       : '';
 
     return {
       success: true,
-      replyToSender: `📨 已帮你把话带给「${recipient.displayName}」啦！等对方回复后我第一时间转达给你~${aliasTip}`,
+      replyToSender: pickVariant(
+        [
+          `好嘞，已经帮你在微信上跟「${recipient.displayName}」说了，等他回了我立刻喊你~${aliasTip}`,
+          `搞定，原话已经给「${recipient.displayName}」捎过去啦！有回信我第一时间转给你${aliasTip}`,
+          `放心吧，找「${recipient.displayName}」传过话了，坐等他回消息~${aliasTip}`,
+          `已经帮您递给「${recipient.displayName}」咯，一有动静我马上告诉你！${aliasTip}`,
+        ],
+        `relay_ack:${fromUserId}`
+      ),
     };
   }
 
@@ -578,18 +632,26 @@ export class RelayService {
     const replierNameForTarget = this.getDisplayName(replierUserId, pending.fromUserId);
     const targetName = this.getDisplayName(pending.fromUserId, pending.fromUserId);
 
-    const outboundText = [
-      `📩 ${targetName}，${replierNameForTarget} 回复你啦：`,
-      `「${content}」`,
-      '----------------------------------------',
-      `💡 还可以继续对我说「跟他说 ...」接着聊哦！`,
-    ].join('\n');
+    const baseReplyOutbound = pickVariant(
+      [
+        `${targetName}，${replierNameForTarget} 刚回你消息了：「${content}」\n还要接着聊就直接跟我说，我继续替你传过去~`,
+        `有回音啦！${replierNameForTarget} 让我给 ${targetName} 回一句：「${content}」\n还想回话随时发我~`,
+        `${targetName}，刚才 ${replierNameForTarget} 托我带回句话：「${content}」\n直接说「跟他说…」我再帮你递回去`,
+      ],
+      `reply_out:${pending.fromUserId}`
+    );
+
+    const outboundText = await humanizeWithLlm(replierUserId, {
+      actionDesc: `把「${replierNameForTarget}」的回信自然地转达给「${targetName}」`,
+      rawResult: baseReplyOutbound,
+      preserveExact: [targetName, replierNameForTarget, content],
+    });
 
     const delivered = await PushGateway.getInstance().sendToUser(pending.fromUserId, outboundText);
     if (!delivered) {
       return {
         success: false,
-        replyToReplier: `哎呀，把回复发给「${pending.fromDisplayName}」时通道异常，请稍后再试~`,
+        replyToReplier: `哎呀，给「${pending.fromDisplayName}」回消息时没发出去，等会儿再试试吧~`,
       };
     }
 
@@ -613,10 +675,16 @@ export class RelayService {
     }
     this.persist();
 
-
     return {
       success: true,
-      replyToReplier: `✅ 收到！已帮你把话转达给「${pending.fromDisplayName}」啦~`,
+      replyToReplier: pickVariant(
+        [
+          `妥了，原话已经替你传回给「${pending.fromDisplayName}」啦~`,
+          `收到！刚帮你在微信上把这句回给「${pending.fromDisplayName}」了`,
+          `好嘞，已转告「${pending.fromDisplayName}」，等他再回我就叫你`,
+        ],
+        `reply_ack:${replierUserId}`
+      ),
     };
   }
 
@@ -717,34 +785,39 @@ export class RelayService {
     const note = (options?.recommendReason || '').trim();
 
     const yearPart = year ? ` (${year})` : '';
-    const ratePart = rate ? ` · ⭐ 豆瓣 ${rate}` : '';
+    const ratePart = rate ? ` · ⭐ ${rate}分` : '';
+    const intro = pickVariant(
+      [
+        `🎬 ${recipientNameForTarget}，${senderNameForTarget} 刚让我给你安利一部片：`,
+        `嗨 ${recipientNameForTarget}，${senderNameForTarget} 觉得这部超不错，非让我推给你看看：`,
+        `${recipientNameForTarget}，刚收到 ${senderNameForTarget} 的好片投喂👇`,
+      ],
+      `share_intro:${recipient.userId}`
+    );
     const cardLines = [
-      `🎬 ${recipientNameForTarget}，${senderNameForTarget} 给你安利了一部好片！`,
-      '----------------------------------------',
+      intro,
       `📽️ 《${title}》${yearPart}${ratePart}`,
     ];
     if (types && types.length > 0) {
-      cardLines.push(`🏷️ 类型：${types.slice(0, 4).join(' / ')}`);
+      cardLines.push(`标签：${types.slice(0, 4).join(' / ')}`);
     }
     if (shortComment) {
-      cardLines.push(`✨ 亮点：${shortComment.slice(0, 80)}`);
+      cardLines.push(`看点：${shortComment.slice(0, 80)}`);
     }
     if (note) {
-      cardLines.push(`💬 ${senderNameForTarget}附言：${note}`);
+      cardLines.push(`${senderNameForTarget} 说：「${note}」`);
     }
     if (sharedResourceUrl) {
-      cardLines.push(`🔗 附带网盘链接：${sharedResourceUrl}`);
+      cardLines.push(`网盘直达：${sharedResourceUrl}`);
     }
-    cardLines.push('----------------------------------------');
-    cardLines.push('💡 你可以直接回复：');
-    cardLines.push(`• 发「搜一下」或「存一下」：马上全网搜存《${title}》到你的网盘`);
-    cardLines.push(`• 发「跟他说 ...」或「/reply ...」：把你的反馈转达给 ${senderNameForTarget}`);
+    cardLines.push('');
+    cardLines.push(`想看直接回个「存一下」或「搜一下」我帮你存好；要回 ${senderNameForTarget} 话也直接跟我说~`);
 
     const delivered = await PushGateway.getInstance().sendToUser(recipient.userId, cardLines.join('\n'));
     if (!delivered) {
       return {
         success: false,
-        replyToSender: `哎呀，把《${title}》推给「${recipient.displayName}」时微信通道暂时没响应，请稍后再试一次~`,
+        replyToSender: `哎呀，想把《${title}》递给「${recipient.displayName}」但暂时没连上微信，等会儿再试试？`,
       };
     }
 
@@ -788,12 +861,19 @@ export class RelayService {
 
     const senderPlan = this.userManager.getUserPlan(fromUserId);
     const aliasTip = !senderPlan.alias
-      ? `\n💡 小提示：你还没设置自己的昵称，现在对方看到的是「${senderNameForTarget}」；发送「我叫你的名字」我就记住啦！`
+      ? `（对了，你还没起名字，他现在看到的是「${senderNameForTarget}」，说一句「叫我某某」就能改啦）`
       : '';
 
     return {
       success: true,
-      replyToSender: `🎉 已把《${title}》推荐卡片发给「${recipient.displayName}」啦！对方可直接一键搜存或回话给你~${aliasTip}`,
+      replyToSender: pickVariant(
+        [
+          `好嘞，已经把《${title}》推荐给「${recipient.displayName}」了！他要看直接回复我就能存~${aliasTip}`,
+          `搞定，《${title}》安利卡片已经给「${recipient.displayName}」发过去啦，看看他喜不喜欢~${aliasTip}`,
+          `推过去啦！《${title}》已送达「${recipient.displayName}」，他有回话我再来告诉你${aliasTip}`,
+        ],
+        `share_ack:${fromUserId}`
+      ),
     };
   }
 }

@@ -323,6 +323,12 @@ test('RelayService supports user directory, nicknames, A->B relay and B->A reply
     const relay = RelayService.createIsolatedForTest(statePath, routesPath);
     assert.equal(relay.getDirectory(userA).length, 2);
 
+    // 验证真人感话术：不含机械系统术语，连续调用不死板重复
+    const n1 = relay.setMyNickname(userA, '小二').message;
+    const n2 = relay.setMyNickname(userA, '小二').message;
+    assert.equal(n1.includes('全局唯一'), false);
+    assert.notEqual(n1, n2);
+
     relay.setMyNickname(userA, '小明');
     relay.setMyNickname(userB, '小红');
     assert.equal(relay.getDisplayName(userA), '小明');
@@ -344,6 +350,7 @@ test('RelayService supports user directory, nicknames, A->B relay and B->A reply
     assert.equal(sentPackets[0].to, userB);
     assert.ok(sentPackets[0].text.includes('小明'));
     assert.ok(sentPackets[0].text.includes('最近有什么好看的电影'));
+    assert.equal(sentPackets[0].text.includes('----'), false);
 
     // B 收到后记住上下文，直接回复给 A
     const pendingB = relay.getPendingReply(userB);
@@ -764,24 +771,25 @@ test('UserProfileService & DeepSeekAgent parse natural language preferences for 
     assert.ok(webDetail.topDecades.some((d) => d.name === '2010s'));
 
     const card = svc.renderProfileCard(testUser);
-    assert.ok(card.includes('专属观影口味画像 · AI 算法分析'));
-    assert.ok(card.includes('影视形态'));
+    assert.ok(card.includes('专属观影口味画像'));
+    assert.ok(card.includes('常看影视形态'));
     assert.ok(card.includes('美剧'));
     assert.ok(card.includes('动画'));
     assert.ok(card.includes('综艺'));
     assert.ok(card.includes('恐怖'));
 
-    // 验证无 Key 离线兜底时 DeepSeekAgent 也能直接识别自然语言偏好并输出算法画像
+    // 验证无 Key 离线兜底时 DeepSeekAgent 也能直接识别自然语言偏好并输出自然口吻画像
     const prevKey = process.env.DEEPSEEK_API_KEY;
     delete process.env.DEEPSEEK_API_KEY;
     try {
       const agent = new DeepSeekAgent();
       const reply = await agent.chat('我比较爱看美剧、日剧、纪录片和脱口秀，不看古装剧', '__nl_agent_offline_test__');
-      assert.ok(reply.includes('专属观影口味画像 · AI 算法分析'));
+      assert.ok(reply.includes('专属观影口味画像'));
       assert.ok(reply.includes('美剧'));
       assert.ok(reply.includes('日剧'));
       assert.ok(reply.includes('纪录片'));
       assert.ok(reply.includes('古装'));
+      assert.equal(reply.includes('算法画像分析'), false);
     } finally {
       if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;
     }

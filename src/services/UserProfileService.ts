@@ -1108,30 +1108,26 @@ export class UserProfileService {
       a.dislikedMediaTypes.length === 0
     ) {
       return [
-        '🎯 【我的影视口味画像】',
-        '----------------------------------------',
-        '目前画像还在冷启动中哦~',
-        '💡 你可以直接用自然语言跟我说：',
-        '• “我平时喜欢看韩国悬疑电影和搞笑综艺”',
-        '• “我很爱看《漫长的季节》这种悬疑剧，不喜欢恐怖片”',
-        '• 或者平时搜片转存几部作品，算法就会自动分析你的画像！',
+        '🎯 你的专属观影口味画像还没攒够数据呢~',
+        '随便跟我聊聊平时爱看啥就行，比如：',
+        '• 「我喜欢看韩国悬疑电影和搞笑综艺」',
+        '• 「最近迷上了《漫长的季节》，我不看恐怖片」',
+        '或者平常用我搜几部、存几部片子，我慢慢就摸清你的喜好了！',
       ].join('\n');
     }
 
     const lines = [
-      '🎯 【专属观影口味画像 · AI 算法分析】',
-      '----------------------------------------',
-      `🧠 画像定位：${a.personaLabel}（置信度 ${a.confidence}%）`,
-      `📊 口味分布：${a.diversityLabel}`,
+      '🎯 你的专属观影口味画像',
+      `🧭 大致路数：${a.personaLabel} · ${a.diversityLabel.replace(/（.*）/, '')}`,
     ];
     if (a.mediaTypeDistribution.length > 0) {
-      lines.push(`📺 影视形态：${a.mediaTypeDistribution.map((m) => `${m.name} ${m.ratio}%`).join(' · ')}`);
+      lines.push(`📺 常看影视形态：${a.mediaTypeDistribution.map((m) => `${m.name} ${m.ratio}%`).join(' · ')}`);
     }
     if (a.topGenres.length > 0) {
-      lines.push(`🎭 偏好题材：${a.topGenres.map((g) => `${g.name}(${g.score})`).join(' · ')}`);
+      lines.push(`🎭 偏爱题材：${a.topGenres.map((g) => g.name).join('、')}`);
     }
     if (a.topRegions.length > 0) {
-      lines.push(`🌍 常看地区：${a.topRegions.map((r) => `${r.name}(${r.score})`).join(' · ')}`);
+      lines.push(`🌍 常看地区：${a.topRegions.map((r) => r.name).join('、')}`);
     }
     if (a.topDirectors.length > 0) {
       lines.push(`🎬 钟爱导演：${a.topDirectors.map((d) => d.name).join('、')}`);
@@ -1140,15 +1136,13 @@ export class UserProfileService {
       lines.push(`🌟 偏爱演员：${a.topActors.map((x) => x.name).join('、')}`);
     }
     if (a.favoriteSeeds.length > 0) {
-      lines.push(`❤️ 心头好片：${a.favoriteSeeds.map((t) => `《${t}》`).join('、')}`);
+      lines.push(`❤️ 心头好：${a.favoriteSeeds.map((t) => `《${t}》`).join('、')}`);
     }
     if (a.dislikedGenres.length > 0 || a.dislikedMediaTypes.length > 0) {
       const blocks = [...a.dislikedMediaTypes, ...a.dislikedGenres];
-      lines.push(`🚫 排雷屏蔽：${blocks.join('、')}`);
+      lines.push(`🚫 避雷屏蔽：${blocks.join('、')}`);
     }
-    lines.push(`📈 推片策略：${a.recommendationStrategy}`);
-    lines.push('----------------------------------------');
-    lines.push('💡 随时说“我喜欢xxx / 不看xxx”即可动态更新；发 `/profile reset` 可清空重建。');
+    lines.push('有想调整的直接跟我说「我喜欢xxx / 不看xxx」就行~');
     return lines.join('\n');
   }
 }
