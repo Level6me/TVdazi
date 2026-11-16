@@ -263,6 +263,18 @@ export async function handleExtendedCommand(
     return res.replyToSender;
   }
 
+  if (['/share-movie', '/recommend-to', '/推片', '/安利'].includes(cmd)) {
+    const targetQuery = args[0] || '';
+    const movieTitle = args.slice(1).join(' ').trim();
+    if (!targetQuery) {
+      return '用法：`/share-movie <对方名字或序号> [片名]`（不填片名时会自动分享刚刚看中的电影哦！）';
+    }
+    const res = await relay.shareMovieToUser(userId, targetQuery, {
+      movieTitle: movieTitle || undefined,
+    });
+    return res.replyToSender;
+  }
+
   if (['/reply', '/回复传话', '/回话'].includes(cmd)) {
     if (!rawArg) {
       return '请写上要回复给对方的话，例如：`/reply 最近《周处除三害》不错`';

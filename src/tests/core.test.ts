@@ -18,6 +18,8 @@ import { getPanRegistry } from '../services/pan';
 import { CommandHandler } from '../commands/CommandHandler';
 import { PushGateway } from '../services/PushGateway';
 import { RelayService } from '../services/RelayService';
+import { SessionManager } from '../services/SessionManager';
+import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 
 test('Logger.maskSensitive hides API keys, cookies and slash commands', () => {
   assert.equal(maskSensitive('/set-quark __pus=abc123; __kp=xyz'), '/set-quark [REDACTED]');
@@ -321,6 +323,50 @@ test('RelayService supports user directory, nicknames, A->B relay and B->A reply
     const blockedRes = await relay.sendRelayMessage(userA, '小红', '晚上还聊吗');
     assert.equal(blockedRes.success, false);
     assert.ok(blockedRes.replyToSender.includes('免打扰'));
+
+    // 恢复免打扰，测试把刚推荐/看中的电影安利分享给好友 B
+    relay.setDnd(userB, false);
+    const sm = SessionManager.getInstance();
+    sm.setHot(userA, 'movie', [
+      {
+        id: '1292052',
+        title: '沙丘2',
+        rate: '8.3',
+        year: '2024',
+        types: ['科幻', '冒险'],
+        shortComment: '史诗级视听震撼',
+        cover: '',
+        url: '',
+      },
+    ]);
+    sm.setSearch(userA, '沙丘2', [
+      {
+        title: '沙丘2 4K 杜比视界',
+        shareUrl: 'https://pan.quark.cn/s/dune2test',
+        shareId: 'dune2test',
+        panType: 'quark',
+      },
+    ]);
+
+    const shareRes = await relay.shareMovieToUser(userA, '小红', {
+      recommendReason: '这部电影很不错，推荐给你',
+      skipNetworkLookup: true,
+    });
+    assert.equal(shareRes.success, true);
+    assert.equal(sentPackets.length, 3);
+    assert.equal(sentPackets[2].to, userB);
+    assert.ok(sentPackets[2].text.includes('《沙丘2》'));
+    assert.ok(sentPackets[2].text.includes('8.3'));
+    assert.ok(sentPackets[2].text.includes('https://pan.quark.cn/s/dune2test'));
+
+    // 验证 B 收到推荐卡片后可直接说“存一下”或“搜一下”触发一键搜存，且“把这部电影推荐给朋友”不会被误判为机器人邀请二维码
+    const agent = new DeepSeekAgent('dummy');
+    assert.equal(agent.isPendingImageSearchConfirm(userB, '存一下'), true);
+    assert.equal(agent.isPendingImageSearchConfirm(userB, '搜一下'), true);
+    assert.equal(new CommandHandler().isCommand('这部电影不错把这部电影推荐给朋友吧', userA), false);
+
+    sm.clearSession(userA);
+    sm.clearPendingImageSearch(userB);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
     for (const u of [userA, userB]) {

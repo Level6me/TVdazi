@@ -2,6 +2,8 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { UserManager } from './UserManager';
 import { PushGateway } from './PushGateway';
+import { SessionManager } from './SessionManager';
+import { DoubanService, DoubanSubject } from './DoubanService';
 import { SerializedJsonStore } from '../utils/StorageQueue';
 
 export interface ActiveWechatContact {
@@ -572,6 +574,174 @@ export class RelayService {
     return {
       success: true,
       replyToReplier: `✅ 收到！已帮你把话转达给「${pending.fromDisplayName}」啦~`,
+    };
+  }
+
+  /**
+   * 从当前用户会话或指定参数提取影视详情，并将结构化安利卡片分享给另一位微信用户
+   */
+  public async shareMovieToUser(
+    fromUserId: string,
+    targetQuery: string,
+    options?: {
+      movieTitle?: string;
+      recommendReason?: string;
+      selectionIndex?: number;
+      skipNetworkLookup?: boolean;
+    }
+  ): Promise<{ success: boolean; replyToSender: string }> {
+    const resolved = this.resolveRecipient(fromUserId, targetQuery, false);
+    if (resolved.status !== 'found' || !resolved.user) {
+      return { success: false, replyToSender: resolved.errorMessage || '没找到你想推荐给哪位朋友哦~' };
+    }
+
+    const recipient = resolved.user;
+    if (this.isDndEnabled(recipient.userId)) {
+      return {
+        success: false,
+        replyToSender: `对方（${recipient.displayName}）当前开启了传话免打扰，暂时无法推送影视分享哦~`,
+      };
+    }
+
+    const sessionMgr = SessionManager.getInstance();
+    const hotSess = sessionMgr.getHot(fromUserId);
+    const searchSess = sessionMgr.getSearch(fromUserId);
+
+    let title = (options?.movieTitle || '').replace(/[《》]/g, '').trim();
+    let matchedSubject: DoubanSubject | undefined;
+
+    if (options?.selectionIndex && hotSess?.items && hotSess.items[options.selectionIndex - 1]) {
+      matchedSubject = hotSess.items[options.selectionIndex - 1];
+      if (!title) title = matchedSubject.title;
+    }
+
+    if (!title) {
+      title = sessionMgr.getRecentTargetTitle(fromUserId) || '';
+    }
+
+    if (!title) {
+      return {
+        success: false,
+        replyToSender:
+          '我还没知道你想分享哪部电影或剧集呢 😅\n你可以直接说「把《片名》推荐给 ' +
+          recipient.displayName +
+          '」，或者先让我给你推荐一部好片再分享哦！',
+      };
+    }
+
+    if (!matchedSubject && hotSess?.items) {
+      const lowerTitle = title.toLowerCase();
+      matchedSubject = hotSess.items.find(
+        (s) => s.title.toLowerCase() === lowerTitle || s.title.toLowerCase().includes(lowerTitle)
+      );
+    }
+
+    let year = matchedSubject?.year;
+    let rate = matchedSubject?.rate;
+    let types = matchedSubject?.types;
+    let shortComment = matchedSubject?.shortComment;
+    let mediaType: 'movie' | 'tv' | undefined = hotSess?.type;
+
+    if (!year && !rate && !options?.skipNetworkLookup) {
+      try {
+        const meta = await Promise.race([
+          new DoubanService().getMovieMeta(title),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 2200)),
+        ]);
+        if (meta) {
+          year = meta.year || year;
+          if (!title && meta.title) title = meta.title;
+        }
+      } catch {}
+    }
+
+    let sharedResourceUrl: string | undefined;
+    if (searchSess?.items && searchSess.items.length > 0) {
+      const lowerTitle = title.toLowerCase();
+      const kwMatch =
+        searchSess.keyword.toLowerCase().includes(lowerTitle) ||
+        lowerTitle.includes(searchSess.keyword.toLowerCase());
+      const resHit = kwMatch
+        ? searchSess.items.find((i) => i.panType === 'quark') || searchSess.items[0]
+        : searchSess.items.find((i) => i.title.toLowerCase().includes(lowerTitle));
+      if (resHit?.shareUrl) {
+        sharedResourceUrl = resHit.shareUrl;
+      }
+    }
+
+    const senderNameForTarget = this.getDisplayName(fromUserId, recipient.userId);
+    const recipientNameForTarget = this.getDisplayName(recipient.userId, recipient.userId);
+    const note = (options?.recommendReason || '').trim();
+
+    const yearPart = year ? ` (${year})` : '';
+    const ratePart = rate ? ` · ⭐ 豆瓣 ${rate}` : '';
+    const cardLines = [
+      `🎬 ${recipientNameForTarget}，${senderNameForTarget} 给你安利了一部好片！`,
+      '----------------------------------------',
+      `📽️ 《${title}》${yearPart}${ratePart}`,
+    ];
+    if (types && types.length > 0) {
+      cardLines.push(`🏷️ 类型：${types.slice(0, 4).join(' / ')}`);
+    }
+    if (shortComment) {
+      cardLines.push(`✨ 亮点：${shortComment.slice(0, 80)}`);
+    }
+    if (note) {
+      cardLines.push(`💬 ${senderNameForTarget}附言：${note}`);
+    }
+    if (sharedResourceUrl) {
+      cardLines.push(`🔗 附带网盘链接：${sharedResourceUrl}`);
+    }
+    cardLines.push('----------------------------------------');
+    cardLines.push('💡 你可以直接回复：');
+    cardLines.push(`• 发「搜一下」或「存一下」：马上全网搜存《${title}》到你的网盘`);
+    cardLines.push(`• 发「跟他说 ...」或「/reply ...」：把你的反馈转达给 ${senderNameForTarget}`);
+
+    const delivered = await PushGateway.getInstance().sendToUser(recipient.userId, cardLines.join('\n'));
+    if (!delivered) {
+      return {
+        success: false,
+        replyToSender: `哎呀，把《${title}》推给「${recipient.displayName}」时微信通道暂时没响应，请稍后再试一次~`,
+      };
+    }
+
+    // 为接收方写入双重上下文：1) 快捷搜存待确认影视；2) 跨用户回复传话目标
+    sessionMgr.setLastMentionedTitle(recipient.userId, title);
+    sessionMgr.setPendingImageSearch(recipient.userId, {
+      standardTitle: title,
+      aliases: [],
+      year,
+      mediaType,
+      overview: shortComment || note || undefined,
+    });
+
+    this.state.pendingReplies[recipient.userId] = {
+      fromUserId,
+      fromDisplayName: senderNameForTarget,
+      originalMessage: `给你安利了《${title}》${note ? `（${note}）` : ''}`,
+      timestamp: Date.now(),
+    };
+    this.state.history.push({
+      id: `share_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      fromUserId,
+      toUserId: recipient.userId,
+      message: `[分享影片] 《${title}》${note ? ` - ${note}` : ''}`,
+      timestamp: Date.now(),
+      delivered: true,
+    });
+    if (this.state.history.length > 100) {
+      this.state.history = this.state.history.slice(-100);
+    }
+    this.persist();
+
+    const senderPlan = this.userManager.getUserPlan(fromUserId);
+    const aliasTip = !senderPlan.alias
+      ? `\n💡 小提示：你还没设置自己的昵称，现在对方看到的是「${senderNameForTarget}」；发送「我叫你的名字」我就记住啦！`
+      : '';
+
+    return {
+      success: true,
+      replyToSender: `🎉 已把《${title}》推荐卡片发给「${recipient.displayName}」啦！对方可直接一键搜存或回话给你~${aliasTip}`,
     };
   }
 }

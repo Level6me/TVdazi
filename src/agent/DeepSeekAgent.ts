@@ -214,7 +214,7 @@ export class DeepSeekAgent {
   public isPendingImageSearchConfirm(userId: string, text: string): boolean {
     if (!this.sessionManager.getPendingImageSearch(userId)) return false;
     const clean = (text || '').trim();
-    return /^(?:搜索|搜|搜一下|搜一搜|搜吧|开始搜索|开始|好的|好|好呀|嗯|嗯嗯|要|要的|需要|是|是的|查一下|帮我搜|确认|可以|行|1|ok|yes)[!！。.~～]*$/i.test(
+    return /^(?:搜索|搜|搜一下|搜一搜|搜吧|开始搜索|开始|好的|好|好呀|嗯|嗯嗯|要|要的|需要|是|是的|查一下|帮我搜|存一下|帮我存|转存|看看这部|想看|确认|可以|行|1|ok|yes)[!！。.~～]*$/i.test(
       clean
     );
   }
@@ -610,12 +610,42 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'share_movie_to_user',
+            description: '把当前刚刚推荐/搜索过的好电影或指定影视作品安利分享给另一位微信用户。当用户说“这部电影不错把这部电影推荐给b吧”“把刚才那部《xxx》分享给小红”“把第2部推荐给用户2”时必须调用。',
+            parameters: {
+              type: 'object',
+              properties: {
+                target_name: {
+                  type: 'string',
+                  description: '要分享给的目标用户名字、称呼或通讯录序号（例如 b、小红、2）',
+                },
+                movie_title: {
+                  type: 'string',
+                  description: '要分享的影视片名（若用户说“这部电影/刚才那部”，可填入上下文最近提及的片名或留空自动提取）',
+                },
+                recommend_note: {
+                  type: 'string',
+                  description: '发送人附带的推荐语或评价（例如“这部电影很不错，推荐给你看看”）',
+                },
+                selection_index: {
+                  type: 'number',
+                  description: '如果用户指定分享推荐列表中的“第几部”（如第2部），填入数字序号',
+                },
+              },
+              required: ['target_name'],
+            },
+          },
+        },
       ];
 
       const relay = RelayService.getInstance();
       const directory = relay.getDirectory(userId);
       const myName = relay.getDisplayName(userId, userId);
       const pendingRelay = relay.getPendingReply(userId);
+      const recentTitle = this.sessionManager.getRecentTargetTitle(userId);
       const directoryHint =
         directory.length > 0
           ? directory.map((u) => `${u.index}.${u.displayName}${u.isSelf ? '(我)' : ''}`).join('、')
@@ -629,11 +659,11 @@ export class DeepSeekAgent {
           role: 'system',
           content: `你是一个微信端像朋友一样的智能影视云盘助手「电视搭子 (TVdazi)」。
 你的性格：热情亲切、自然随和、说话通俗简单、接地气，绝不要输出冰冷呆板的客服话术或技术术语。
-当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}。
+当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}；最近刚推荐或讨论过的影视：${recentTitle ? `《${recentTitle}》` : '暂无'}。
 核心系统能力与规则（重要）：
 1. 你是所有自然语言消息的总控意图分析大脑，必须先准确理解用户的真实意图再调用对应工具。
 2. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时、延时、周期蹲守或追更任务（如“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守《某剧》”），【绝对严禁】推脱拒答！遇到此类需求直接调用 manage_scheduled_task。
-3. 你拥有【多用户传话与通讯录】能力：当用户问服务有几个用户/分别是谁、想设置自己叫什么、想给某人设备注时，调用 manage_user_directory；当用户想让你给其他微信用户带话/问问题，或让你“跟他说/回他”回复刚刚的传话时，必须调用 relay_message！
+3. 你拥有【多用户传话、通讯录与好友安利推片】能力：当用户问服务有几个用户/分别是谁、想设置自己叫什么、想给某人设备注时，调用 manage_user_directory；当用户想把“这部电影/某部片子”推荐或分享给某位用户（如“这部电影不错把这部电影推荐给b吧”）时，必须调用 share_movie_to_user；当用户想给其他用户带普通文字消息或回复传话（如“你跟他说...”）时，调用 relay_message！
 4. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
 5. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
 6. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
@@ -741,6 +771,15 @@ export class DeepSeekAgent {
           }
           appendUserHistory(trimmed, dirReply);
           return dirReply;
+        } else if (toolCall.function.name === 'share_movie_to_user') {
+          const relaySvc = RelayService.getInstance();
+          const shareRes = await relaySvc.shareMovieToUser(userId, String(args.target_name || ''), {
+            movieTitle: args.movie_title ? String(args.movie_title) : undefined,
+            recommendReason: args.recommend_note ? String(args.recommend_note) : undefined,
+            selectionIndex: typeof args.selection_index === 'number' ? args.selection_index : undefined,
+          });
+          appendUserHistory(trimmed, shareRes.replyToSender);
+          return shareRes.replyToSender;
         }
       }
 

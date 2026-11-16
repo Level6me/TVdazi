@@ -44,6 +44,10 @@ export class CommandHandler {
     if (/https?:\/\/|pan\.quark\.cn|alipan\.com|aliyundrive\.com|drive\.uc\.cn|baidu\.com/i.test(trimmed)) {
       return false;
     }
+    // 分享具体影视作品给好友时，不误判为生成机器人邀请二维码
+    if (/(?:电影|电视剧|剧集|动漫|影片|这部|那部|第\s*\d+\s*部|《[^》]+》)/.test(trimmed) && !/(?:机器人|二维码|额度)/.test(trimmed)) {
+      return false;
+    }
     return (
       /^(?:分享|邀请|二维码|分享机器人|邀请二维码)$/.test(trimmed) ||
       /(?:推荐给朋友|分享给朋友|分享给好友|把你推荐给|加机器人|邀请好友|邀请朋友|好友邀请|生成邀请|邀请码|机器人二维码|授权二维码)/.test(
@@ -1278,6 +1282,7 @@ export class CommandHandler {
       '• /name 名字 / “我叫xxx” 设置自己的对外昵称',
       '• /alias 序号 备注      给其他用户设置本地备注名',
       '• /say 名字 内容        直接托我给指定微信好友带话',
+      '• /share-movie 名字 [片名] 把刚看中的好片安利给好友',
       '• /reply 内容 / “跟他说...” 回复最近给你传话的好友',
       '• /dnd on|off          开启或关闭传话免打扰',
       '',
