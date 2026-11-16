@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# WeSaver - 微信端 AI 影视资源转存与种草助手 一键部署安装脚本
-# 支持单行链接执行: bash <(curl -fsSL https://raw.githubusercontent.com/Level6me/wesaver/main/install.sh)
+# TVdazi (电视搭子) - 微信端 AI 影视资源转存与种草助手 一键部署安装脚本
+# 支持单行链接执行: bash <(curl -fsSL https://raw.githubusercontent.com/Level6me/TVdazi/main/install.sh)
 # ==============================================================================
 
 set -e
@@ -50,17 +50,18 @@ clear_screen() {
 clear_screen
 echo -e "${CYAN}${BOLD}"
 cat << 'EOF'
- __      __       _________                               
-/  \    /  \ ____/   _____/____ ___  __ ___________ 
-\   \/\/   // __ \_____  \\__  \\  \/ // __ \_  __ \
- \        /\  ___//        \/ __ \\   /\  ___/|  | \/
-  \__/\  /  \___  >_______  (____  /\_/  \___  >__|   
-       \/       \/        \/     \/          \/       
+  _______     ______             _ 
+ |__   __\ \ / /  _ \           (_)
+    | |   \ V /| | | | __ _ ____ _ 
+    | |    > < | | | |/ _` |_  /| |
+    | |   / . \| |_| | (_| |/ / | |
+    |_|  /_/ \_\____/ \__,_/___||_|
+                                   
 EOF
 echo -e "${NC}"
 echo -e "${BOLD}================================================================${NC}"
-echo -e "${BOLD}  WeSaver - 微信端 AI 影视资源转存与种草助手 (DeepSeek 驱动)${NC}"
-echo -e "${BOLD}  全网50+频道检索 | AI实体纠错 | 小红书种草笔记 | 智能防和谐还原${NC}"
+echo -e "${BOLD}  TVdazi (电视搭子) - 微信端 AI 影视资源转存与种草助手${NC}"
+echo -e "${BOLD}  全网50+频道检索 | 小红书种草 | 多用户传话 | 防和谐与媒体库整理${NC}"
 echo -e "${BOLD}================================================================${NC}\n"
 
 # 1. 检查操作系统与基础包
@@ -99,7 +100,7 @@ if ! command -v node &>/dev/null; then
 else
   NODE_VER=$(node -v | sed 's/v//' | cut -d'.' -f1)
   if [ "$NODE_VER" -lt 18 ]; then
-    log_warn "当前 Node.js 版本 (v$(node -v)) 过低，WeSaver 需要 Node.js 18 或更高版本！"
+    log_warn "当前 Node.js 版本 (v$(node -v)) 过低，TVdazi (电视搭子) 需要 Node.js 18 或更高版本！"
     NEED_NODE_INSTALL=true
   fi
 fi
@@ -128,13 +129,13 @@ fi
 log_success "PM2 守护管理器就绪: $(pm2 -v)"
 
 # 3. 定位或克隆代码仓库
-REPO_URL="https://github.com/Level6me/wesaver.git"
-INSTALL_DIR="wesaver"
+REPO_URL="https://github.com/Level6me/TVdazi.git"
+INSTALL_DIR="TVdazi"
 
-# 判断当前是否已处于 wesaver 项目根目录下
-if [ -f "package.json" ] && grep -q '"name": "wesaver"' package.json 2>/dev/null; then
+# 判断当前是否已处于 tvdazi 项目根目录下
+if [ -f "package.json" ] && grep -q '"name": "tvdazi"' package.json 2>/dev/null; then
   PROJECT_ROOT="$(pwd)"
-  log_info "检测到当前目录即为 WeSaver 项目目录: ${PROJECT_ROOT}"
+  log_info "检测到当前目录即为 TVdazi (电视搭子) 项目目录: ${PROJECT_ROOT}"
 else
   log_info "准备在当前目录克隆最新代码仓库..."
   if [ -d "$INSTALL_DIR" ]; then
@@ -154,13 +155,23 @@ mkdir -p data data/accounts data/users
 
 # 4. 交互式配置向导 (写入 .env)
 echo -e "\n${PURPLE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${PURPLE}${BOLD}  🛠️  WeSaver 核心参数交互式配置向导 (可直接按回车使用默认值)${NC}"
+echo -e "${PURPLE}${BOLD}  🛠️  TVdazi (电视搭子) 核心参数交互式配置向导 (可直接按回车使用默认值)${NC}"
 echo -e "${PURPLE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
 EXISTING_DEEPSEEK_KEY=""
 EXISTING_QUARK_COOKIE=""
 EXISTING_SAVE_DIR="/我的资源"
 EXISTING_PORT="3001"
+EXISTING_WEB_PORT="3002"
+EXISTING_PUBLIC_BASE_URL=""
+EXISTING_TMDB_KEY=""
+EXISTING_TG_CHANNELS=""
+EXISTING_ALIYUN_TOKEN=""
+EXISTING_PAN115_COOKIE=""
+EXISTING_WEBHOOK_URL=""
+EXISTING_DASHBOARD_SECRET=""
+EXISTING_WECHAT_TOKEN=""
+EXISTING_API_AUTH_TOKEN=""
 
 if [ -f ".env" ]; then
   log_info "检测到本地已存在 .env 配置文件，将优先提取现有配置作为默认值..."
@@ -168,10 +179,21 @@ if [ -f ".env" ]; then
   EXISTING_QUARK_COOKIE=$(grep -E '^QUARK_COOKIE=' .env | cut -d'=' -f2- || true)
   EXISTING_SAVE_DIR=$(grep -E '^DEFAULT_SAVE_DIR=' .env | cut -d'=' -f2- || true)
   EXISTING_PORT=$(grep -E '^PORT=' .env | cut -d'=' -f2- || true)
+  EXISTING_WEB_PORT=$(grep -E '^WEB_DASHBOARD_PORT=' .env | cut -d'=' -f2- || true)
+  EXISTING_PUBLIC_BASE_URL=$(grep -E '^PUBLIC_BASE_URL=' .env | cut -d'=' -f2- || true)
+  EXISTING_TMDB_KEY=$(grep -E '^TMDB_API_KEY=' .env | cut -d'=' -f2- || true)
+  EXISTING_TG_CHANNELS=$(grep -E '^TG_CHANNELS=' .env | cut -d'=' -f2- || true)
+  EXISTING_ALIYUN_TOKEN=$(grep -E '^ALIYUN_REFRESH_TOKEN=' .env | cut -d'=' -f2- || true)
+  EXISTING_PAN115_COOKIE=$(grep -E '^PAN115_COOKIE=' .env | cut -d'=' -f2- || true)
+  EXISTING_WEBHOOK_URL=$(grep -E '^MEDIA_WEBHOOK_URL=' .env | cut -d'=' -f2- || true)
+  EXISTING_DASHBOARD_SECRET=$(grep -E '^DASHBOARD_SECRET=' .env | cut -d'=' -f2- || true)
+  EXISTING_WECHAT_TOKEN=$(grep -E '^WECHAT_TOKEN=' .env | cut -d'=' -f2- || true)
+  EXISTING_API_AUTH_TOKEN=$(grep -E '^API_AUTH_TOKEN=' .env | cut -d'=' -f2- || true)
 fi
 
 [ -z "$EXISTING_SAVE_DIR" ] && EXISTING_SAVE_DIR="/我的资源"
 [ -z "$EXISTING_PORT" ] && EXISTING_PORT="3001"
+[ -z "$EXISTING_WEB_PORT" ] && EXISTING_WEB_PORT="3002"
 
 # Step 1: DeepSeek API Key
 echo -e "${CYAN}1. DeepSeek API Key 配置${NC}"
@@ -200,21 +222,61 @@ echo -e "\n${CYAN}4. 本地服务端口${NC}"
 PROMPT_PORT="   服务监听端口 [回车默认: ${EXISTING_PORT}]: "
 USER_PORT=$(read_input "$PROMPT_PORT" "$EXISTING_PORT")
 
+# Step 5: Web 控制面板端口与访问域名
+echo -e "\n${CYAN}5. Web 控制面板访问域名与端口 (用于微信 /web 指令直达管理页)${NC}"
+echo -e "   • 若已配置域名反代（如 https://tvdazi.example.com），请输入完整域名或 URL；"
+echo -e "   • 留空回车则自动探测服务器公网 IP（如 http://公网IP:3002）；输入 clear 可清空已有域名。"
+PROMPT_WEB_PORT="   Web 控制台监听端口 [回车默认: ${EXISTING_WEB_PORT}]: "
+USER_WEB_PORT=$(read_input "$PROMPT_WEB_PORT" "$EXISTING_WEB_PORT")
+
+PROMPT_DOMAIN="   Web 面板访问域名 [回车自动探测]: "
+[ -n "$EXISTING_PUBLIC_BASE_URL" ] && PROMPT_DOMAIN="   Web 面板访问域名 [当前: ${EXISTING_PUBLIC_BASE_URL}，回车保留，输入 clear 清空]: "
+RAW_PUBLIC_URL=$(read_input "$PROMPT_DOMAIN" "$EXISTING_PUBLIC_BASE_URL")
+RAW_PUBLIC_URL=$(echo "$RAW_PUBLIC_URL" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s:/*$::')
+
+USER_PUBLIC_BASE_URL=""
+if [ -n "$RAW_PUBLIC_URL" ]; then
+  LOWER_PUBLIC_URL=$(echo "$RAW_PUBLIC_URL" | tr '[:upper:]' '[:lower:]')
+  if [ "$LOWER_PUBLIC_URL" = "clear" ] || [ "$LOWER_PUBLIC_URL" = "reset" ] || [ "$LOWER_PUBLIC_URL" = "auto" ]; then
+    USER_PUBLIC_BASE_URL=""
+  elif echo "$RAW_PUBLIC_URL" | grep -qiE '^https?://'; then
+    USER_PUBLIC_BASE_URL="$RAW_PUBLIC_URL"
+  elif echo "$RAW_PUBLIC_URL" | grep -qE '^[a-zA-Z][a-zA-Z0-9+.-]*://'; then
+    log_warn "不支持非 http/https 协议，已跳过自定义域名设置（将自动探测公网 IP）。"
+    USER_PUBLIC_BASE_URL=""
+  elif echo "$RAW_PUBLIC_URL" | grep -qiE '^(localhost|[0-9]{1,3}(\.[0-9]{1,3}){3})(:[0-9]+)?$'; then
+    USER_PUBLIC_BASE_URL="http://${RAW_PUBLIC_URL}"
+  else
+    USER_PUBLIC_BASE_URL="https://${RAW_PUBLIC_URL}"
+  fi
+fi
+
 # 写入 .env 文件
 log_info "正在生成 .env 配置文件..."
 cat > .env << EOF
 # ==============================================================================
-# WeSaver 自动化配置
+# TVdazi (电视搭子) 自动化配置
 # ==============================================================================
 DEEPSEEK_API_KEY=${USER_DEEPSEEK_KEY}
 DEEPSEEK_BASE_URL=https://api.deepseek.com
 DEEPSEEK_MODEL=deepseek-flash
+TMDB_API_KEY=${EXISTING_TMDB_KEY}
 
 QUARK_COOKIE=${USER_QUARK_COOKIE}
 DEFAULT_PAN=quark
 DEFAULT_SAVE_DIR=${USER_SAVE_DIR}
+TG_CHANNELS=${EXISTING_TG_CHANNELS}
 
 PORT=${USER_PORT}
+WEB_DASHBOARD_PORT=${USER_WEB_PORT}
+PUBLIC_BASE_URL=${USER_PUBLIC_BASE_URL}
+DASHBOARD_SECRET=${EXISTING_DASHBOARD_SECRET}
+WECHAT_TOKEN=${EXISTING_WECHAT_TOKEN}
+API_AUTH_TOKEN=${EXISTING_API_AUTH_TOKEN}
+
+ALIYUN_REFRESH_TOKEN=${EXISTING_ALIYUN_TOKEN}
+PAN115_COOKIE=${EXISTING_PAN115_COOKIE}
+MEDIA_WEBHOOK_URL=${EXISTING_WEBHOOK_URL}
 DEBUG=false
 EOF
 chmod 600 .env
@@ -230,37 +292,40 @@ log_success "代码构建与打包成功 (dist 产物已就绪)！"
 
 # 6. PM2 守护服务管理
 echo -e "\n${PURPLE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${PURPLE}${BOLD}  🚀  启动 WeSaver 微信机器人后台服务${NC}"
+echo -e "${PURPLE}${BOLD}  🚀  启动 TVdazi (电视搭子) 微信机器人后台服务${NC}"
 echo -e "${PURPLE}${BOLD}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n"
 
 # 停止已有的老实例 (如果有)
 pm2 delete wesaver 2>/dev/null || true
+pm2 delete wesaver-wechat 2>/dev/null || true
+pm2 delete tvdazi-wechat 2>/dev/null || true
 
 # 启动实例
 pm2 start ecosystem.config.js
 pm2 save
 
-log_success "WeSaver 微信机器人后台服务已通过 PM2 成功启动！"
+log_success "TVdazi (电视搭子) 微信机器人后台服务已通过 PM2 成功启动！"
 
 # 7. 完成提示与扫码指南
 echo -e "\n${GREEN}${BOLD}================================================================${NC}"
-echo -e "${GREEN}${BOLD}  🎉  恭喜！WeSaver 已经成功安装并启动运行！${NC}"
+echo -e "${GREEN}${BOLD}  🎉  恭喜！TVdazi (电视搭子) 已经成功安装并启动运行！${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}\n"
 
 echo -e "${BOLD}📱 微信扫码授权指南：${NC}"
 echo -e "1. 查看登录二维码与实时日志："
-echo -e "   ${CYAN}pm2 logs wesaver${NC}"
+echo -e "   ${CYAN}pm2 logs tvdazi-wechat${NC}"
 echo -e "2. 终端会输出登录二维码链接与图片路径，使用微信扫码授权即可接管消息！"
 echo -e "\n${BOLD}🛠️  常用管理指令：${NC}"
-echo -e "• 查看运行日志：  ${CYAN}pm2 logs wesaver${NC}"
-echo -e "• 重启机器人服务：${CYAN}pm2 restart wesaver${NC}"
+echo -e "• 查看运行日志：  ${CYAN}pm2 logs tvdazi-wechat${NC}"
+echo -e "• 重启机器人服务：${CYAN}pm2 restart tvdazi-wechat${NC}"
 echo -e "• 查看状态与资源：${CYAN}pm2 status${NC}"
-echo -e "• 停止服务：      ${CYAN}pm2 stop wesaver${NC}"
+echo -e "• 停止服务：      ${CYAN}pm2 stop tvdazi-wechat${NC}"
 echo -e "\n${BOLD}💬 微信常用功能与指令：${NC}"
 echo -e "• 直接搜片：在微信聊天框发「想看流浪地球2」或「周星驰功夫」"
 echo -e "• 小红书种草：在微信发「推荐一部最近比较火的电影」或「推荐好看的韩剧」"
 echo -e "• 一键转存：在搜索或推荐结果中，回复序号（如「1」或「看第2个」）自动存入网盘"
 echo -e "• 绑定网盘：向机器人发送「/set-quark 你的夸克Cookie」"
+echo -e "• 网页控制台：向机器人发送「/web」获取个人 H5 管理面板链接（可在面板内随时修改域名与配置）"
 echo -e "• 防和谐规整：向机器人发送「/clean-names」一键自动洗白网盘中的火星文剧名"
 echo -e "• 邀请好友共用：向机器人发送「/share」生成你的专属带参裂变二维码"
 echo -e "\n如遇任何问题，欢迎访问 GitHub 项目主页提 Issue 交流！"

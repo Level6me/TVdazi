@@ -9,6 +9,7 @@ import { UserManager } from '../services/UserManager';
 import { SchedulerService } from '../services/SchedulerService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
 import { MetadataResolver } from '../services/MetadataResolver';
+import { RelayService } from '../services/RelayService';
 
 export interface RecognizedImageResult {
   standardTitle: string;
@@ -558,20 +559,85 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'relay_message',
+            description: '跨微信用户传话或回复刚刚收到的传话。当用户想让你帮他问候/带话给另一位微信用户（如“你问一下b最近有什么好看的电影”“帮我告诉小红今晚看电影”），或者回复刚刚传话给自己的人（如“你跟他说最近有个叫xxx的电影还不错”“回他我晚点看”）时调用。',
+            parameters: {
+              type: 'object',
+              properties: {
+                target_name: {
+                  type: 'string',
+                  description: '目标接收人的称呼、昵称或序号（若 is_reply=true 回复上一位传话者，可留空）',
+                },
+                message: {
+                  type: 'string',
+                  description: '要转达给对方的自然完整话语内容（去掉“你帮我问一下/你跟他说”等代词指令壳，保留真实表达）',
+                },
+                is_reply: {
+                  type: 'boolean',
+                  description: '是否为回复最近刚刚给自己传话的人（如“你跟他说...”、“回他...”）',
+                },
+              },
+              required: ['message'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'manage_user_directory',
+            description: '查询当前服务共有几个微信用户/叫什么名字，或者设置自己的对外昵称、给其他用户设置备注名。',
+            parameters: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['list_users', 'set_my_name', 'set_contact_alias'],
+                  description: 'list_users=查看当前微信用户列表, set_my_name=设置/修改我自己的名字, set_contact_alias=给某个联系人设备注名',
+                },
+                name: {
+                  type: 'string',
+                  description: '要设置的昵称或备注名（set_my_name / set_contact_alias 时必填）',
+                },
+                target_query: {
+                  type: 'string',
+                  description: '要备注的目标联系人原名或序号（仅 set_contact_alias 时使用）',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
       ];
+
+      const relay = RelayService.getInstance();
+      const directory = relay.getDirectory(userId);
+      const myName = relay.getDisplayName(userId, userId);
+      const pendingRelay = relay.getPendingReply(userId);
+      const directoryHint =
+        directory.length > 0
+          ? directory.map((u) => `${u.index}.${u.displayName}${u.isSelf ? '(我)' : ''}`).join('、')
+          : '暂无其他记录';
+      const pendingHint = pendingRelay
+        ? `刚刚「${pendingRelay.fromDisplayName}」给你传了话（内容：“${pendingRelay.originalMessage}”）`
+        : '暂无待回复传话';
 
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         {
           role: 'system',
-          content: `你是一个微信端像朋友一样的智能影视云盘助手「WeSaver」。
+          content: `你是一个微信端像朋友一样的智能影视云盘助手「电视搭子 (TVdazi)」。
 你的性格：热情亲切、自然随和、说话通俗简单、接地气，绝不要输出冰冷呆板的客服话术或技术术语。
+当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}。
 核心系统能力与规则（重要）：
 1. 你是所有自然语言消息的总控意图分析大脑，必须先准确理解用户的真实意图再调用对应工具。
 2. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时、延时、周期蹲守或追更任务（如“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守《某剧》”），【绝对严禁】推脱拒答！遇到此类需求直接调用 manage_scheduled_task。
-3. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
-4. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
-5. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
-6. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
+3. 你拥有【多用户传话与通讯录】能力：当用户问服务有几个用户/分别是谁、想设置自己叫什么、想给某人设备注时，调用 manage_user_directory；当用户想让你给其他微信用户带话/问问题，或让你“跟他说/回他”回复刚刚的传话时，必须调用 relay_message！
+4. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
+5. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
+6. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
+7. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
         },
         ...chatHistory,
         { role: 'user', content: trimmed },
@@ -649,6 +715,32 @@ export class DeepSeekAgent {
           });
           appendUserHistory(trimmed, schedReply);
           return schedReply;
+        } else if (toolCall.function.name === 'relay_message') {
+          const relaySvc = RelayService.getInstance();
+          const targetName = String(args.target_name || '').trim();
+          const msgText = String(args.message || '').trim();
+          const isReply = Boolean(args.is_reply) || (!targetName && Boolean(relaySvc.getPendingReply(userId)));
+          const relayReply = isReply
+            ? (await relaySvc.replyToLastSender(userId, msgText)).replyToReplier
+            : (await relaySvc.sendRelayMessage(userId, targetName, msgText)).replyToSender;
+          appendUserHistory(trimmed, relayReply);
+          return relayReply;
+        } else if (toolCall.function.name === 'manage_user_directory') {
+          const relaySvc = RelayService.getInstance();
+          let dirReply = '';
+          if (args.action === 'set_my_name') {
+            dirReply = relaySvc.setMyNickname(userId, String(args.name || '')).message;
+          } else if (args.action === 'set_contact_alias') {
+            dirReply = relaySvc.setContactRemark(
+              userId,
+              String(args.target_query || ''),
+              String(args.name || '')
+            ).message;
+          } else {
+            dirReply = relaySvc.renderDirectoryText(userId);
+          }
+          appendUserHistory(trimmed, dirReply);
+          return dirReply;
         }
       }
 
@@ -672,7 +764,7 @@ export class DeepSeekAgent {
     const greetings = ['你好', '您好', 'hi', 'hello', '在吗', '早', '晚上好', '在么', '你是谁', '你叫什么'];
     const lower = text.toLowerCase().replace(/[？?！!。，,\s]/g, '');
     if (greetings.includes(lower)) {
-      return '嗨，我是你的网盘看片小助手 WeSaver！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
+      return '嗨，我是你的网盘看片小助手 电视搭子 (TVdazi)！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
     }
 
     // 明显是日常聊天/疑问句且并非具体片名时，API 异常时友好提示而不是硬搜 50 个频道

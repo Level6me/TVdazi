@@ -8,7 +8,7 @@ async function main() {
   const agent = new DeepSeekAgent();
 
   console.log('================================================================');
-  console.log('  WeSaver - 微信端 AI 云盘资源助手 (自然语言 + 原版指令双模支持)');
+  console.log('  TVdazi (电视搭子) - 微信端 AI 云盘资源助手 (自然语言 + 原版指令双模支持)');
   console.log('================================================================');
   console.log('💡 支持原版指令：/help, /hot, /config, /status, /channels, /search');
   console.log('💡 支持自然语言：直接输入“我想看周星驰的功夫4K”、“帮我找庆余年第二季”');
@@ -31,7 +31,7 @@ async function main() {
         return;
       }
 
-      console.log('🤖 WeSaver 处理中...');
+      console.log('🤖 TVdazi 电视搭子 处理中...');
       try {
         const reply = await agent.chat(trimmed);
         console.log(`\n${reply}\n----------------------------------------------------------------\n`);

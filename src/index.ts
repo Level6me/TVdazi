@@ -2,6 +2,7 @@ import * as dotenv from 'dotenv';
 dotenv.config();
 
 import http from 'http';
+import * as crypto from 'crypto';
 import * as url from 'url';
 import { DeepSeekAgent } from './agent/DeepSeekAgent';
 import { CommandHandler } from './commands/CommandHandler';
@@ -12,6 +13,9 @@ import { ChannelManager } from './services/ChannelManager';
 import { SessionManager } from './services/SessionManager';
 import { CategoryClassifier } from './services/CategoryClassifier';
 import { SchedulerService } from './services/SchedulerService';
+import { DashboardServer } from './web/DashboardServer';
+import { LruCache } from './utils/LruCache';
+import { maskSensitive } from './utils/Logger';
 
 export {
   DeepSeekAgent,
@@ -24,15 +28,29 @@ export {
   CategoryClassifier,
 };
 
+function verifyWechatSignature(query: Record<string, any>): boolean {
+  const token = (process.env.WECHAT_TOKEN || '').trim();
+  if (!token) return true; // 未配置 WECHAT_TOKEN 时放行本地调试
+  const signature = String(query.signature || '');
+  const timestamp = String(query.timestamp || '');
+  const nonce = String(query.nonce || '');
+  if (!signature || !timestamp || !nonce) return false;
+  const sha1 = crypto.createHash('sha1').update([token, timestamp, nonce].sort().join('')).digest('hex');
+  return sha1 === signature;
+}
+
 export async function bootstrap() {
   const agent = new DeepSeekAgent();
   const commandHandler = new CommandHandler();
   const port = parseInt(process.env.PORT || '3001', 10);
-  const xmlPendingCache = new Map<string, { query: string; reply?: string; promise?: Promise<string>; timestamp: number }>();
+  const xmlPendingCache = new LruCache<string, { query: string; reply?: string; promise?: Promise<string>; timestamp: number }>(
+    500,
+    2 * 60 * 1000
+  );
 
   // 启动后台定时与监控引擎
   SchedulerService.getInstance().start(async (userId, message) => {
-    console.log(`[Scheduler 定时推送 -> ${userId}]\n${message}`);
+    console.log(`[Scheduler 定时推送 -> ${userId}]\n${maskSensitive(message)}`);
     return true;
   });
 
@@ -40,14 +58,25 @@ export async function bootstrap() {
     const parsedUrl = url.parse(req.url || '', true);
     const pathname = parsedUrl.pathname || '';
 
-    // 跨域处理
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    // 跨域处理（支持通过 CORS_ALLOWED_ORIGINS 限制来源）
+    const allowedOrigin = (process.env.CORS_ALLOWED_ORIGINS || '').trim();
+    const reqOrigin = String(req.headers.origin || '');
+    if (!allowedOrigin || allowedOrigin === '*') {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+    } else if (allowedOrigin.split(',').map((o) => o.trim()).includes(reqOrigin)) {
+      res.setHeader('Access-Control-Allow-Origin', reqOrigin);
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-Panel-Token');
 
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
       res.end();
+      return;
+    }
+
+    // 0. 轻量 H5 自助控制台
+    if (await DashboardServer.handleHttpRequest(req, res)) {
       return;
     }
 
@@ -56,21 +85,26 @@ export async function bootstrap() {
     // 1. 健康检测
     if (req.method === 'GET' && pathname === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-      res.end(JSON.stringify({ status: 'ok', service: 'WeSaver', timestamp: new Date().toISOString() }));
+      res.end(JSON.stringify({ status: 'ok', service: 'TVdazi', timestamp: new Date().toISOString() }));
       return;
     }
 
-    // 2. 微信公众号 / 开放平台服务器配置握手校验 (GET 方式返回 echostr)
+    // 2. 微信公众号 / 开放平台服务器配置握手校验 (GET 方式校验签名后返回 echostr)
     if (req.method === 'GET' && (pathname === '/webhook/wechat' || pathname === '/api/wechat')) {
+      if (!verifyWechatSignature(parsedUrl.query)) {
+        res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+        res.end('Invalid WeChat Signature');
+        return;
+      }
       const echostr = parsedUrl.query.echostr as string;
       if (echostr) {
-        console.log(`[WeSaver 微信握手] 收到官方服务器认证请求，返回 echostr`);
+        console.log(`[TVdazi 微信握手] 收到官方服务器认证请求，返回 echostr`);
         res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
         res.end(echostr);
         return;
       }
       res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-      res.end('WeSaver 微信网关已就绪');
+      res.end('TVdazi (电视搭子) 微信网关已就绪');
       return;
     }
 
@@ -99,6 +133,11 @@ export async function bootstrap() {
 
           // 场景 A: 微信公众号原生 XML 格式推送
           if (raw.startsWith('<xml') || raw.includes('<FromUserName>')) {
+            if (!verifyWechatSignature(parsedUrl.query)) {
+              res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+              res.end('Invalid WeChat Signature');
+              return;
+            }
             const fromUserMatch = raw.match(/<FromUserName><!\[CDATA\[(.*?)\]\]><\/FromUserName>/) || raw.match(/<FromUserName>(.*?)<\/FromUserName>/);
             const toUserMatch = raw.match(/<ToUserName><!\[CDATA\[(.*?)\]\]><\/ToUserName>/) || raw.match(/<ToUserName>(.*?)<\/ToUserName>/);
             const contentMatch = raw.match(/<Content><!\[CDATA\[(.*?)\]\]><\/Content>/) || raw.match(/<Content>(.*?)<\/Content>/);
@@ -124,7 +163,7 @@ export async function bootstrap() {
               return;
             }
 
-            console.log(`[WeSaver 微信XML消息] 来自 ${fromUser}: ${userText}`);
+            console.log(`[TVdazi 微信XML消息] 来自 ${fromUser}: ${userText}`);
             let reply = '';
             const cached = xmlPendingCache.get(fromUser);
             const isFollowPull =
@@ -203,10 +242,8 @@ export async function bootstrap() {
             return;
           }
 
-          const logPreview = /^\/(?:set-quark|set-key|set-deepseek)\b/i.test(String(text).trim())
-            ? `${String(text).trim().split(/\s+/)[0]} [REDACTED]`
-            : text;
-          console.log(`[WeSaver JSON消息] 用户 ${userId}: ${logPreview}`);
+          const logPreview = maskSensitive(String(text).trim());
+          console.log(`[TVdazi JSON消息] 用户 ${userId}: ${logPreview}`);
           const reply = await agent.chat(text, [], userId);
           res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({
@@ -215,7 +252,7 @@ export async function bootstrap() {
             status: 'success'
           }));
         } catch (err: any) {
-          console.error('[WeSaver 网关异常]', err.message);
+          console.error('[TVdazi 网关异常]', err.message);
           res.writeHead(500, { 'Content-Type': 'application/json; charset=utf-8' });
           res.end(JSON.stringify({ error: err.message || 'Internal Error' }));
         }
@@ -228,9 +265,9 @@ export async function bootstrap() {
   });
 
   server.listen(port, () => {
-    console.log(`[WeSaver] 服务已启动，监听端口: http://127.0.0.1:${port}`);
-    console.log(`[WeSaver] 微信公众号/XML 接入端点: http://127.0.0.1:${port}/webhook/wechat`);
-    console.log(`[WeSaver] OpenClaw/JSON 接入端点: http://127.0.0.1:${port}/api/chat`);
+    console.log(`[TVdazi] 服务已启动，监听端口: http://127.0.0.1:${port}`);
+    console.log(`[TVdazi] 微信公众号/XML 接入端点: http://127.0.0.1:${port}/webhook/wechat`);
+    console.log(`[TVdazi] OpenClaw/JSON 接入端点: http://127.0.0.1:${port}/api/chat`);
   });
 
   return {

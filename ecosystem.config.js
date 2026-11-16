@@ -1,7 +1,7 @@
 module.exports = {
   apps: [
     {
-      name: 'wesaver',
+      name: 'tvdazi-wechat',
       script: 'dist/login.js',
       cwd: './',
       instances: 1,

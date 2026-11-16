@@ -26,8 +26,8 @@ jobs:
       - name: Install dependencies
         run: npm ci --no-audit --no-fund
 
-      - name: TypeScript build (tsc)
-        run: npm run build
+      - name: TypeScript build (tsc) & Core Unit Tests
+        run: npm test
 
       - name: Run module load & unit tests
         run: |
@@ -65,7 +65,7 @@ jobs:
           assert.strictEqual(CategoryClassifier.classify('进击的巨人 最终季 动漫'), '动漫');
 
           // 3. FileUtils tests ($ replacement safety + atomic write)
-          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wesaver-ci-'));
+          const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'tvdazi-ci-'));
           const envFile = path.join(tmpDir, '.env');
           upsertEnvVar(envFile, 'QUARK_COOKIE', 'abc$1$$xyz=123');
           upsertEnvVar(envFile, 'QUARK_COOKIE', 'updated$&val');

@@ -1,6 +1,6 @@
 import * as fs from 'fs';
 import * as path from 'path';
-import { atomicWriteFileSync } from '../utils/FileUtils';
+import { SerializedJsonStore } from '../utils/StorageQueue';
 
 export interface UserPlan {
   // 基础身份
@@ -14,10 +14,13 @@ export interface UserPlan {
   inheritedApiKey?: string; // 继承自邀请人的 API Key
   shareMode?: 'shared' | 'standalone'; // 继承共享还是自理独立
 
-  // 专属网盘配置 (允许每个微信用户绑定自己的夸克 Cookie，未设置时继承全局默认)
+  // 专属网盘配置 (允许每个微信用户绑定自己的网盘凭证，未设置时继承全局默认)
   quarkCookie?: string;
+  aliyunToken?: string;
+  pan115Cookie?: string;
   defaultPan?: 'quark' | 'aliyun' | 'uc' | '115';
   saveRootDir?: string; // 用户专属保存根目录，默认 /我的资源
+  webhookUrl?: string; // 媒体库刷新 Webhook (Alist / Emby / Jellyfin)
 
   // 专属 DeepSeek API Key (允许每个微信用户使用自己的 Key，未设置时共享继承 Key 或全局系统 Key)
   deepseekApiKey?: string;
@@ -29,6 +32,7 @@ export interface UserPlan {
     type: 'movie' | 'tv';
     category?: string;
     status: 'planned' | 'saving' | 'completed';
+    currentEpisode?: number;
     addedAt: number;
     lastSavedUrl?: string;
     note?: string;
@@ -36,7 +40,7 @@ export interface UserPlan {
 
   // 专属偏好设置
   preferences: {
-    preferredQuality?: '4K' | '1080P' | '原盘' | 'any';
+    preferredQuality?: string;
     autoSaveOnSelect?: boolean; // 命中序号时是否直接自动转存
   };
 
@@ -199,7 +203,9 @@ export class UserManager {
     this.memoryCache.set(plan.userId, plan);
     try {
       const filePath = this.getSafeFilename(plan.userId);
-      atomicWriteFileSync(filePath, JSON.stringify(plan, null, 2));
+      SerializedJsonStore.enqueueWrite(filePath, plan).catch((err: any) => {
+        console.error(`[UserManager] 保存用户 ${plan.userId} 数据失败:`, err.message);
+      });
     } catch (err: any) {
       console.error(`[UserManager] 保存用户 ${plan.userId} 数据失败:`, err.message);
     }
@@ -288,6 +294,90 @@ export class UserManager {
     this.saveUserPlan(plan);
   }
 
+  setUserAliyunToken(userId: string, token: string): void {
+    const plan = this.getUserPlan(userId);
+    const clean = token.trim();
+    if (!clean || ['reset', 'clear', '清除'].includes(clean.toLowerCase())) {
+      delete plan.aliyunToken;
+    } else {
+      plan.aliyunToken = clean;
+    }
+    this.saveUserPlan(plan);
+  }
+
+  setUser115Cookie(userId: string, cookie: string): void {
+    const plan = this.getUserPlan(userId);
+    const clean = cookie.trim();
+    if (!clean || ['reset', 'clear', '清除'].includes(clean.toLowerCase())) {
+      delete plan.pan115Cookie;
+    } else {
+      plan.pan115Cookie = clean;
+    }
+    this.saveUserPlan(plan);
+  }
+
+  setUserWebhookUrl(userId: string, url: string): void {
+    const plan = this.getUserPlan(userId);
+    const clean = url.trim();
+    if (!clean || ['reset', 'clear', '清除', 'off'].includes(clean.toLowerCase())) {
+      delete plan.webhookUrl;
+    } else {
+      plan.webhookUrl = clean;
+    }
+    this.saveUserPlan(plan);
+  }
+
+  importToWatchlist(
+    userId: string,
+    titles: string[],
+    category: string = '剧集'
+  ): { added: string[]; skipped: string[] } {
+    const plan = this.getUserPlan(userId);
+    const added: string[] = [];
+    const skipped: string[] = [];
+
+    for (const rawTitle of titles) {
+      const cleanTitle = rawTitle.replace(/[《》]/g, '').trim();
+      if (!cleanTitle || cleanTitle.length < 1) continue;
+      const exists = plan.watchlist.some((w) => w.title.toLowerCase() === cleanTitle.toLowerCase());
+      if (exists) {
+        skipped.push(cleanTitle);
+        continue;
+      }
+      plan.watchlist.push({
+        title: cleanTitle,
+        type: /电影/.test(category) ? 'movie' : 'tv',
+        category,
+        status: 'planned',
+        addedAt: Date.now(),
+      });
+      added.push(cleanTitle);
+    }
+
+    if (added.length > 0) {
+      this.saveUserPlan(plan);
+    }
+    return { added, skipped };
+  }
+
+  updateWatchlistStatus(
+    userId: string,
+    title: string,
+    status: 'planned' | 'saving' | 'completed',
+    currentEpisode?: number
+  ): boolean {
+    const plan = this.getUserPlan(userId);
+    const clean = title.replace(/[《》]/g, '').trim().toLowerCase();
+    const item = plan.watchlist.find((w) => w.title.trim().toLowerCase() === clean);
+    if (!item) return false;
+    item.status = status;
+    if (currentEpisode !== undefined && Number.isFinite(currentEpisode)) {
+      item.currentEpisode = currentEpisode;
+    }
+    this.saveUserPlan(plan);
+    return true;
+  }
+
   setUserDeepSeekKey(userId: string, apiKey: string): void {
     const plan = this.getUserPlan(userId);
     const clean = apiKey.trim();
@@ -309,12 +399,12 @@ export class UserManager {
     this.saveUserPlan(plan);
   }
 
-  setUserPreferredQuality(userId: string, quality: '4K' | '1080P' | '原盘' | 'any'): void {
+  setUserPreferredQuality(userId: string, quality: string): void {
     const plan = this.getUserPlan(userId);
     if (!plan.preferences) {
       plan.preferences = { autoSaveOnSelect: true };
     }
-    plan.preferences.preferredQuality = quality;
+    plan.preferences.preferredQuality = quality.trim() || 'any';
     this.saveUserPlan(plan);
   }
 

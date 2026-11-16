@@ -3,22 +3,35 @@ import * as cheerio from 'cheerio';
 import { CloudResource, SearchOptions, SearchResult } from '../types';
 import { ChannelManager } from './ChannelManager';
 import { CategoryClassifier } from './CategoryClassifier';
+import { QualityTagger } from './QualityTagger';
+import { ChannelHealthService } from './ChannelHealthService';
+import { LruCache } from '../utils/LruCache';
 
 export class ResourceSearcher {
   private explicitChannels?: string[];
   private channelManager: ChannelManager;
+  private healthService: ChannelHealthService;
+  private static searchCache = new LruCache<string, CloudResource[]>(150, 10 * 60 * 1000);
 
   constructor(channels?: string[]) {
     this.explicitChannels = channels;
     this.channelManager = new ChannelManager();
+    this.healthService = ChannelHealthService.getInstance();
+  }
+
+  public static clearCache(): void {
+    ResourceSearcher.searchCache.clear();
   }
 
   private getActiveChannels(): string[] {
-    if (this.explicitChannels && this.explicitChannels.length > 0) {
-      return this.explicitChannels;
-    }
-    const channels = this.channelManager.loadChannels().map((c) => c.id);
-    return channels.length > 0 ? channels : ['Quark_Movies', 'shareAliyun', 'PanjClub', 'guaguale115', 'hao115'];
+    const raw =
+      this.explicitChannels && this.explicitChannels.length > 0
+        ? this.explicitChannels
+        : this.channelManager.loadChannels().map((c) => c.id);
+    const base = raw.length > 0 ? raw : ['Quark_Movies', 'shareAliyun', 'PanjClub', 'guaguale115', 'hao115'];
+    return this.explicitChannels && this.explicitChannels.length > 0
+      ? base
+      : this.healthService.prioritizeChannels(base);
   }
 
   /**
@@ -84,19 +97,14 @@ export class ResourceSearcher {
       score += 50;
     }
 
-    // 4. 画质标签加分与用户专属画质偏好加权
-    if (title.includes('4k') || raw.includes('4k') || full.includes('2160p')) score += 20;
-    if (title.includes('remux') || raw.includes('remux') || full.includes('原盘') || full.includes('蓝光')) score += 15;
-    if (title.includes('1080p') || raw.includes('1080p')) score += 10;
+    // 4. 结构化画质标签加分与用户专属自然语言画质偏好加权
+    const tags = item.qualityTags || QualityTagger.extractTags(item.title, item.rawText);
+    score += tags.qualityScoreBonus;
+    score += QualityTagger.scoreByPreference(tags, preferredQuality);
 
-    const pref = (preferredQuality || '').toUpperCase();
-    if (pref === '4K' && /(?:4k|2160p|uhd|杜比|dolby|hdr)/i.test(full)) {
-      score += 80;
-    } else if (pref === '原盘' && /(?:remux|原盘|bluray|蓝光|iso)/i.test(full)) {
-      score += 80;
-    } else if (pref === '1080P' && /(?:1080p|1080i|高码)/i.test(full)) {
-      score += 80;
-    }
+    if (title.includes('4k') || raw.includes('4k') || full.includes('2160p')) score += 10;
+    if (title.includes('remux') || raw.includes('remux') || full.includes('原盘') || full.includes('蓝光')) score += 10;
+    if (title.includes('1080p') || raw.includes('1080p')) score += 5;
 
     return score;
   }
@@ -207,6 +215,7 @@ export class ResourceSearcher {
     seenUrls: Set<string>,
     results: CloudResource[]
   ): Promise<void> {
+    const reqStart = Date.now();
     try {
       const url = `https://t.me/s/${channel}?q=${encodeURIComponent(keyword)}`;
       const response = await axios.get(url, {
@@ -217,6 +226,7 @@ export class ResourceSearcher {
         },
       });
 
+      let extractedInChannel = 0;
       const $ = cheerio.load(response.data);
       $('.tgme_widget_message_wrap').each((_, elem) => {
         const msgElem = $(elem).find('.tgme_widget_message_text');
@@ -252,6 +262,7 @@ export class ResourceSearcher {
 
         const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
         const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
+        const qualityTags = QualityTagger.extractTags(cleanTitle || keyword, rawTextContent);
 
         const addResource = (
           shareUrl: string,
@@ -261,6 +272,7 @@ export class ResourceSearcher {
         ) => {
           if (!shareUrl || seenUrls.has(shareUrl)) return;
           seenUrls.add(shareUrl);
+          extractedInChannel++;
           results.push({
             title: cleanTitle || keyword,
             shareUrl,
@@ -268,6 +280,7 @@ export class ResourceSearcher {
             passcode: passcode || undefined,
             panType,
             category,
+            qualityTags,
             rawText: rawTextContent.slice(0, 400),
             sourceChannel: channel,
           });
@@ -294,7 +307,7 @@ export class ResourceSearcher {
           { regex: /https?:\/\/(?:115|anxia|115cdn)\.com\/s\/([a-zA-Z0-9]+)/gi, panType: '115', hasId: true },
           { regex: /https?:\/\/(?:www\.)?123[^\/\s<>"]+\.com\/s\/([a-zA-Z0-9]+)/gi, panType: 'other', hasId: true },
           { regex: /https?:\/\/cloud\.189\.cn\/[^\s<>"]+/gi, panType: 'other', hasId: false },
-          { regex: /https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/gi, panType: 'other', hasId: false },
+          { regex: /https?:\/\/(?:pan|yun)\.baidu\.com\/s\/[^\s<>"]+/gi, panType: 'baidu', hasId: false },
         ];
 
         for (const pat of otherPatterns) {
@@ -303,8 +316,13 @@ export class ResourceSearcher {
           }
         }
       });
+      if (!this.explicitChannels) {
+        this.healthService.recordSuccess(channel, Date.now() - reqStart, extractedInChannel);
+      }
     } catch {
-      // 静默异常
+      if (!this.explicitChannels) {
+        this.healthService.recordFailure(channel, Date.now() - reqStart);
+      }
     }
   }
 
@@ -315,9 +333,18 @@ export class ResourceSearcher {
     results: CloudResource[],
     primaryKeyword: string,
     options?: Omit<SearchOptions, 'keyword'>,
-    startTime: number = Date.now()
+    startTime: number = Date.now(),
+    fromCache: boolean = false
   ): SearchResult {
-    const pool = results.filter((item) => this.isRelevantItem(item, primaryKeyword, options?.aliasKeywords));
+    let pool = results.filter((item) => this.isRelevantItem(item, primaryKeyword, options?.aliasKeywords));
+    if (options?.subtitleOnly) {
+      const subPool = pool.filter(
+        (item) => item.qualityTags?.isSubtitleOnly || /字幕|srt|ass|sub/i.test(`${item.title} ${item.rawText || ''}`)
+      );
+      if (subPool.length > 0) {
+        pool = subPool;
+      }
+    }
 
     pool.sort((a, b) => {
       const scoreA = this.calculateScore(a, primaryKeyword, options?.quality, options?.aliasKeywords);
@@ -333,6 +360,7 @@ export class ResourceSearcher {
       items: finalItems,
       totalFound: pool.length,
       durationMs: Date.now() - startTime,
+      fromCache,
     };
   }
 
@@ -344,10 +372,23 @@ export class ResourceSearcher {
   }
 
   /**
+   * 专项检索外挂字幕资源（.srt / .ass / 字幕包）
+   */
+  async searchSubtitles(keyword: string, options?: Omit<SearchOptions, 'keyword'>): Promise<SearchResult> {
+    const clean = (keyword || '').trim();
+    if (!clean) return { keyword: '', items: [], totalFound: 0, durationMs: 0 };
+    return this.searchMany([`${clean} 字幕`, clean], {
+      ...options,
+      aliasKeywords: [clean, ...(options?.aliasKeywords || [])],
+      subtitleOnly: true,
+    });
+  }
+
+  /**
    * 多语种/多标题共享并发池一次性联合检索：
    * - 将多个语言标题（如 [中文, 拍摄国原语, 英文]）按频道交错排布在同一全局并发工作池中执行，
    *   避免 N 个关键词各开独立 15 并发导致瞬时请求放大引发 TG 网页限流；
-   * - 实时按 shareUrl 去重并统一以主片名优先打分排序。
+   * - 支持热词 10 分钟 LRU 缓存，命中后立即按用户当前画质偏好重排。
    */
   async searchMany(keywords: string[], options?: Omit<SearchOptions, 'keyword'>): Promise<SearchResult> {
     const startTime = Date.now();
@@ -375,6 +416,22 @@ export class ResourceSearcher {
         ...(options?.aliasKeywords || []),
       ].filter((a) => a && a.trim().toLowerCase() !== primaryKeyword.toLowerCase()))
     );
+
+    const cacheKey = !this.explicitChannels
+      ? `kw:${cleanKeywords.map((k) => k.toLowerCase()).join('|')}`
+      : '';
+    if (cacheKey) {
+      const cachedPool = ResourceSearcher.searchCache.get(cacheKey);
+      if (cachedPool && cachedPool.length > 0) {
+        return this.finalizeSearchPool(
+          cachedPool,
+          primaryKeyword,
+          { ...options, aliasKeywords: mergedAliases },
+          startTime,
+          true
+        );
+      }
+    }
 
     const results: CloudResource[] = [];
     const seenUrls = new Set<string>();
@@ -408,11 +465,16 @@ export class ResourceSearcher {
 
     await Promise.allSettled(workers);
 
+    if (cacheKey && results.length > 0) {
+      ResourceSearcher.searchCache.set(cacheKey, results);
+    }
+
     return this.finalizeSearchPool(
       results,
       primaryKeyword,
       { ...options, aliasKeywords: mergedAliases },
-      startTime
+      startTime,
+      false
     );
   }
 

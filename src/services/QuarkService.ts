@@ -3,6 +3,7 @@ import * as crypto from 'crypto';
 import * as path from 'path';
 import { ResourceCategory } from '../types';
 import { AntiCensorService } from './AntiCensorService';
+import { QuarkFileNode, QuarkOrganizer, DuplicateGroup } from './QuarkOrganizer';
 import { upsertEnvVar } from '../utils/FileUtils';
 
 export interface QuarkUserInfo {
@@ -865,5 +866,148 @@ export class QuarkService {
       scannedCount: totalScanned,
       renamedItems: allRenamed,
     };
+  }
+
+  /**
+   * 列出指定目录下的全部文件和子目录节点（含大小与目录标志）
+   */
+  async listFilesInFolder(folderFid = '0', customCookie?: string, size = 100): Promise<QuarkFileNode[]> {
+    if (!this.isConfigured(customCookie)) return [];
+    try {
+      const resp = await axios.get('https://drive-h.quark.cn/1/clouddrive/file/sort', {
+        params: {
+          pr: 'ucpro',
+          fr: 'pc',
+          uc_param_str: '',
+          pdir_fid: folderFid,
+          _page: '1',
+          _size: String(size),
+          _sort: 'updated_at:desc',
+        },
+        headers: this.getHeaders(customCookie),
+        timeout: 8000,
+      });
+      const list = resp.data?.data?.list || [];
+      return list.map((item: any) => ({
+        fid: item.fid,
+        file_name: item.file_name,
+        dir: Boolean(item.dir),
+        size: Number(item.size || 0),
+        pdir_fid: folderFid,
+      }));
+    } catch {
+      return [];
+    }
+  }
+
+  /**
+   * 删除指定文件或文件夹（移入回收站）
+   */
+  async deleteFiles(fids: string[], customCookie?: string): Promise<boolean> {
+    if (!this.isConfigured(customCookie) || fids.length === 0) return false;
+    try {
+      const resp = await axios.post(
+        'https://drive-h.quark.cn/1/clouddrive/file/delete?pr=ucpro&fr=pc',
+        { action_type: 2, filelist: fids, exclude_fids: [] },
+        { headers: this.getHeaders(customCookie), timeout: 8000 }
+      );
+      return resp.data?.status === 200 || resp.data?.code === 0;
+    } catch {
+      return false;
+    }
+  }
+
+  /**
+   * 按 Emby / Infuse / VidHub 规范整理并标准化媒体库文件名
+   */
+  async organizeMediaLibrary(
+    userRootDir?: string,
+    options?: { customCookie?: string; dryRun?: boolean }
+  ): Promise<{ scannedFolders: number; renamed: Array<{ from: string; to: string }> }> {
+    const customCookie = options?.customCookie;
+    const baseDir = userRootDir || this.defaultRootDir;
+    const renamed: Array<{ from: string; to: string }> = [];
+    let scannedFolders = 0;
+
+    if (!this.isConfigured(customCookie)) {
+      return { scannedFolders, renamed };
+    }
+
+    const rootFid = await this.resolveExistingPathFid(baseDir, customCookie);
+    if (!rootFid) return { scannedFolders, renamed };
+
+    const catFolders = await this.getFolderList(rootFid, customCookie);
+    for (const cat of catFolders.slice(0, 10)) {
+      scannedFolders++;
+      const subFolders = await this.getFolderList(cat.cid, customCookie);
+      for (const mediaDir of subFolders.slice(0, 15)) {
+        scannedFolders++;
+        const yearMatch = mediaDir.name.match(/\b(19\d{2}|20\d{2})\b/);
+        const standardTitle = mediaDir.name.replace(/[《》]|\(\d{4}\)/g, '').trim();
+        const files = await this.listFilesInFolder(mediaDir.cid, customCookie, 80);
+
+        for (const f of files) {
+          if (f.dir || !QuarkOrganizer.isVideoFile(f.file_name)) continue;
+          const targetName = QuarkOrganizer.formatEmbyMediaName(f.file_name, standardTitle, yearMatch?.[1]);
+          if (targetName && targetName !== f.file_name) {
+            if (!options?.dryRun) {
+              const ok = await this.renameFile(f.fid, targetName, customCookie);
+              if (ok.success) {
+                renamed.push({ from: f.file_name, to: targetName });
+              }
+            } else {
+              renamed.push({ from: f.file_name, to: targetName });
+            }
+          }
+        }
+      }
+    }
+
+    return { scannedFolders, renamed };
+  }
+
+  /**
+   * 扫描网盘分类目录下的重复影视资源（同名多清晰度或重复转存），支持预览或自动删除低清晰度冗余副本
+   */
+  async scanAndCleanDuplicates(
+    userRootDir?: string,
+    options?: { customCookie?: string; executeDelete?: boolean }
+  ): Promise<{
+    scannedCount: number;
+    groups: DuplicateGroup[];
+    deletedCount: number;
+    reclaimedBytes: number;
+  }> {
+    const customCookie = options?.customCookie;
+    const baseDir = userRootDir || this.defaultRootDir;
+    const allGroups: DuplicateGroup[] = [];
+    let scannedCount = 0;
+    let deletedCount = 0;
+    let reclaimedBytes = 0;
+
+    if (!this.isConfigured(customCookie)) {
+      return { scannedCount, groups: allGroups, deletedCount, reclaimedBytes };
+    }
+
+    const rootFid = await this.resolveExistingPathFid(baseDir, customCookie);
+    if (!rootFid) return { scannedCount, groups: allGroups, deletedCount, reclaimedBytes };
+
+    const catFolders = await this.getFolderList(rootFid, customCookie);
+    for (const cat of catFolders.slice(0, 10)) {
+      const files = await this.listFilesInFolder(cat.cid, customCookie, 100);
+      scannedCount += files.length;
+      const dirGroups = QuarkOrganizer.findDuplicateGroups(files);
+      allGroups.push(...dirGroups);
+
+      if (options?.executeDelete && dirGroups.length > 0) {
+        const toDelFids = dirGroups.flatMap((g) => g.duplicates.map((d) => d.fid));
+        if (toDelFids.length > 0 && (await this.deleteFiles(toDelFids, customCookie))) {
+          deletedCount += toDelFids.length;
+          reclaimedBytes += dirGroups.reduce((acc, g) => acc + g.reclaimableBytes, 0);
+        }
+      }
+    }
+
+    return { scannedCount, groups: allGroups, deletedCount, reclaimedBytes };
   }
 }

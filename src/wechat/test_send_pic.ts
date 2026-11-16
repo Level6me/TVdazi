@@ -68,13 +68,13 @@ async function run() {
     {
       msg: {
         to_user_id: targetUser,
-        client_id: `wesaver-img-${Date.now()}`,
+        client_id: `tvdazi-img-${Date.now()}`,
         message_type: 2, // BOT
         message_state: 2, // FINISH
         item_list: [
           {
             type: 1, // TEXT 附带说明
-            text_item: { text: '📸 叮咚！我是 WeSaver，这是一张测试图片已成功送达你的微信聊天框！' },
+            text_item: { text: '📸 叮咚！我是电视搭子 (TVdazi)，这是一张测试图片已成功送达你的微信聊天框！' },
           },
           {
             type: 2, // IMAGE

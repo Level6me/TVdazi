@@ -317,7 +317,7 @@ export class MetadataResolver {
       try {
         const resp = await axios.get(`https://api.bgm.tv/search/subject/${encodeURIComponent(cleanQ)}`, {
           params: { responseGroup: 'small', max_results: 5 },
-          headers: { 'User-Agent': 'WeSaver/1.0 (https://github.com/Level6me/wesaver)' },
+          headers: { 'User-Agent': 'TVdazi/1.0 (https://github.com/Level6me/TVdazi)' },
           timeout: 3200,
         });
         const list = Array.isArray(resp.data?.list) ? resp.data.list : [];

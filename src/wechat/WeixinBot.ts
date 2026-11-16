@@ -9,7 +9,11 @@ import { DeepSeekAgent } from '../agent/DeepSeekAgent';
 import { downloadAndDecryptWechatImage } from './CdnDecrypt';
 import { uploadImageToWechatCdn } from './CdnUpload';
 import { SchedulerService } from '../services/SchedulerService';
+import { DashboardServer } from '../web/DashboardServer';
+import { PushGateway } from '../services/PushGateway';
+import { RelayService } from '../services/RelayService';
 import { atomicWriteFileSync } from '../utils/FileUtils';
+import { maskSensitive } from '../utils/Logger';
 
 const FIXED_BASE_URL = 'https://ilinkai.weixin.qq.com';
 const BOT_TYPE = '3';
@@ -206,11 +210,8 @@ export class WeixinBot {
   }
 
   private maskSensitiveLog(text: string): string {
-    if (/^\/(?:set-quark|set-key|set-deepseek)\b/i.test(text.trim())) {
-      const cmd = text.trim().split(/\s+/)[0];
-      return `${cmd} [REDACTED]`;
-    }
-    return text.length > 120 ? `${text.slice(0, 120)}...` : text;
+    const masked = maskSensitive(text.trim());
+    return masked.length > 120 ? `${masked.slice(0, 120)}...` : masked;
   }
 
   /**
@@ -363,6 +364,9 @@ export class WeixinBot {
             const fromUser = msg.from_user_id;
             const contextToken = msg.context_token;
             this.recordUserRoute(fromUser, auth.botId, contextToken);
+            const capturedName =
+              msg.from_user_name || msg.sender_name || msg.nickname || msg.from_nickname || undefined;
+            RelayService.getInstance().registerActiveUser(fromUser, auth.botId, capturedName);
             const textItem = msg.item_list?.find((i: any) => i.type === 1);
             const imageItem = msg.item_list?.find((i: any) => i.type === 2);
             const userText = textItem?.text_item?.text?.trim();
@@ -462,10 +466,20 @@ export class WeixinBot {
       }
     }
 
+    // 注册全局主动推送网关（供跨用户传话与后台任务调用）
+    PushGateway.getInstance().registerSender(async (userId, text) => {
+      return await this.pushMessageToUser(userId, text);
+    });
+
     // 启动全局智能定时与资源监控引擎
     SchedulerService.getInstance().start(async (userId, text) => {
       return await this.pushMessageToUser(userId, text);
     });
+
+    // 同步拉起轻量 H5 自助控制台
+    DashboardServer.ensureStandaloneStarted().then((port) => {
+      console.log(`[WeixinBot] 🌐 H5 自助控制台已就绪: http://127.0.0.1:${port}/panel`);
+    }).catch(() => {});
   }
 
   private loadUserRoutes() {
@@ -560,7 +574,7 @@ export class WeixinBot {
         {
           msg: {
             to_user_id: toUserId,
-            client_id: `wesaver-img-${Date.now()}`,
+            client_id: `tvdazi-img-${Date.now()}`,
             message_type: 2,
             message_state: 2,
             item_list: [
@@ -669,7 +683,7 @@ export class WeixinBot {
           {
             msg: {
               to_user_id: toUserId,
-              client_id: `wesaver-${Date.now()}-${i}`,
+              client_id: `tvdazi-${Date.now()}-${i}`,
               message_type: 2, // BOT
               message_state: 2, // FINISH
               item_list: [

@@ -9,7 +9,7 @@ async function main() {
   const bot = new WeixinBot();
 
   console.log('====================================================');
-  console.log('   WeSaver - 微信端 AI 云盘资源转存助手 (个人微信通道)');
+  console.log('   TVdazi (电视搭子) - 微信端 AI 云盘资源转存助手 (个人微信通道)');
   console.log('====================================================');
 
   const authFile = path.resolve(__dirname, '../data/weixin_auth.json');

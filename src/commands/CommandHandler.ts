@@ -9,6 +9,10 @@ import { AiRecommender } from '../services/AiRecommender';
 import { CategoryClassifier, ResourceCategory } from '../services/CategoryClassifier';
 import { SchedulerService } from '../services/SchedulerService';
 import { MetadataResolver, ResolvedMediaInfo } from '../services/MetadataResolver';
+import { getPanRegistry } from '../services/pan';
+import { WebhookService } from '../services/WebhookService';
+import { RelayService } from '../services/RelayService';
+import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
 import * as crypto from 'crypto';
@@ -69,10 +73,18 @@ export class CommandHandler {
 
     if (
       trimmed.startsWith('/') ||
-      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质)(?:\s+.*)?$/i.test(
+      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表)(?:\s+.*)?$/i.test(
         trimmed
       ) ||
+      /^(?:我叫|叫我|我的名字叫|我的名字是)\s*[^\s，。！!？?]{1,20}$/.test(trimmed) ||
       this.isFriendInviteIntent(trimmed)
+    ) {
+      return true;
+    }
+
+    if (
+      RelayService.getInstance().getPendingReply(userId) &&
+      /^(?:你)?(?:跟他说|告诉他|回复他|跟她说|告诉她|回复她|回他|回她|转告他|转告她)[：:，,\s]*.+$/i.test(trimmed)
     ) {
       return true;
     }
@@ -208,6 +220,20 @@ export class CommandHandler {
       return await SchedulerService.getInstance().handleNaturalLanguageCommand(trimmed, userId);
     }
 
+    // 4.6 跨用户传话口语直达（"我叫xxx" / "你跟他说..."）
+    const selfNameMatch = trimmed.match(/^(?:我叫|叫我|我的名字叫|我的名字是)\s*([^\s，。！!？?]{1,20})$/);
+    if (selfNameMatch && selfNameMatch[1]) {
+      return RelayService.getInstance().setMyNickname(userId, selfNameMatch[1]).message;
+    }
+
+    const quickReplyMatch = trimmed.match(
+      /^(?:你)?(?:跟他说|告诉他|回复他|跟她说|告诉她|回复她|回他|回她|转告他|转告她)[：:，,\s]*(.+)$/i
+    );
+    if (quickReplyMatch && quickReplyMatch[1] && RelayService.getInstance().getPendingReply(userId)) {
+      const res = await RelayService.getInstance().replyToLastSender(userId, quickReplyMatch[1]);
+      return res.replyToReplier;
+    }
+
     const parts = trimmed.split(/\s+/);
     const cmd = parts[0].toLowerCase();
     const args = parts.slice(1);
@@ -280,7 +306,13 @@ export class CommandHandler {
     }
 
     if (cmd === '/transfer-115') {
-      return '115 网盘秒存还在加紧打磨中，目前建议优先用夸克网盘，转存又快又稳哦！';
+      const extReply = await handleExtendedCommand(cmd, args, userId, {
+        userManager: this.userManager,
+        quarkService: this.quarkService,
+        channelManager: this.channelManager,
+        searcher: this.searcher,
+      });
+      if (extReply !== null) return extReply;
     }
 
     if (cmd === '/set-quark') {
@@ -340,27 +372,22 @@ export class CommandHandler {
     }
 
     if (['/prefer', '/quality', '画质偏好', '设置画质'].includes(cmd)) {
-      const rawPref = (args[0] || '').trim().toUpperCase();
+      const rawPref = args.join(' ').trim();
       if (!rawPref) {
         const current = this.userManager.getUserPlan(userId).preferences?.preferredQuality || 'any';
         return [
           `🎞️ 当前搜片画质偏好：【${current === 'any' ? '自动默认（不限画质）' : current}】`,
           '----------------------------------------',
-          '💡 可发送以下命令切换画质优先排序：',
-          '• `/prefer 4K`   优先置顶 4K / 杜比 / HDR 片源',
-          '• `/prefer 原盘` 优先置顶 REMUX / 蓝光原盘',
-          '• `/prefer 1080P` 优先置顶 1080P 省流版',
-          '• `/prefer 自动` 恢复默认排序',
+          '💡 可发送以下命令切换画质优先排序（支持任意自然语言组合）：',
+          '• `/prefer 4K`          优先置顶 4K / 杜比 / HDR 片源',
+          '• `/prefer 4K杜比`      优先置顶 4K + 杜比视界/HDR',
+          '• `/prefer 原盘`        优先置顶 REMUX / 蓝光原盘',
+          '• `/prefer 体积小1080P` 优先置顶省流小体积 1080P',
+          '• `/prefer 自动`        恢复默认排序',
         ].join('\n');
       }
-      let target: '4K' | '1080P' | '原盘' | 'any' = 'any';
-      if (['4K', '2160P', 'UHD', '高画质'].includes(rawPref)) target = '4K';
-      else if (['1080', '1080P', '省流', '高清'].includes(rawPref)) target = '1080P';
-      else if (['原盘', 'REMUX', '蓝光', 'BLURAY'].includes(rawPref)) target = '原盘';
-      else if (['ANY', 'AUTO', '自动', '默认', '不限', '重置'].includes(rawPref)) target = 'any';
-      else {
-        return '支持的画质偏好选项：`4K`、`1080P`、`原盘` 或 `自动`，例如：`/prefer 4K`';
-      }
+      const upper = rawPref.toUpperCase();
+      const target = ['ANY', 'AUTO', '自动', '默认', '不限', '重置'].includes(upper) ? 'any' : rawPref;
 
       this.userManager.setUserPreferredQuality(userId, target);
       return target === 'any'
@@ -409,6 +436,16 @@ export class CommandHandler {
       }
       reply += '\n\n💡 以后每次转存新资源时，我也会全自动实时检测并规整为正常片名哦！';
       return reply;
+    }
+
+    const extReply = await handleExtendedCommand(cmd, args, userId, {
+      userManager: this.userManager,
+      quarkService: this.quarkService,
+      channelManager: this.channelManager,
+      searcher: this.searcher,
+    });
+    if (extReply !== null) {
+      return extReply;
     }
 
     return `没太明白「${cmd}」是什么意思呢 😅 发送「帮助」或者 /help 可以查看我支持的全部玩法！`;
@@ -625,6 +662,14 @@ export class CommandHandler {
         });
         if (res.success) {
           this.userManager.recordSave(userId, item.title, item.shareUrl, category);
+          WebhookService.notifyMediaSaved(userPlan.webhookUrl, {
+            userId,
+            title: item.title,
+            category,
+            panType: 'quark',
+            targetPath: res.targetPath,
+            shareUrl: item.shareUrl,
+          }).catch(() => {});
           return [
             `🎬 收到！正在为你转存第 ${index} 个资源${relativeLabel}：`,
             `《${item.title}》`,
@@ -650,13 +695,53 @@ export class CommandHandler {
         ].join('\n');
       }
 
-      const panName = item.panType === 'aliyun' ? '阿里云盘' : item.panType === 'uc' ? 'UC网盘' : '第三方网盘';
+      // 若用户已绑定阿里云盘或 115 凭证，自动调用对应网盘适配器直接转存
+      if ((item.panType === 'aliyun' || item.panType === '115') && item.shareId) {
+        const provider = getPanRegistry().get(item.panType);
+        const credential = item.panType === 'aliyun' ? userPlan.aliyunToken : userPlan.pan115Cookie;
+        if (provider && provider.isConfigured(credential)) {
+          const panRes = await provider.saveShare(item.shareId, item.passcode || '', category, {
+            credential,
+            rootDir: userPlan.saveRootDir,
+            standardTitle,
+            userId,
+          });
+          if (panRes.success) {
+            this.userManager.recordSave(userId, item.title, item.shareUrl, category);
+            WebhookService.notifyMediaSaved(userPlan.webhookUrl, {
+              userId,
+              title: item.title,
+              category,
+              panType: item.panType,
+              targetPath: panRes.targetPath,
+              shareUrl: item.shareUrl,
+            }).catch(() => {});
+            return [
+              `🎬 已通过 ${provider.displayName} 自动转存第 ${index} 个资源${relativeLabel}：`,
+              `《${item.title}》`,
+              panRes.message,
+              `🔗 原链接：${item.shareUrl}`,
+            ].join('\n');
+          }
+        }
+      }
+
+      const panName =
+        item.panType === 'aliyun'
+          ? '阿里云盘'
+          : item.panType === '115'
+          ? '115网盘'
+          : item.panType === 'uc'
+          ? 'UC网盘'
+          : item.panType === 'baidu'
+          ? '百度网盘'
+          : '第三方网盘';
       return [
         `🎬 已为你找到第 ${index} 个资源${relativeLabel}《${item.title}》：`,
         `📦 资源类型：${panName}（分类：${category}）`,
         `🔗 完整链接：${item.shareUrl}`,
         '----------------------------------------',
-        `💡 小贴士：复制上面的链接在 ${panName} App 中打开就可以直接保存和播放啦！`,
+        `💡 小贴士：复制上面的链接在 ${panName} App 中打开即可保存；也可以发 /set-aliyun 或 /set-115 绑定后一键直存！`,
       ].join('\n');
     }
 
@@ -799,13 +884,19 @@ export class CommandHandler {
           ? '夸克'
           : item.panType === 'aliyun'
           ? '阿里'
+          : item.panType === '115'
+          ? '115'
           : item.panType === 'uc'
           ? 'UC'
+          : item.panType === 'baidu'
+          ? '百度'
           : '网盘';
       const cat = item.category ? `[${item.category}]` : '';
       const fullText = `${item.title} ${item.rawText || ''}`;
       let qBadge = '';
-      if (!/4k|2160p/i.test(item.title) && /(?:4k|2160p|杜比|dolby)/i.test(fullText)) {
+      if (item.qualityTags?.badges && item.qualityTags.badges.length > 0) {
+        qBadge = item.qualityTags.badges.map((b) => `[${b}]`).join('');
+      } else if (!/4k|2160p/i.test(item.title) && /(?:4k|2160p|杜比|dolby)/i.test(fullText)) {
         qBadge = '[4K]';
       } else if (!/remux|原盘/i.test(item.title) && /(?:remux|蓝光原盘)/i.test(fullText)) {
         qBadge = '[原盘]';
@@ -1155,7 +1246,7 @@ export class CommandHandler {
 
   private renderHelp(userId: string): string {
     return [
-      '🤖 WeSaver 微信影视小助手使用指南',
+      '🤖 电视搭子 (TVdazi) 微信影视小助手使用指南',
       '─────────────────────────',
       '🔍 【找片与转存】',
       '• 直接发片名 / 剧照截图搜片',
@@ -1164,13 +1255,17 @@ export class CommandHandler {
       '• 回复“换一批”刷新推荐',
       '',
       '⚙️ 【常用指令】',
+      '• /web           打开 H5 可视化控制面板',
       '• /tasks         查看/管理定时任务与追更',
       '• /status        查看网盘空间与状态',
       '• /config        查看当前个人配置',
       '• /set-dir 路径   修改保存目录(如 /影视)',
-      '• /prefer 4K     设置搜片优先画质偏好',
+      '• /prefer 4K杜比  设置画质偏好（支持自然语言）',
+      '• /subtitle 片名  专项检索外挂/中字字幕包',
       '• /clean-names   一键清洗网盘火星文剧名',
-      '• /追剧          查看追剧清单与历史',
+      '• /organize      按 Emby/Infuse 规范整理命名',
+      '• /dedup         扫描重复低画质资源释放空间',
+      '• /追剧 / /import-list  查看或批量导入片单',
       '• /share         邀请微信好友一起使用',
       '',
       '⏰ 【定时与智能追更（直接发文字即可）】',
@@ -1178,10 +1273,21 @@ export class CommandHandler {
       '• 发“《片名》有资源了通知我”或“蹲守《片名》”',
       '• 发“帮我追更《剧名》”或“开启全套智能守护”',
       '',
-      '🔑 【高级与账号绑定】',
+      '💬 【多用户传话与通讯录】',
+      '• /users / “通讯录”     查看当前服务在线的微信用户',
+      '• /name 名字 / “我叫xxx” 设置自己的对外昵称',
+      '• /alias 序号 备注      给其他用户设置本地备注名',
+      '• /say 名字 内容        直接托我给指定微信好友带话',
+      '• /reply 内容 / “跟他说...” 回复最近给你传话的好友',
+      '• /dnd on|off          开启或关闭传话免打扰',
+      '',
+      '🔑 【高级与多网盘绑定】',
       '• /set-quark Cookie   绑定私有夸克网盘',
+      '• /set-aliyun Token   绑定阿里云盘自动转存',
+      '• /set-115 Cookie     绑定 115 网盘自动接收',
+      '• /set-webhook URL    配置 Alist/Emby 扫库通知',
       '• /set-key APIKey     绑定专属DeepSeek Key',
-      '• /channels           查看当前50+资源源',
+      '• /channels / /channels-health  频道与健康度',
       '─────────────────────────',
       '💡 日常直接和我像微信好友一样聊天即可找片！',
     ].join('\n');

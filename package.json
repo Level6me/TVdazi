@@ -1,10 +1,11 @@
 {
-  "name": "wesaver",
+  "name": "tvdazi",
   "version": "1.0.0",
-  "description": "WeSaver - 微信端 AI 云盘资源转存助手 (DeepSeek 驱动)",
+  "description": "TVdazi (电视搭子) - 微信端 AI 云盘资源转存助手 (DeepSeek 驱动)",
   "main": "dist/login.js",
   "scripts": {
     "build": "tsc",
+    "test": "npm run build && node --test dist/tests/*.test.js",
     "start": "node dist/login.js",
     "server": "node dist/index.js",
     "dev": "ts-node src/login.ts",
@@ -13,12 +14,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/Level6me/wesaver.git"
+    "url": "https://github.com/Level6me/TVdazi.git"
   },
   "bugs": {
-    "url": "https://github.com/Level6me/wesaver/issues"
+    "url": "https://github.com/Level6me/TVdazi/issues"
   },
-  "homepage": "https://github.com/Level6me/wesaver#readme",
+  "homepage": "https://github.com/Level6me/TVdazi#readme",
   "keywords": [
     "wechat",
     "deepseek",
