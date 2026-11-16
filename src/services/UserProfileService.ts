@@ -5,6 +5,7 @@ export type ImplicitAction = 'save' | 'share' | 'search' | 'skip';
 
 export interface UserTasteProfile {
   explicitLikes: {
+    mediaTypes?: string[];
     genres: string[];
     regions: string[];
     directors: string[];
@@ -12,12 +13,14 @@ export interface UserTasteProfile {
     favoriteSeeds: string[];
   };
   explicitDislikes: {
+    mediaTypes?: string[];
     genres: string[];
     titles: string[];
   };
   implicitEvents: Array<{
     title: string;
     action: ImplicitAction;
+    mediaType?: string;
     genres: string[];
     region?: string;
     directors?: string[];
@@ -29,11 +32,41 @@ export interface UserTasteProfile {
 }
 
 export interface TagWeightVector {
+  mediaTypes: Record<string, number>;
   genres: Record<string, number>;
   regions: Record<string, number>;
   directors: Record<string, number>;
   actors: Record<string, number>;
   decades: Record<string, number>;
+}
+
+export interface ParsedNaturalPreference {
+  likeMediaTypes: string[];
+  dislikeMediaTypes: string[];
+  likeGenres: string[];
+  dislikeGenres: string[];
+  likeRegions: string[];
+  likeDirectors: string[];
+  likeActors: string[];
+  favoriteSeeds: string[];
+  dislikeTitles: string[];
+}
+
+export interface ProfileAnalysisResult {
+  personaLabel: string;
+  confidence: number;
+  diversityEntropy: number;
+  diversityLabel: string;
+  mediaTypeDistribution: Array<{ name: string; weight: number; ratio: number }>;
+  topGenres: Array<{ name: string; score: number }>;
+  topRegions: Array<{ name: string; score: number }>;
+  topDirectors: Array<{ name: string; score: number }>;
+  topActors: Array<{ name: string; score: number }>;
+  favoriteSeeds: string[];
+  dislikedGenres: string[];
+  dislikedMediaTypes: string[];
+  eventCount: number;
+  recommendationStrategy: string;
 }
 
 const ACTION_BASE_WEIGHTS: Record<ImplicitAction, number> = {
@@ -71,6 +104,7 @@ export class UserProfileService {
     if (!plan.tasteProfile) {
       plan.tasteProfile = {
         explicitLikes: {
+          mediaTypes: [],
           genres: [],
           regions: [],
           directors: [],
@@ -78,12 +112,20 @@ export class UserProfileService {
           favoriteSeeds: [],
         },
         explicitDislikes: {
+          mediaTypes: [],
           genres: [],
           titles: [],
         },
         implicitEvents: [],
         updatedAt: Date.now(),
       };
+    } else {
+      if (!Array.isArray(plan.tasteProfile.explicitLikes.mediaTypes)) {
+        plan.tasteProfile.explicitLikes.mediaTypes = [];
+      }
+      if (!Array.isArray(plan.tasteProfile.explicitDislikes.mediaTypes)) {
+        plan.tasteProfile.explicitDislikes.mediaTypes = [];
+      }
     }
     return plan.tasteProfile;
   }
@@ -117,6 +159,8 @@ export class UserProfileService {
   public recordExplicitPreference(
     userId: string,
     opts: {
+      likeMediaTypes?: string[];
+      dislikeMediaTypes?: string[];
       likeGenres?: string[];
       likeRegions?: string[];
       likeDirectors?: string[];
@@ -130,6 +174,8 @@ export class UserProfileService {
     const plan = this.userManager.getUserPlan(userId);
     const profile = this.ensureProfile(plan);
 
+    this.mergeUnique(profile.explicitLikes.mediaTypes!, opts.likeMediaTypes, 8);
+    this.mergeUnique(profile.explicitDislikes.mediaTypes!, opts.dislikeMediaTypes, 8);
     this.mergeUnique(profile.explicitLikes.genres, opts.likeGenres, 15);
     this.mergeUnique(profile.explicitLikes.regions, opts.likeRegions, 10);
     this.mergeUnique(profile.explicitLikes.directors, opts.likeDirectors, 15);
@@ -137,6 +183,13 @@ export class UserProfileService {
     this.mergeUnique(profile.explicitLikes.favoriteSeeds, opts.favoriteSeeds, 20);
     this.mergeUnique(profile.explicitDislikes.genres, opts.dislikeGenres, 15);
     this.mergeUnique(profile.explicitDislikes.titles, opts.dislikeTitles, 30);
+
+    if (opts.likeMediaTypes && opts.likeMediaTypes.length > 0) {
+      const likeMediaSet = new Set(opts.likeMediaTypes.map((m) => m.toLowerCase()));
+      profile.explicitDislikes.mediaTypes = (profile.explicitDislikes.mediaTypes || []).filter(
+        (m) => !likeMediaSet.has(m.toLowerCase())
+      );
+    }
 
     // 若用户说了喜欢某题材，自动从不喜欢列表移出该题材
     if (opts.likeGenres && opts.likeGenres.length > 0) {
@@ -227,6 +280,7 @@ export class UserProfileService {
   public computeTagVector(userId: string, nowMs: number = Date.now()): TagWeightVector {
     const profile = this.getProfile(userId);
     const vec: TagWeightVector = {
+      mediaTypes: {},
       genres: {},
       regions: {},
       directors: {},
@@ -241,6 +295,7 @@ export class UserProfileService {
     };
 
     // 1. 显式偏好（永久基础高权重 +5.0）
+    for (const m of profile.explicitLikes.mediaTypes || []) addWeight(vec.mediaTypes, m, 5.0);
     for (const g of profile.explicitLikes.genres) addWeight(vec.genres, g, 5.0);
     for (const r of profile.explicitLikes.regions) addWeight(vec.regions, r, 5.0);
     for (const d of profile.explicitLikes.directors) addWeight(vec.directors, d, 5.0);
@@ -251,6 +306,7 @@ export class UserProfileService {
       const ageMs = Math.max(0, nowMs - ev.timestamp);
       const decay = Math.pow(0.5, ageMs / HALF_LIFE_MS);
       const w = ACTION_BASE_WEIGHTS[ev.action] * decay;
+      if (ev.mediaType) addWeight(vec.mediaTypes, ev.mediaType, w * 0.9);
       for (const g of ev.genres) addWeight(vec.genres, g, w);
       if (ev.region) addWeight(vec.regions, ev.region, w * 0.8);
       for (const d of ev.directors || []) addWeight(vec.directors, d, w * 1.1);
@@ -399,9 +455,268 @@ export class UserProfileService {
   }
 
   /**
+   * 轻量级中文自然语言偏好解析器：
+   * 从用户口语描述中自动抽取喜欢的/排雷的【影视形态（电影/电视剧/综艺/动漫/纪录片/短剧）、题材、地区、导演、代表作】
+   */
+  public parseNaturalLanguagePreference(text: string): ParsedNaturalPreference {
+    const out: ParsedNaturalPreference = {
+      likeMediaTypes: [],
+      dislikeMediaTypes: [],
+      likeGenres: [],
+      dislikeGenres: [],
+      likeRegions: [],
+      likeDirectors: [],
+      likeActors: [],
+      favoriteSeeds: [],
+      dislikeTitles: [],
+    };
+
+    const raw = String(text || '').trim();
+    if (!raw) return out;
+
+    const mediaDict: Array<[RegExp, string]> = [
+      [/(?:电影|院线片|大片|影片|movie)/i, '电影'],
+      [/(?:电视剧|连续剧|剧集|网剧|美剧|韩剧|日剧|泰剧|港剧|台剧|国产剧|陆剧)/i, '电视剧'],
+      [/(?:综艺|真人秀|脱口秀|恋综|音综|搞笑综艺|下饭综艺|晚会)/i, '综艺'],
+      [/(?:动漫|动画|番剧|国漫|日漫|二次元)/i, '动漫'],
+      [/(?:纪录片|纪实)/i, '纪录片'],
+      [/(?:短剧|微短剧|爽剧)/i, '短剧'],
+    ];
+
+    const genreDict: Array<[RegExp, string]> = [
+      [/(?:悬疑|推理|烧脑|探案|破案)/i, '悬疑'],
+      [/(?:科幻|太空|赛博|星际|未来)/i, '科幻'],
+      [/(?:犯罪|警匪|黑帮|扫黑|刑侦)/i, '犯罪'],
+      [/(?:动作|武侠|功夫|打戏|特工|枪战)/i, '动作'],
+      [/(?:喜剧|搞笑|幽默|沙雕|下饭|轻松|欢乐)/i, '喜剧'],
+      [/(?:爱情|恋爱|甜宠|浪漫|偶像|言情|恋综)/i, '爱情'],
+      [/(?:剧情|文艺|现实|人性|口碑)/i, '剧情'],
+      [/(?:战争|军事|谍战|抗战)/i, '战争'],
+      [/(?:恐怖|鬼片|惊悚|灵异|吓人)/i, '恐怖'],
+      [/(?:奇幻|魔幻|仙侠|玄幻|魔法)/i, '奇幻'],
+      [/(?:古装|历史|宫斗|权谋|朝堂|武林)/i, '古装'],
+      [/(?:家庭|伦理|亲情|治愈|温情|生活)/i, '家庭'],
+      [/(?:真人秀|慢综艺|旅游|旅行|美食|竞速)/i, '真人秀'],
+      [/(?:脱口秀|吐槽|单口|相声)/i, '脱口秀'],
+      [/(?:音乐|音综|演唱会|歌舞)/i, '音乐'],
+    ];
+
+    const regionDict: Array<[RegExp, string]> = [
+      [/(?:国产|内地|大陆|华语|国漫|国产剧)/i, '中国大陆'],
+      [/(?:香港|港片|港剧|TVB)/i, '香港'],
+      [/(?:台湾|台剧|台片)/i, '台湾'],
+      [/(?:韩国|韩剧|韩影|韩综)/i, '韩国'],
+      [/(?:日本|日剧|日影|日漫)/i, '日本'],
+      [/(?:美国|美剧|好莱坞)/i, '美国'],
+      [/(?:英国|英剧)/i, '英国'],
+      [/(?:欧美|西方)/i, '欧美'],
+      [/(?:泰国|泰剧|泰影)/i, '泰国'],
+    ];
+
+    const clauses = raw
+      .split(/[，,。；;！!\n]|(?=(?:但是|不过|就是|除了|别给我|不要|不喜欢|不爱看|不看|讨厌|排雷))/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const negPrefixRegex = /(?:不喜欢|不爱看|不怎么看|不看|别推|别给我推|少推|不要|讨厌|害怕|受不了|拒绝|排雷)/;
+
+    const pushUnique = (arr: string[], val: string) => {
+      if (val && !arr.includes(val)) arr.push(val);
+    };
+
+    for (const clause of clauses) {
+      const isNegative = negPrefixRegex.test(clause);
+
+      for (const m of clause.matchAll(/《([^《》]{1,40})》/g)) {
+        const title = m[1].trim();
+        if (title) {
+          pushUnique(isNegative ? out.dislikeTitles : out.favoriteSeeds, title);
+        }
+      }
+
+      for (const [reg, label] of mediaDict) {
+        if (reg.test(clause)) {
+          pushUnique(isNegative ? out.dislikeMediaTypes : out.likeMediaTypes, label);
+        }
+      }
+
+      for (const [reg, label] of genreDict) {
+        if (reg.test(clause)) {
+          pushUnique(isNegative ? out.dislikeGenres : out.likeGenres, label);
+        }
+      }
+
+      if (!isNegative) {
+        for (const [reg, label] of regionDict) {
+          if (reg.test(clause)) {
+            pushUnique(out.likeRegions, label);
+          }
+        }
+
+        const dirMatch = clause.match(/导演\s*([A-Za-z\u4e00-\u9fa5·]{2,14})/);
+        if (dirMatch && dirMatch[1]) {
+          pushUnique(out.likeDirectors, dirMatch[1].trim());
+        }
+        const actorMatch = clause.match(/(?:演员|主演|明星)\s*([A-Za-z\u4e00-\u9fa5·]{2,14})/);
+        if (actorMatch && actorMatch[1]) {
+          pushUnique(out.likeActors, actorMatch[1].trim());
+        }
+      }
+    }
+
+    return out;
+  }
+
+  /**
+   * 判断用户输入是否在主动表达个人影视偏好（而非直接搜片或发指令）
+   */
+  public static isNaturalPreferenceStatement(text: string): boolean {
+    const trimmed = String(text || '').trim();
+    if (!trimmed || trimmed.startsWith('/')) return false;
+    // 排除明确搜片或定时/传话指令
+    if (/(?:帮我找|搜一下|搜索|求资源|推荐一部|来一部|有什么好看|几分钟后|定时|追更|蹲守|传话)/.test(trimmed)) {
+      return false;
+    }
+    const hasPrefVerb = /(?:我(?:平时|一般|比较|最|特别|挺|很|偏)?(?:喜欢|爱看|偏好|爱追|常看|迷上|钟爱|不喜欢|不爱看|不看|讨厌|害怕|排雷))|(?:别给我推|少给我推|平时爱看|个人口味)/.test(
+      trimmed
+    );
+    if (!hasPrefVerb) return false;
+    const hasMediaOrTaste = /(?:电影|电视剧|剧集|连续剧|网剧|综艺|真人秀|脱口秀|动漫|动画|纪录片|短剧|悬疑|科幻|犯罪|动作|喜剧|搞笑|爱情|剧情|战争|恐怖|惊悚|奇幻|古装|家庭|韩剧|美剧|日剧|港剧|国产|欧美|《)/.test(
+      trimmed
+    );
+    return hasMediaOrTaste;
+  }
+
+  /**
+   * 解析自然语言并更新用户画像，随后执行算法画像分析并返回结构化结果
+   */
+  public applyNaturalLanguagePreference(userId: string, text: string): {
+    parsed: ParsedNaturalPreference;
+    analysis: ProfileAnalysisResult;
+  } {
+    const parsed = this.parseNaturalLanguagePreference(text);
+    this.recordExplicitPreference(userId, {
+      likeMediaTypes: parsed.likeMediaTypes,
+      dislikeMediaTypes: parsed.dislikeMediaTypes,
+      likeGenres: parsed.likeGenres,
+      dislikeGenres: parsed.dislikeGenres,
+      likeRegions: parsed.likeRegions,
+      likeDirectors: parsed.likeDirectors,
+      likeActors: parsed.likeActors,
+      favoriteSeeds: parsed.favoriteSeeds,
+      dislikeTitles: parsed.dislikeTitles,
+    });
+    return {
+      parsed,
+      analysis: this.analyzeUserProfile(userId),
+    };
+  }
+
+  /**
+   * 算法分析用户画像：
+   * 计算形态占比分布、偏好置信度、香农多样性熵与人物画像标签
+   */
+  public analyzeUserProfile(userId: string): ProfileAnalysisResult {
+    const profile = this.getProfile(userId);
+    const vec = this.computeTagVector(userId);
+    const sortBucket = (b: Record<string, number>, topN = 5) =>
+      Object.entries(b)
+        .filter(([, v]) => v > 0.2)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, topN)
+        .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
+
+    const topMediaRaw = sortBucket(vec.mediaTypes, 6);
+    const mediaSum = topMediaRaw.reduce((acc, item) => acc + item.score, 0);
+    const mediaTypeDistribution = topMediaRaw.map((m) => ({
+      name: m.name,
+      weight: m.score,
+      ratio: mediaSum > 0 ? Math.round((m.score / mediaSum) * 100) : 0,
+    }));
+
+    const topGenres = sortBucket(vec.genres, 6);
+    const topRegions = sortBucket(vec.regions, 4);
+    const topDirectors = sortBucket(vec.directors, 3);
+    const topActors = sortBucket(vec.actors, 3);
+
+    // 计算香农多样性熵（Normalized Shannon Entropy over genres）
+    let diversityEntropy = 0;
+    const genreSum = topGenres.reduce((acc, g) => acc + g.score, 0);
+    if (topGenres.length > 1 && genreSum > 0) {
+      let h = 0;
+      for (const g of topGenres) {
+        const p = g.score / genreSum;
+        if (p > 0) h -= p * Math.log2(p);
+      }
+      diversityEntropy = Number((h / Math.log2(topGenres.length)).toFixed(2));
+    }
+
+    const diversityLabel =
+      topGenres.length === 0
+        ? '冷启动待建立'
+        : diversityEntropy >= 0.85
+          ? '多面探索派（涉猎广泛）'
+          : diversityEntropy >= 0.55
+            ? '均衡追片派（主次分明）'
+            : '垂直硬核派（偏好高度聚焦）';
+
+    // 画像置信度 (0~100%)
+    const explicitSignals =
+      (profile.explicitLikes.mediaTypes?.length || 0) +
+      profile.explicitLikes.genres.length +
+      profile.explicitLikes.regions.length +
+      profile.explicitLikes.directors.length +
+      profile.explicitLikes.actors.length +
+      profile.explicitLikes.favoriteSeeds.length +
+      profile.explicitDislikes.genres.length;
+    const implicitSignals = profile.implicitEvents.length;
+    const confidence = Math.min(100, Math.round(explicitSignals * 14 + implicitSignals * 4));
+
+    // 生成算法画像定位标签
+    const regionPart = topRegions[0]?.name ? `${topRegions[0].name}` : '';
+    const genrePart = topGenres.slice(0, 2).map((g) => g.name).join('/');
+    const mediaPart = mediaTypeDistribution.slice(0, 2).map((m) => m.name).join('·') || '影视';
+    const personaCore = [regionPart, genrePart, mediaPart].filter(Boolean).join('');
+    const personaLabel = personaCore ? `「${personaCore}偏好派」` : '「冷启动探索中」';
+
+    const strategyParts: string[] = [];
+    if (mediaTypeDistribution.length > 0) {
+      strategyParts.push(`优先匹配 ${mediaTypeDistribution.map((m) => `${m.name}(${m.ratio}%)`).join(' / ')}`);
+    }
+    if (topGenres.length > 0) {
+      strategyParts.push(`主推 ${topGenres.slice(0, 3).map((g) => g.name).join('、')} 题材`);
+    }
+    if (profile.explicitDislikes.genres.length > 0) {
+      strategyParts.push(`自动屏蔽 ${profile.explicitDislikes.genres.join('、')}`);
+    }
+    const recommendationStrategy =
+      strategyParts.length > 0
+        ? `${strategyParts.join('，')}（MMR 多样性重排 λ=0.72）`
+        : '当前采用豆瓣高分口碑冷启动策略';
+
+    return {
+      personaLabel,
+      confidence,
+      diversityEntropy,
+      diversityLabel,
+      mediaTypeDistribution,
+      topGenres,
+      topRegions,
+      topDirectors,
+      topActors,
+      favoriteSeeds: profile.explicitLikes.favoriteSeeds,
+      dislikedGenres: profile.explicitDislikes.genres,
+      dislikedMediaTypes: profile.explicitDislikes.mediaTypes || [],
+      eventCount: implicitSignals,
+      recommendationStrategy,
+    };
+  }
+
+  /**
    * 生成 Top 标签摘要（用于 Prompt 注入与前端可视化）
    */
   public getTopTags(userId: string): {
+    topMediaTypes: Array<{ name: string; score: number }>;
     topGenres: Array<{ name: string; score: number }>;
     topRegions: Array<{ name: string; score: number }>;
     topDirectors: Array<{ name: string; score: number }>;
@@ -419,6 +734,7 @@ export class UserProfileService {
         .map(([name, score]) => ({ name, score: Number(score.toFixed(1)) }));
 
     return {
+      topMediaTypes: sortBucket(vec.mediaTypes, 5),
       topGenres: sortBucket(vec.genres, 5),
       topRegions: sortBucket(vec.regions, 3),
       topDirectors: sortBucket(vec.directors, 3),
@@ -430,22 +746,28 @@ export class UserProfileService {
 
   public buildProfileSummaryForPrompt(userId?: string): string {
     if (!userId) return '';
-    const summary = this.getTopTags(userId);
+    const analysis = this.analyzeUserProfile(userId);
     const parts: string[] = [];
-    if (summary.topGenres.length > 0) {
-      parts.push(`偏好题材：${summary.topGenres.map((g) => g.name).join('、')}`);
+    if (analysis.mediaTypeDistribution.length > 0) {
+      parts.push(`偏好形态：${analysis.mediaTypeDistribution.map((m) => `${m.name}(${m.ratio}%)`).join('、')}`);
     }
-    if (summary.topRegions.length > 0) {
-      parts.push(`常看地区：${summary.topRegions.map((r) => r.name).join('、')}`);
+    if (analysis.topGenres.length > 0) {
+      parts.push(`偏好题材：${analysis.topGenres.map((g) => g.name).join('、')}`);
     }
-    if (summary.topDirectors.length > 0) {
-      parts.push(`喜欢导演：${summary.topDirectors.map((d) => d.name).join('、')}`);
+    if (analysis.topRegions.length > 0) {
+      parts.push(`常看地区：${analysis.topRegions.map((r) => r.name).join('、')}`);
     }
-    if (summary.favoriteSeeds.length > 0) {
-      parts.push(`心头好代表作：${summary.favoriteSeeds.slice(-3).map((t) => `《${t}》`).join('、')}`);
+    if (analysis.topDirectors.length > 0) {
+      parts.push(`喜欢导演：${analysis.topDirectors.map((d) => d.name).join('、')}`);
     }
-    if (summary.dislikedGenres.length > 0) {
-      parts.push(`明确排雷不看：${summary.dislikedGenres.join('、')}`);
+    if (analysis.favoriteSeeds.length > 0) {
+      parts.push(`心头好代表作：${analysis.favoriteSeeds.slice(-3).map((t) => `《${t}》`).join('、')}`);
+    }
+    if (analysis.dislikedGenres.length > 0) {
+      parts.push(`明确排雷不看：${analysis.dislikedGenres.join('、')}`);
+    }
+    if (analysis.dislikedMediaTypes.length > 0) {
+      parts.push(`屏蔽形态：${analysis.dislikedMediaTypes.join('、')}`);
     }
     return parts.join('；');
   }
@@ -458,7 +780,7 @@ export class UserProfileService {
 
   public removeExplicitItem(
     userId: string,
-    category: 'likeGenres' | 'likeRegions' | 'likeDirectors' | 'likeActors' | 'favoriteSeeds' | 'dislikeGenres',
+    category: 'likeMediaTypes' | 'likeGenres' | 'likeRegions' | 'likeDirectors' | 'likeActors' | 'favoriteSeeds' | 'dislikeGenres',
     value: string
   ): UserTasteProfile {
     const plan = this.userManager.getUserPlan(userId);
@@ -466,7 +788,8 @@ export class UserProfileService {
     const target = (value || '').trim().toLowerCase();
     const filterArr = (arr: string[]) => arr.filter((x) => x.trim().toLowerCase() !== target);
 
-    if (category === 'likeGenres') profile.explicitLikes.genres = filterArr(profile.explicitLikes.genres);
+    if (category === 'likeMediaTypes') profile.explicitLikes.mediaTypes = filterArr(profile.explicitLikes.mediaTypes || []);
+    else if (category === 'likeGenres') profile.explicitLikes.genres = filterArr(profile.explicitLikes.genres);
     else if (category === 'likeRegions') profile.explicitLikes.regions = filterArr(profile.explicitLikes.regions);
     else if (category === 'likeDirectors') profile.explicitLikes.directors = filterArr(profile.explicitLikes.directors);
     else if (category === 'likeActors') profile.explicitLikes.actors = filterArr(profile.explicitLikes.actors);
@@ -481,8 +804,13 @@ export class UserProfileService {
   public getDetailedProfileForWeb(userId: string) {
     const profile = this.getProfile(userId);
     const summary = this.getTopTags(userId);
+    const analysis = this.analyzeUserProfile(userId);
     return {
       ...summary,
+      personaLabel: analysis.personaLabel,
+      confidence: analysis.confidence,
+      diversityLabel: analysis.diversityLabel,
+      mediaTypeDistribution: analysis.mediaTypeDistribution,
       explicitLikes: profile.explicitLikes,
       explicitDislikes: profile.explicitDislikes,
       recentEvents: [...profile.implicitEvents].reverse().slice(0, 15),
@@ -490,46 +818,56 @@ export class UserProfileService {
   }
 
   public renderProfileCard(userId: string): string {
-    const s = this.getTopTags(userId);
+    const a = this.analyzeUserProfile(userId);
     if (
-      s.topGenres.length === 0 &&
-      s.topRegions.length === 0 &&
-      s.favoriteSeeds.length === 0 &&
-      s.dislikedGenres.length === 0
+      a.mediaTypeDistribution.length === 0 &&
+      a.topGenres.length === 0 &&
+      a.topRegions.length === 0 &&
+      a.favoriteSeeds.length === 0 &&
+      a.dislikedGenres.length === 0
     ) {
       return [
-        '🎯 【我的观影口味画像】',
+        '🎯 【我的影视口味画像】',
         '----------------------------------------',
-        '目前画像还在空白冷启动中哦~',
-        '💡 你可以直接跟我说：',
-        '• “我喜欢看悬疑、科幻、诺兰的电影”',
-        '• “我很喜欢《星际穿越》，不喜欢恐怖片”',
-        '• 或者平时搜片转存几部电影，我就会自动记住你的口味啦！',
+        '目前画像还在冷启动中哦~',
+        '💡 你可以直接用自然语言跟我说：',
+        '• “我平时喜欢看韩国悬疑电影和搞笑综艺”',
+        '• “我很爱看《漫长的季节》这种悬疑剧，不喜欢恐怖片”',
+        '• 或者平时搜片转存几部作品，算法就会自动分析你的画像！',
       ].join('\n');
     }
 
     const lines = [
-      '🎯 【我的专属观影口味画像】',
+      '🎯 【专属观影口味画像 · AI 算法分析】',
       '----------------------------------------',
+      `🧠 画像定位：${a.personaLabel}（置信度 ${a.confidence}%）`,
+      `📊 口味分布：${a.diversityLabel}`,
     ];
-    if (s.topGenres.length > 0) {
-      lines.push(`🎭 偏好题材：${s.topGenres.map((g) => `${g.name}(${g.score})`).join(' · ')}`);
+    if (a.mediaTypeDistribution.length > 0) {
+      lines.push(`📺 影视形态：${a.mediaTypeDistribution.map((m) => `${m.name} ${m.ratio}%`).join(' · ')}`);
     }
-    if (s.topRegions.length > 0) {
-      lines.push(`🌍 常看地区：${s.topRegions.map((r) => `${r.name}(${r.score})`).join(' · ')}`);
+    if (a.topGenres.length > 0) {
+      lines.push(`🎭 偏好题材：${a.topGenres.map((g) => `${g.name}(${g.score})`).join(' · ')}`);
     }
-    if (s.topDirectors.length > 0) {
-      lines.push(`🎬 钟爱导演：${s.topDirectors.map((d) => d.name).join('、')}`);
+    if (a.topRegions.length > 0) {
+      lines.push(`🌍 常看地区：${a.topRegions.map((r) => `${r.name}(${r.score})`).join(' · ')}`);
     }
-    if (s.favoriteSeeds.length > 0) {
-      lines.push(`❤️ 心头好片：${s.favoriteSeeds.map((t) => `《${t}》`).join('、')}`);
+    if (a.topDirectors.length > 0) {
+      lines.push(`🎬 钟爱导演：${a.topDirectors.map((d) => d.name).join('、')}`);
     }
-    if (s.dislikedGenres.length > 0) {
-      lines.push(`🚫 排雷屏蔽：${s.dislikedGenres.join('、')}`);
+    if (a.topActors.length > 0) {
+      lines.push(`🌟 偏爱演员：${a.topActors.map((x) => x.name).join('、')}`);
     }
-    lines.push(`📈 已分析行为：${s.eventCount} 条（含 30 天时间衰减加权）`);
+    if (a.favoriteSeeds.length > 0) {
+      lines.push(`❤️ 心头好片：${a.favoriteSeeds.map((t) => `《${t}》`).join('、')}`);
+    }
+    if (a.dislikedGenres.length > 0 || a.dislikedMediaTypes.length > 0) {
+      const blocks = [...a.dislikedMediaTypes, ...a.dislikedGenres];
+      lines.push(`🚫 排雷屏蔽：${blocks.join('、')}`);
+    }
+    lines.push(`📈 推片策略：${a.recommendationStrategy}`);
     lines.push('----------------------------------------');
-    lines.push('💡 随时说“我喜欢xxx / 不看xxx”即可调整；发 `/profile reset` 可清空重建。');
+    lines.push('💡 随时说“我喜欢xxx / 不看xxx”即可动态更新；发 `/profile reset` 可清空重建。');
     return lines.join('\n');
   }
 }

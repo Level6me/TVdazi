@@ -47,6 +47,7 @@ export interface UserPlan {
   // 个人观影画像（显式偏好 + 时间衰减隐式行为）
   tasteProfile?: {
     explicitLikes: {
+      mediaTypes?: string[];
       genres: string[];
       regions: string[];
       directors: string[];
@@ -54,12 +55,14 @@ export interface UserPlan {
       favoriteSeeds: string[];
     };
     explicitDislikes: {
+      mediaTypes?: string[];
       genres: string[];
       titles: string[];
     };
     implicitEvents: Array<{
       title: string;
       action: 'save' | 'share' | 'search' | 'skip';
+      mediaType?: string;
       genres: string[];
       region?: string;
       directors?: string[];

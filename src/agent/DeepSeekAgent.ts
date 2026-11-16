@@ -653,6 +653,16 @@ export class DeepSeekAgent {
                   enum: ['update', 'view', 'reset'],
                   description: 'update=更新喜好或排雷, view=查看当前观影画像, reset=清空重建',
                 },
+                like_media_types: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户喜欢的影视形态品类（如 ["电影", "电视剧", "综艺", "动漫", "纪录片", "短剧"]）',
+                },
+                dislike_media_types: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户不看或排斥的影视形态（如 ["短剧", "动漫"]）',
+                },
                 like_genres: {
                   type: 'array',
                   items: { type: 'string' },
@@ -716,7 +726,8 @@ export class DeepSeekAgent {
 4. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
 5. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
 6. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
-7. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
+7. 当用户用自然语言表达自己喜欢/不喜欢什么样的【电影、电视剧、综艺、动漫、纪录片、题材、地区、导演、演员、代表作】（如“我平时喜欢看韩国悬疑电影和搞笑综艺”、“我爱看《漫长的季节》，不爱看恐怖片”），或让 bot 分析/查看自己的口味画像时，必须调用 update_user_taste_profile！
+8. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
         },
         ...chatHistory,
         { role: 'user', content: trimmed },
@@ -838,15 +849,21 @@ export class DeepSeekAgent {
             profileSvc.clearProfile(userId);
             profileReply = '✅ 已清空你的个人观影口味画像，之后会根据你的新喜好重新学习！';
           } else {
+            const nlpParsed = profileSvc.parseNaturalLanguagePreference(trimmed);
+            const mergeArr = (a: unknown, b: string[]) =>
+              Array.from(new Set([...(Array.isArray(a) ? a.map(String) : []), ...b].map((s) => s.trim()).filter(Boolean)));
             profileSvc.recordExplicitPreference(userId, {
-              likeGenres: Array.isArray(args.like_genres) ? args.like_genres : undefined,
-              likeRegions: Array.isArray(args.like_regions) ? args.like_regions : undefined,
-              likeDirectors: Array.isArray(args.like_directors) ? args.like_directors : undefined,
-              likeActors: Array.isArray(args.like_actors) ? args.like_actors : undefined,
-              favoriteSeeds: Array.isArray(args.favorite_movies) ? args.favorite_movies : undefined,
-              dislikeGenres: Array.isArray(args.dislike_genres) ? args.dislike_genres : undefined,
+              likeMediaTypes: mergeArr(args.like_media_types, nlpParsed.likeMediaTypes),
+              dislikeMediaTypes: mergeArr(args.dislike_media_types, nlpParsed.dislikeMediaTypes),
+              likeGenres: mergeArr(args.like_genres, nlpParsed.likeGenres),
+              likeRegions: mergeArr(args.like_regions, nlpParsed.likeRegions),
+              likeDirectors: mergeArr(args.like_directors, nlpParsed.likeDirectors),
+              likeActors: mergeArr(args.like_actors, nlpParsed.likeActors),
+              favoriteSeeds: mergeArr(args.favorite_movies, nlpParsed.favoriteSeeds),
+              dislikeGenres: mergeArr(args.dislike_genres, nlpParsed.dislikeGenres),
+              dislikeTitles: nlpParsed.dislikeTitles,
             });
-            profileReply = `👌 记下你的观影口味啦！以后给你推片会重点参考这些偏好~\n\n${profileSvc.renderProfileCard(userId)}`;
+            profileReply = `👌 已记住你的偏好并完成算法画像分析，后续推片会精准匹配你的口味~\n\n${profileSvc.renderProfileCard(userId)}`;
           }
           appendUserHistory(trimmed, profileReply);
           return profileReply;
@@ -874,6 +891,12 @@ export class DeepSeekAgent {
     const lower = text.toLowerCase().replace(/[？?！!。，,\s]/g, '');
     if (greetings.includes(lower)) {
       return '嗨，我是你的网盘看片小助手 电视搭子 (TVdazi)！\n平时想看什么电影、电视剧直接把名字发我就行（比如“庆余年”、“功夫之王”），我来帮你全网搜活链转存~';
+    }
+
+    if (UserProfileService.isNaturalPreferenceStatement(text)) {
+      const profileSvc = UserProfileService.getInstance();
+      profileSvc.applyNaturalLanguagePreference(userId, text);
+      return `👌 已记住你的偏好并完成算法画像分析，后续推片会精准匹配你的口味~\n\n${profileSvc.renderProfileCard(userId)}`;
     }
 
     // 明显是日常聊天/疑问句且并非具体片名时，API 异常时友好提示而不是硬搜 50 个频道

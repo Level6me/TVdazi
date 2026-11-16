@@ -472,6 +472,7 @@ export class DashboardServer {
       const profileSvc = UserProfileService.getInstance();
       const action = String(body.action || '');
       const category = String(body.category || '') as
+        | 'likeMediaTypes'
         | 'likeGenres'
         | 'likeRegions'
         | 'likeDirectors'
@@ -487,7 +488,7 @@ export class DashboardServer {
         return true;
       }
 
-      const validCats = ['likeGenres', 'likeRegions', 'likeDirectors', 'likeActors', 'favoriteSeeds', 'dislikeGenres'];
+      const validCats = ['likeMediaTypes', 'likeGenres', 'likeRegions', 'likeDirectors', 'likeActors', 'favoriteSeeds', 'dislikeGenres'];
       if (!validCats.includes(category) || !rawValue) {
         res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(JSON.stringify({ ok: false, error: '无效的画像分类或空值' }));

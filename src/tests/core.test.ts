@@ -631,3 +631,59 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     server.close();
   }
 });
+
+test('UserProfileService & DeepSeekAgent parse natural language preferences for movie/tv/variety and compute algorithmic profile', async () => {
+  const testUser = '__nl_profile_analysis_test__';
+  const svc = UserProfileService.getInstance();
+  svc.clearProfile(testUser);
+
+  try {
+    const input = '我平时喜欢看韩国悬疑电影和搞笑综艺，最近也爱追《漫长的季节》这种剧，但是不喜欢恐怖片';
+    assert.equal(UserProfileService.isNaturalPreferenceStatement(input), true);
+    assert.equal(UserProfileService.isNaturalPreferenceStatement('帮我搜一下流浪地球'), false);
+
+    const { parsed, analysis } = svc.applyNaturalLanguagePreference(testUser, input);
+    assert.ok(parsed.likeMediaTypes.includes('电影'));
+    assert.ok(parsed.likeMediaTypes.includes('综艺'));
+    assert.ok(parsed.likeGenres.includes('悬疑'));
+    assert.ok(parsed.likeGenres.includes('喜剧'));
+    assert.ok(parsed.likeRegions.includes('韩国'));
+    assert.ok(parsed.favoriteSeeds.includes('漫长的季节'));
+    assert.ok(parsed.dislikeGenres.includes('恐怖'));
+
+    assert.ok(analysis.confidence > 0);
+    assert.ok(analysis.mediaTypeDistribution.length >= 2);
+    assert.ok(analysis.personaLabel.length > 2);
+    assert.ok(analysis.recommendationStrategy.includes('MMR'));
+
+    const card = svc.renderProfileCard(testUser);
+    assert.ok(card.includes('专属观影口味画像 · AI 算法分析'));
+    assert.ok(card.includes('影视形态'));
+    assert.ok(card.includes('综艺'));
+    assert.ok(card.includes('恐怖'));
+
+    // 验证无 Key 离线兜底时 DeepSeekAgent 也能直接识别自然语言偏好并输出算法画像
+    const prevKey = process.env.DEEPSEEK_API_KEY;
+    delete process.env.DEEPSEEK_API_KEY;
+    try {
+      const agent = new DeepSeekAgent();
+      const reply = await agent.chat('我比较爱看美国科幻电影和脱口秀，不看古装剧', '__nl_agent_offline_test__');
+      assert.ok(reply.includes('专属观影口味画像 · AI 算法分析'));
+      assert.ok(reply.includes('科幻'));
+      assert.ok(reply.includes('古装'));
+    } finally {
+      if (prevKey !== undefined) process.env.DEEPSEEK_API_KEY = prevKey;
+    }
+  } finally {
+    svc.clearProfile(testUser);
+    svc.clearProfile('__nl_agent_offline_test__');
+    for (const u of [testUser, '__nl_agent_offline_test__']) {
+      const f = path.resolve(process.cwd(), 'data/users', `${Buffer.from(u).toString('hex')}.json`);
+      setTimeout(() => {
+        try {
+          if (fs.existsSync(f)) fs.unlinkSync(f);
+        } catch {}
+      }, 60);
+    }
+  }
+});
