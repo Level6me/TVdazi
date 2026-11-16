@@ -12,6 +12,7 @@ import { MetadataResolver, ResolvedMediaInfo } from '../services/MetadataResolve
 import { getPanRegistry } from '../services/pan';
 import { WebhookService } from '../services/WebhookService';
 import { RelayService } from '../services/RelayService';
+import { UserProfileService } from '../services/UserProfileService';
 import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
@@ -77,7 +78,7 @@ export class CommandHandler {
 
     if (
       trimmed.startsWith('/') ||
-      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表)(?:\s+.*)?$/i.test(
+      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表|我的画像|观影画像|我的口味)(?:\s+.*)?$/i.test(
         trimmed
       ) ||
       /^(?:我叫|叫我|我的名字叫|我的名字是)\s*[^\s，。！!？?]{1,20}$/.test(trimmed) ||
@@ -595,6 +596,17 @@ export class CommandHandler {
   ): Promise<string> {
     let targetPage = (hotSession.page || 1);
     if (nav.action === 'next' || nav.action === 'refresh') {
+      if (nav.action === 'refresh' && Array.isArray(hotSession.items) && hotSession.items[0]) {
+        const skipped = hotSession.items[0];
+        UserProfileService.getInstance()
+          .recordImplicitBehavior(userId, skipped.title, 'skip', {
+            genres: skipped.types || [],
+            region: skipped.region,
+            year: skipped.year,
+            skipLookup: true,
+          })
+          .catch(() => {});
+      }
       targetPage += 1;
     } else if (nav.action === 'prev') {
       targetPage = Math.max(1, targetPage - 1);
@@ -666,6 +678,9 @@ export class CommandHandler {
         });
         if (res.success) {
           this.userManager.recordSave(userId, item.title, item.shareUrl, category);
+          UserProfileService.getInstance()
+            .recordImplicitBehavior(userId, standardTitle || item.title, 'save')
+            .catch(() => {});
           WebhookService.notifyMediaSaved(userPlan.webhookUrl, {
             userId,
             title: item.title,
@@ -820,6 +835,13 @@ export class CommandHandler {
         });
         if (saveRes.success) {
           this.userManager.recordSave(userId, title, cand.shareUrl, category);
+          UserProfileService.getInstance()
+            .recordImplicitBehavior(userId, title, 'save', {
+              genres: subject.types || [],
+              region: subject.region,
+              year: subject.year,
+            })
+            .catch(() => {});
           const failoverTip = idx > 0 ? `（前 ${idx} 条链接已失效，已自动为你顺延命中有效活链 ⚡）` : '';
           return [
             `🎉 一键全网搜存成功！${failoverTip}`,
@@ -1171,6 +1193,11 @@ export class CommandHandler {
 
     // 每页精简显示 8 条，避免微信端单条消息过长
     const sessionKeyword = standardTitle || searchWord;
+    UserProfileService.getInstance()
+      .recordImplicitBehavior(userId, sessionKeyword, 'search', {
+        year: searchMeta?.year || resolvedInfo?.year || doubanYear,
+      })
+      .catch(() => {});
     this.sessionManager.setSearch(userId, sessionKeyword, res.items, 8);
     const pageData = this.sessionManager.getSearchPage(userId, 1)!;
     return this.formatSearchResultPage({
@@ -1260,6 +1287,7 @@ export class CommandHandler {
       '',
       '⚙️ 【常用指令】',
       '• /web           打开 H5 可视化控制面板',
+      '• /profile       查看或重置个人观影口味画像',
       '• /tasks         查看/管理定时任务与追更',
       '• /status        查看网盘空间与状态',
       '• /config        查看当前个人配置',

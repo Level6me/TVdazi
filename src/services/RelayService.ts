@@ -4,6 +4,7 @@ import { UserManager } from './UserManager';
 import { PushGateway } from './PushGateway';
 import { SessionManager } from './SessionManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
+import { UserProfileService } from './UserProfileService';
 import { SerializedJsonStore } from '../utils/StorageQueue';
 
 export interface ActiveWechatContact {
@@ -133,6 +134,7 @@ export class RelayService {
       }
       if (changed) {
         this.persist();
+
       }
     } catch {
       // ignore
@@ -173,6 +175,7 @@ export class RelayService {
     }
 
     this.persist();
+
   }
 
   public maskUserId(userId: string): string {
@@ -233,6 +236,7 @@ export class RelayService {
     }
     this.state.personalAliases[viewerUserId][resolved.user.userId] = clean;
     this.persist();
+
     return {
       success: true,
       message: `👌 记好啦！以后在你这边，「${resolved.user.displayName}」就对应备注为「${clean}」，直接说找「${clean}」就行！`,
@@ -245,6 +249,7 @@ export class RelayService {
     else set.delete(userId);
     this.state.dndUsers = Array.from(set);
     this.persist();
+
     return enabled
       ? '🔕 已为你开启传话免打扰，其他人暂时无法通过我给你传话啦（发送 `/dnd off` 可恢复）。'
       : '🔔 已关闭传话免打扰，现在可以正常接收大家托我带的话啦~';
@@ -426,6 +431,7 @@ export class RelayService {
     if (Date.now() - entry.timestamp > RelayService.REPLY_TTL_MS) {
       delete this.state.pendingReplies[userId];
       this.persist();
+
       return null;
     }
     return entry;
@@ -494,6 +500,7 @@ export class RelayService {
       this.state.history = this.state.history.slice(-100);
     }
     this.persist();
+
 
     const senderPlan = this.userManager.getUserPlan(fromUserId);
     const aliasTip = !senderPlan.alias
@@ -570,6 +577,7 @@ export class RelayService {
       this.state.history = this.state.history.slice(-100);
     }
     this.persist();
+
 
     return {
       success: true,
@@ -733,6 +741,15 @@ export class RelayService {
       this.state.history = this.state.history.slice(-100);
     }
     this.persist();
+
+    // 异步记录用户的分享偏好行为，用于增强个人观影画像
+    UserProfileService.getInstance()
+      .recordImplicitBehavior(fromUserId, title, 'share', {
+        genres: types,
+        year,
+        skipLookup: true,
+      })
+      .catch(() => {});
 
     const senderPlan = this.userManager.getUserPlan(fromUserId);
     const aliasTip = !senderPlan.alias

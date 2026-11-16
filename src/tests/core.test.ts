@@ -20,6 +20,7 @@ import { PushGateway } from '../services/PushGateway';
 import { RelayService } from '../services/RelayService';
 import { SessionManager } from '../services/SessionManager';
 import { DeepSeekAgent } from '../agent/DeepSeekAgent';
+import { UserProfileService } from '../services/UserProfileService';
 
 test('Logger.maskSensitive hides API keys, cookies and slash commands', () => {
   assert.equal(maskSensitive('/set-quark __pus=abc123; __kp=xyz'), '/set-quark [REDACTED]');
@@ -377,5 +378,102 @@ test('RelayService supports user directory, nicknames, A->B relay and B->A reply
         } catch {}
       }, 60);
     }
+  }
+});
+
+test('UserProfileService builds explicit & time-decayed implicit taste profile and reranks with MMR', async () => {
+  const testUser = '__taste_profile_test_user__';
+  const svc = UserProfileService.getInstance();
+  svc.clearProfile(testUser);
+
+  try {
+    // 1. 显式偏好 + 排雷
+    svc.recordExplicitPreference(testUser, {
+      likeGenres: ['科幻', '悬疑'],
+      likeDirectors: ['克里斯托弗·诺兰'],
+      dislikeGenres: ['恐怖'],
+      enrichSeedsAsync: false,
+    });
+
+    // 2. 隐式转存行为
+    await svc.recordImplicitBehavior(testUser, '星际穿越', 'save', {
+      genres: ['科幻', '冒险'],
+      region: '美国',
+      directors: ['克里斯托弗·诺兰'],
+      year: '2014',
+      skipLookup: true,
+    });
+
+    const vecNow = svc.computeTagVector(testUser, Date.now());
+    assert.ok(vecNow.genres['科幻'] >= 7.9); // 5.0(explicit) + 3.0(save)
+    assert.ok(vecNow.directors['克里斯托弗·诺兰'] > 7);
+
+    // 验证 30 天时间衰减（只剩一半左右隐式权重）
+    const thirtyDaysLater = Date.now() + 30 * 24 * 60 * 60 * 1000;
+    const vecDecayed = svc.computeTagVector(testUser, thirtyDaysLater);
+    assert.ok(vecDecayed.genres['科幻'] < vecNow.genres['科幻']);
+    assert.ok(vecDecayed.genres['科幻'] >= 6.4); // 5.0 + 3.0 * 0.5
+
+    // 3. 候选过滤（恐怖片直接排雷）与 MMR 重排
+    const candidates = [
+      {
+        subject: {
+          id: '1',
+          title: '招魂',
+          rate: '8.5',
+          types: ['恐怖', '悬疑'],
+          cover: '',
+          url: '',
+        },
+        score: 90,
+      },
+      {
+        subject: {
+          id: '2',
+          title: '盗梦空间',
+          rate: '9.4',
+          types: ['科幻', '悬疑'],
+          directors: '克里斯托弗·诺兰',
+          region: '美国',
+          cover: '',
+          url: '',
+        },
+        score: 85,
+      },
+      {
+        subject: {
+          id: '3',
+          title: '看不见的客人',
+          rate: '8.8',
+          types: ['悬疑', '犯罪'],
+          region: '西班牙',
+          cover: '',
+          url: '',
+        },
+        score: 82,
+      },
+    ];
+
+    const ranked = svc.rerankWithMMR(testUser, candidates, 3);
+    assert.equal(ranked.length, 2); // 恐怖片《招魂》被排雷过滤
+    assert.equal(ranked[0].title, '盗梦空间');
+
+    const card = svc.renderProfileCard(testUser);
+    assert.ok(card.includes('科幻'));
+    assert.ok(card.includes('恐怖'));
+
+    // 4. 验证 /profile 指令
+    const handler = new CommandHandler();
+    assert.equal(handler.isCommand('/profile', testUser), true);
+    const reply = await handler.handle('/profile', testUser);
+    assert.ok(reply.includes('专属观影口味画像'));
+  } finally {
+    svc.clearProfile(testUser);
+    const f = path.resolve(process.cwd(), 'data/users', `${Buffer.from(testUser).toString('hex')}.json`);
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(f)) fs.unlinkSync(f);
+      } catch {}
+    }, 60);
   }
 });

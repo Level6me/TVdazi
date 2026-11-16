@@ -9,6 +9,7 @@ import { getPanRegistry } from '../services/pan';
 import { WebhookService } from '../services/WebhookService';
 import { DashboardServer } from '../web/DashboardServer';
 import { RelayService } from '../services/RelayService';
+import { UserProfileService } from '../services/UserProfileService';
 import { ResourceCategory } from '../types';
 
 export interface ExtendedCmdContext {
@@ -289,6 +290,15 @@ export async function handleExtendedCommand(
       return `当前传话免打扰状态：${relay.isDndEnabled(userId) ? '已开启 🔕' : '未开启 🔔'}（发送 \`/dnd on\` 或 \`/dnd off\` 切换）`;
     }
     return relay.setDnd(userId, ['on', '1', 'true', '开启', '开'].includes(flag));
+  }
+
+  if (['/profile', '/taste', '/画像', '我的画像', '观影画像', '我的口味'].includes(cmd)) {
+    const profileSvc = UserProfileService.getInstance();
+    if (['reset', 'clear', '清空', '重置'].includes((args[0] || '').toLowerCase())) {
+      profileSvc.clearProfile(userId);
+      return '✅ 已清空你的个人观影口味画像，之后会根据你的新喜好和转存重新学习啦！';
+    }
+    return profileSvc.renderProfileCard(userId);
   }
 
   return null;

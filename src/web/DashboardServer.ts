@@ -11,6 +11,7 @@ import { ChannelHealthService } from '../services/ChannelHealthService';
 import { ChannelManager } from '../services/ChannelManager';
 import { WatchlistService } from '../services/WatchlistService';
 import { RelayService } from '../services/RelayService';
+import { UserProfileService } from '../services/UserProfileService';
 import { maskSensitive } from '../utils/Logger';
 import { upsertEnvVar } from '../utils/FileUtils';
 
@@ -279,6 +280,7 @@ export class DashboardServer {
             isSelf: d.isSelf,
             hasCustomAlias: d.hasCustomAlias,
           })),
+          tasteProfile: UserProfileService.getInstance().getTopTags(userId),
           stats: plan.stats,
           watchlist: plan.watchlist,
           tasks,
@@ -395,6 +397,13 @@ export class DashboardServer {
       return true;
     }
 
+    if (req.method === 'POST' && pathname === '/api/panel/profile/reset') {
+      UserProfileService.getInstance().clearProfile(userId);
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true }));
+      return true;
+    }
+
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ error: 'Unknown panel endpoint' }));
     return true;
@@ -475,6 +484,11 @@ export class DashboardServer {
     <div id="tasksBox"></div>
   </div>
   <div class="card">
+    <h2>我的观影口味画像</h2>
+    <div id="profileBox" style="font-size:13px;line-height:1.7;"></div>
+    <button class="del" onclick="resetProfile()">清空重建画像</button>
+  </div>
+  <div class="card">
     <h2>微信通讯录成员（传话可用联系人）</h2>
     <div id="contactsBox"></div>
   </div>
@@ -503,6 +517,14 @@ async function load(){
   document.getElementById("saveRootDir").value = d.settings.saveRootDir || "";
   document.getElementById("preferredQuality").value = d.settings.preferredQuality || "any";
   document.getElementById("webhookUrl").value = d.settings.webhookUrl || "";
+  const tp = d.tasteProfile || {};
+  const tpParts = [];
+  if ((tp.topGenres||[]).length) tpParts.push("偏好题材：" + tp.topGenres.map(g => esc(g.name)+"("+g.score+")").join(" · "));
+  if ((tp.topRegions||[]).length) tpParts.push("常看地区：" + tp.topRegions.map(r => esc(r.name)+"("+r.score+")").join(" · "));
+  if ((tp.topDirectors||[]).length) tpParts.push("喜欢导演：" + tp.topDirectors.map(x => esc(x.name)).join("、"));
+  if ((tp.favoriteSeeds||[]).length) tpParts.push("心头好片：" + tp.favoriteSeeds.map(t => "《"+esc(t)+"》").join("、"));
+  if ((tp.dislikedGenres||[]).length) tpParts.push("排雷屏蔽：" + tp.dislikedGenres.map(g => esc(g)).join("、"));
+  document.getElementById("profileBox").innerHTML = tpParts.length ? tpParts.join("<br>") + "<br><span style='color:#94a3b8;'>累计行为事件：" + (tp.eventCount||0) + " 条</span>" : "<span style='color:#64748b;'>暂未沉淀偏好，可以在微信说“我喜欢科幻/悬疑”或转存几部电影自动生成。</span>";
   document.getElementById("contactsBox").innerHTML = (d.contacts || []).map(c => '<div class="row"><span>'+c.index+'. '+esc(c.displayName)+(c.isSelf?' <span class="badge ok">我</span>':'')+'</span><span class="badge">'+esc(c.maskedId)+'</span></div>').join("") || "<div style='color:#64748b;font-size:13px;'>暂无联系人</div>";
   const wb = document.getElementById("watchlistBox");
   wb.innerHTML = d.watchlist.map(w => '<div class="row"><span>《'+esc(w.title)+'》 <span class="badge">'+esc(w.status)+'</span></span><div><button class="sec js-watch-done" data-title="'+esc(w.title)+'">标为已看</button> <button class="del js-watch-del" data-title="'+esc(w.title)+'">删</button></div></div>').join("") || "<div style='color:#64748b;font-size:13px;'>暂无片单</div>";
@@ -548,6 +570,7 @@ async function setStatus(title, status){ await api("/api/panel/watchlist", { act
 async function delWatch(title){ await api("/api/panel/watchlist", { action:"remove", title }); load(); }
 async function toggleTask(taskId){ await api("/api/panel/tasks", { action:"toggle", taskId }); load(); }
 async function delTask(taskId){ await api("/api/panel/tasks", { action:"delete", taskId }); load(); }
+async function resetProfile(){ await api("/api/panel/profile/reset", {}); load(); }
 load();
 </script>
 </body>

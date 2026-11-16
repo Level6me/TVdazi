@@ -44,6 +44,32 @@ export interface UserPlan {
     autoSaveOnSelect?: boolean; // 命中序号时是否直接自动转存
   };
 
+  // 个人观影画像（显式偏好 + 时间衰减隐式行为）
+  tasteProfile?: {
+    explicitLikes: {
+      genres: string[];
+      regions: string[];
+      directors: string[];
+      actors: string[];
+      favoriteSeeds: string[];
+    };
+    explicitDislikes: {
+      genres: string[];
+      titles: string[];
+    };
+    implicitEvents: Array<{
+      title: string;
+      action: 'save' | 'share' | 'search' | 'skip';
+      genres: string[];
+      region?: string;
+      directors?: string[];
+      actors?: string[];
+      decade?: string;
+      timestamp: number;
+    }>;
+    updatedAt: number;
+  };
+
   // 历史转存与搜索统计
   stats: {
     totalSearches: number;

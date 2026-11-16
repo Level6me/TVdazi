@@ -10,6 +10,7 @@ import { SchedulerService } from '../services/SchedulerService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
 import { MetadataResolver } from '../services/MetadataResolver';
 import { RelayService } from '../services/RelayService';
+import { UserProfileService } from '../services/UserProfileService';
 
 export interface RecognizedImageResult {
   standardTitle: string;
@@ -639,6 +640,54 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'update_user_taste_profile',
+            description: '记录用户明确表达的观影喜好或排雷厌恶，或者查看/清空用户的个人观影画像。当用户说“我喜欢看科幻/悬疑/韩剧”、“我最爱诺兰和《星际穿越》”、“别给我推恐怖片”、“看看我的观影画像”时调用。',
+            parameters: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: ['update', 'view', 'reset'],
+                  description: 'update=更新喜好或排雷, view=查看当前观影画像, reset=清空重建',
+                },
+                like_genres: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户喜欢的电影/剧集类型（如 ["科幻", "悬疑"]）',
+                },
+                like_regions: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户喜欢的国家或地区（如 ["韩国", "美国"]）',
+                },
+                like_directors: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户喜欢的导演（如 ["克里斯托弗·诺兰"]）',
+                },
+                like_actors: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户喜欢的演员',
+                },
+                favorite_movies: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户主动提及特别喜欢的代表作品名称（不带书名号）',
+                },
+                dislike_genres: {
+                  type: 'array',
+                  items: { type: 'string' },
+                  description: '用户明确不看/排雷的类型（如 ["恐怖", "古装"]）',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
       ];
 
       const relay = RelayService.getInstance();
@@ -780,6 +829,27 @@ export class DeepSeekAgent {
           });
           appendUserHistory(trimmed, shareRes.replyToSender);
           return shareRes.replyToSender;
+        } else if (toolCall.function.name === 'update_user_taste_profile') {
+          const profileSvc = UserProfileService.getInstance();
+          let profileReply = '';
+          if (args.action === 'view') {
+            profileReply = profileSvc.renderProfileCard(userId);
+          } else if (args.action === 'reset') {
+            profileSvc.clearProfile(userId);
+            profileReply = '✅ 已清空你的个人观影口味画像，之后会根据你的新喜好重新学习！';
+          } else {
+            profileSvc.recordExplicitPreference(userId, {
+              likeGenres: Array.isArray(args.like_genres) ? args.like_genres : undefined,
+              likeRegions: Array.isArray(args.like_regions) ? args.like_regions : undefined,
+              likeDirectors: Array.isArray(args.like_directors) ? args.like_directors : undefined,
+              likeActors: Array.isArray(args.like_actors) ? args.like_actors : undefined,
+              favoriteSeeds: Array.isArray(args.favorite_movies) ? args.favorite_movies : undefined,
+              dislikeGenres: Array.isArray(args.dislike_genres) ? args.dislike_genres : undefined,
+            });
+            profileReply = `👌 记下你的观影口味啦！以后给你推片会重点参考这些偏好~\n\n${profileSvc.renderProfileCard(userId)}`;
+          }
+          appendUserHistory(trimmed, profileReply);
+          return profileReply;
         }
       }
 

@@ -1,5 +1,6 @@
 import { UserManager } from './UserManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
+import { UserProfileService } from './UserProfileService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
 
 export type TimeScope = 'current_season' | 'this_year' | 'last_year' | 'custom_year' | 'classic' | 'mixed';
@@ -640,7 +641,11 @@ export class AiRecommender {
     }
 
     verified.sort((a, b) => b.score - a.score);
-    return verified.map((v) => v.subject);
+    return UserProfileService.getInstance().rerankWithMMR(
+      userId,
+      verified,
+      Math.max(slots.count * 2 + 4, 12)
+    );
   }
 
   private recordRecommended(userId: string | undefined, titles: string[]): void {
@@ -735,12 +740,15 @@ export class AiRecommender {
       slots.timeScope !== 'current_season' &&
       slots.timeScope !== 'this_year';
 
+    const profileSummary = UserProfileService.getInstance().buildProfileSummaryForPrompt(userId);
+
     try {
       const prompt = `你是一个真正能听懂人话、懂影视、像微信好友一样自然聊天的影视达人。
 请仔细理解用户的这句话，并结合下方【豆瓣实时核验片单】给出最贴合他心意的回复！
 
 【当前真实时间】：${currentYear}年${currentMonth}月（注意：今年是 ${currentYear} 年！）
 ${recentHistoryText ? `【近期对话上下文】：\n${recentHistoryText}\n` : ''}
+${profileSummary ? `【该用户的长期观影画像（用于个性化贴合，勿直接生硬背诵数据）】：${profileSummary}\n` : ''}
 【用户当前说的原话】："${slots.rawQuery}"
 ${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` : ''}
 【你必须遵守的核心原则】：
