@@ -456,6 +456,39 @@ export class UserProfileService {
     this.userManager.saveUserPlan(plan);
   }
 
+  public removeExplicitItem(
+    userId: string,
+    category: 'likeGenres' | 'likeRegions' | 'likeDirectors' | 'likeActors' | 'favoriteSeeds' | 'dislikeGenres',
+    value: string
+  ): UserTasteProfile {
+    const plan = this.userManager.getUserPlan(userId);
+    const profile = this.ensureProfile(plan);
+    const target = (value || '').trim().toLowerCase();
+    const filterArr = (arr: string[]) => arr.filter((x) => x.trim().toLowerCase() !== target);
+
+    if (category === 'likeGenres') profile.explicitLikes.genres = filterArr(profile.explicitLikes.genres);
+    else if (category === 'likeRegions') profile.explicitLikes.regions = filterArr(profile.explicitLikes.regions);
+    else if (category === 'likeDirectors') profile.explicitLikes.directors = filterArr(profile.explicitLikes.directors);
+    else if (category === 'likeActors') profile.explicitLikes.actors = filterArr(profile.explicitLikes.actors);
+    else if (category === 'favoriteSeeds') profile.explicitLikes.favoriteSeeds = filterArr(profile.explicitLikes.favoriteSeeds);
+    else if (category === 'dislikeGenres') profile.explicitDislikes.genres = filterArr(profile.explicitDislikes.genres);
+
+    profile.updatedAt = Date.now();
+    this.userManager.saveUserPlan(plan);
+    return profile;
+  }
+
+  public getDetailedProfileForWeb(userId: string) {
+    const profile = this.getProfile(userId);
+    const summary = this.getTopTags(userId);
+    return {
+      ...summary,
+      explicitLikes: profile.explicitLikes,
+      explicitDislikes: profile.explicitDislikes,
+      recentEvents: [...profile.implicitEvents].reverse().slice(0, 15),
+    };
+  }
+
   public renderProfileCard(userId: string): string {
     const s = this.getTopTags(userId);
     if (

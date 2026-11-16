@@ -14,6 +14,7 @@ import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
 import { maskSensitive } from '../utils/Logger';
 import { upsertEnvVar } from '../utils/FileUtils';
+import { AUI_BUNDLE_CSS, AUI_BUNDLE_JS } from './auiBundle';
 
 /**
  * 轻量 H5 自助控制台 & REST API（可嵌入 src/index.ts HTTP 网关，也可在微信端按需拉起独立端口）
@@ -280,7 +281,7 @@ export class DashboardServer {
             isSelf: d.isSelf,
             hasCustomAlias: d.hasCustomAlias,
           })),
-          tasteProfile: UserProfileService.getInstance().getTopTags(userId),
+          tasteProfile: UserProfileService.getInstance().getDetailedProfileForWeb(userId),
           stats: plan.stats,
           watchlist: plan.watchlist,
           tasks,
@@ -404,6 +405,50 @@ export class DashboardServer {
       return true;
     }
 
+    if (req.method === 'POST' && pathname === '/api/panel/profile') {
+      const profileSvc = UserProfileService.getInstance();
+      const action = String(body.action || '');
+      const category = String(body.category || '') as
+        | 'likeGenres'
+        | 'likeRegions'
+        | 'likeDirectors'
+        | 'likeActors'
+        | 'favoriteSeeds'
+        | 'dislikeGenres';
+      const rawValue = String(body.value || '').trim();
+
+      if (action === 'reset') {
+        profileSvc.clearProfile(userId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: true, tasteProfile: profileSvc.getDetailedProfileForWeb(userId) }));
+        return true;
+      }
+
+      const validCats = ['likeGenres', 'likeRegions', 'likeDirectors', 'likeActors', 'favoriteSeeds', 'dislikeGenres'];
+      if (!validCats.includes(category) || !rawValue) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: '无效的画像分类或空值' }));
+        return true;
+      }
+
+      if (action === 'add') {
+        const values = rawValue
+          .split(/[,，、;；]+/)
+          .map((s) => s.replace(/[《》]/g, '').trim())
+          .filter(Boolean);
+        profileSvc.recordExplicitPreference(userId, {
+          [category]: values,
+          enrichSeedsAsync: category === 'favoriteSeeds',
+        });
+      } else if (action === 'remove') {
+        profileSvc.removeExplicitItem(userId, category, rawValue);
+      }
+
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+      res.end(JSON.stringify({ ok: true, tasteProfile: profileSvc.getDetailedProfileForWeb(userId) }));
+      return true;
+    }
+
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
     res.end(JSON.stringify({ error: 'Unknown panel endpoint' }));
     return true;
@@ -429,77 +474,300 @@ export class DashboardServer {
 
   private static renderHtmlPage(token: string): string {
     const safeToken = token.replace(/[^A-Za-z0-9._-]/g, '');
-    return `<!doctype html>
-<html lang="zh-CN">
+    return `<!DOCTYPE html>
+<html lang="zh-CN" data-theme="auto">
 <head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>电视搭子 (TVdazi) 个人控制面板</title>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, minimum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<title>电视搭子 (TVdazi) 影视网盘控制台</title>
+<meta name="theme-color" content="#007aff" media="(prefers-color-scheme: light)" />
+<meta name="theme-color" content="#1c1c1e" media="(prefers-color-scheme: dark)" />
 <style>
-  body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f172a;color:#e2e8f0;margin:0;padding:16px;}
-  .wrap{max-width:760px;margin:0 auto;display:grid;gap:16px;}
-  .card{background:#1e293b;border:1px solid #334155;border-radius:12px;padding:16px;}
-  h1{margin:0 0 4px;font-size:20px;color:#38bdf8;}
-  h2{margin:0 0 12px;font-size:16px;color:#f8fafc;}
-  label{display:block;font-size:12px;color:#94a3b8;margin:8px 0 4px;}
-  input,textarea,select{width:100%;box-sizing:border-box;background:#0f172a;border:1px solid #475569;color:#f8fafc;border-radius:8px;padding:8px 10px;font-size:14px;}
-  button{background:#0284c7;color:#fff;border:none;border-radius:8px;padding:8px 14px;font-size:13px;cursor:pointer;margin-top:10px;}
-  button.sec{background:#475569;}
-  button.del{background:#dc2626;}
-  .row{display:flex;justify-content:space-between;align-items:center;padding:8px 0;border-bottom:1px solid #334155;gap:8px;}
-  .badge{font-size:11px;padding:2px 8px;border-radius:99px;background:#334155;color:#cbd5e1;}
-  .ok{background:#065f46;color:#6ee7b7;}
-  .warn{background:#7f1d1d;color:#fca5a5;}
+${AUI_BUNDLE_CSS}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--success);display:inline-block;box-shadow:0 0 8px var(--success);}
+.chip-wrap{display:flex;flex-wrap:wrap;gap:8px;}
+.chip-del{margin-left:4px;opacity:.7;cursor:pointer;font-weight:800;}
+.chip-del:hover{opacity:1;color:var(--danger);}
+.inline-add{display:flex;gap:8px;align-items:center;margin-top:10px;}
+.inline-add .form-control{flex:1;min-width:0;}
+.list-row{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:10px 0;border-bottom:1px solid var(--border-subtle);}
+.list-row:last-child{border-bottom:none;}
+.list-main{min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:13px;}
+.list-actions{display:flex;align-items:center;gap:6px;flex-shrink:0;}
+.mono-sub{font-family:var(--font-mono);font-size:11px;color:var(--text-sec);margin-top:4px;word-break:break-all;}
 </style>
 </head>
 <body>
-<div class="wrap">
-  <div class="card">
-    <h1>电视搭子 (TVdazi) 影视网盘控制台</h1>
-    <div id="userMeta" style="font-size:12px;color:#94a3b8;">加载中...</div>
-  </div>
-  <div class="card">
-    <h2>网盘凭证、域名与偏好设置</h2>
-    <label>我的对外昵称（用于好友通过机器人传话称呼你）</label><input id="aliasName" placeholder="例如：小明" />
-    <label>Web 面板访问域名（如 https://pan.example.com，留空则自动使用服务器公网 IP）</label>
-    <input id="publicBaseUrl" placeholder="留空自动探测，或输入 https://your-domain.com" />
-    <div id="effectiveDomainTip" style="font-size:11px;color:#94a3b8;margin-top:4px;"></div>
-    <label>默认保存目录</label><input id="saveRootDir" placeholder="/我的资源" />
-    <label>画质偏好（支持 4K / 1080P / 原盘 / 4K杜比 / 体积小1080P）</label><input id="preferredQuality" />
-    <label>Alist / Emby 扫库 Webhook</label><input id="webhookUrl" placeholder="https://..." />
-    <label>夸克 Cookie（留空则保持不变）</label><input id="quarkCookie" type="password" placeholder="粘贴新 Cookie 更新" />
-    <label>阿里云盘 Refresh Token（留空不变）</label><input id="aliyunToken" type="password" placeholder="粘贴 Refresh Token" />
-    <label>115 网盘 Cookie（留空不变）</label><input id="pan115Cookie" type="password" placeholder="需包含 UID/CID/SEID" />
-    <button onclick="saveSettings()">保存配置</button>
-    <span id="saveMsg" style="margin-left:10px;font-size:12px;color:#6ee7b7;"></span>
-  </div>
-  <div class="card">
-    <h2>追剧片单管理 & 批量导入</h2>
-    <textarea id="batchImport" rows="3" placeholder="支持粘贴豆瓣豆列链接、含《片名》的推荐文案或多行片名"></textarea>
-    <button onclick="importList()">批量导入片单</button>
-    <div id="watchlistBox" style="margin-top:10px;"></div>
-  </div>
-  <div class="card">
-    <h2>定时与蹲守任务</h2>
-    <div id="tasksBox"></div>
-  </div>
-  <div class="card">
-    <h2>我的观影口味画像</h2>
-    <div id="profileBox" style="font-size:13px;line-height:1.7;"></div>
-    <button class="del" onclick="resetProfile()">清空重建画像</button>
-  </div>
-  <div class="card">
-    <h2>微信通讯录成员（传话可用联系人）</h2>
-    <div id="contactsBox"></div>
-  </div>
-  <div class="card">
-    <h2>资源频道健康度 Top 20</h2>
-    <div id="channelsBox"></div>
-  </div>
+<div class="toast-container" id="toast-container"></div>
+
+<div class="container">
+  <header class="header">
+    <div class="header-left">
+      <div class="date-badge"><span class="status-dot"></span><span id="headerBadge">TVDAZI · SYNCING</span></div>
+      <h1 class="title" id="page-title">观影总览</h1>
+    </div>
+    <div class="header-actions">
+      <button class="pill-btn" onclick="load(true)"><span>↻</span><span class="pill-text">刷新</span></button>
+      <button class="pill-btn" onclick="cycleTheme()"><span id="theme-icon">🌓</span><span id="theme-label" class="pill-text">自动</span></button>
+    </div>
+  </header>
+
+  <!-- Tab 1: 总览 -->
+  <main id="p-overview" class="page active">
+    <div class="grid-4">
+      <div class="card interactive" onclick="navTab('p-profile','观影画像',1)">
+        <div class="val-big" id="kpiSearches" style="color:var(--accent)">0</div>
+        <div class="val-sub">累计搜片</div>
+      </div>
+      <div class="card interactive" onclick="navTab('p-media','片单与任务',2)">
+        <div class="val-big" id="kpiSaves" style="color:var(--success)">0</div>
+        <div class="val-sub">累计转存</div>
+      </div>
+      <div class="card interactive" onclick="navTab('p-media','片单与任务',2)">
+        <div class="val-big" id="kpiWatchlist" style="color:var(--purple)">0</div>
+        <div class="val-sub">追剧片单</div>
+      </div>
+      <div class="card interactive" onclick="navTab('p-media','片单与任务',2)">
+        <div class="val-big" id="kpiTasks" style="color:var(--warning)">0</div>
+        <div class="val-sub">活跃任务</div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">观影画像权重</div>
+          <button class="pill-btn" onclick="navTab('p-profile','观影画像',1)">调优</button>
+        </div>
+        <div id="overviewProfileBars"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">网盘与通道状态</div>
+          <button class="pill-btn" onclick="navTab('p-settings','配置与网络',3)">设置</button>
+        </div>
+        <div id="overviewStatusRows"></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">快速喜好标签</div>
+        <span class="badge purple" id="overviewEventBadge">0 条行为</span>
+      </div>
+      <div class="chip-wrap" id="overviewProfileChips"></div>
+    </div>
+    <div class="bottom-spacer"></div>
+  </main>
+
+  <!-- Tab 2: 观影画像 -->
+  <main id="p-profile" class="page">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">快捷题材点选</div>
+        <button class="pill-btn danger" onclick="resetProfile()">清空重建</button>
+      </div>
+      <div class="chip-wrap" id="quickGenreChips"></div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">偏好题材与地区</div>
+          <span class="badge accent">永久 +5.0</span>
+        </div>
+        <div class="form-label">题材标签</div>
+        <div class="chip-wrap" id="chipsLikeGenres"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inLikeGenres" placeholder="如：悬疑, 科幻" />
+          <button class="btn" onclick="addProfileTag('likeGenres','inLikeGenres')">添加</button>
+        </div>
+        <div class="form-label" style="margin-top:14px;">国家 / 地区</div>
+        <div class="chip-wrap" id="chipsLikeRegions"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inLikeRegions" placeholder="如：韩国, 美国" />
+          <button class="btn" onclick="addProfileTag('likeRegions','inLikeRegions')">添加</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">主创与代表作种子</div>
+          <span class="badge purple">自动扩维</span>
+        </div>
+        <div class="form-label">钟爱导演</div>
+        <div class="chip-wrap" id="chipsLikeDirectors"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inLikeDirectors" placeholder="如：克里斯托弗·诺兰" />
+          <button class="btn" onclick="addProfileTag('likeDirectors','inLikeDirectors')">添加</button>
+        </div>
+        <div class="form-label" style="margin-top:14px;">心头好电影</div>
+        <div class="chip-wrap" id="chipsFavoriteSeeds"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inFavoriteSeeds" placeholder="如：星际穿越, 杀人回忆" />
+          <button class="btn" onclick="addProfileTag('favoriteSeeds','inFavoriteSeeds')">添加</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">排雷屏蔽题材</div>
+          <span class="badge danger">硬过滤</span>
+        </div>
+        <div class="chip-wrap" id="chipsDislikeGenres"></div>
+        <div class="inline-add">
+          <input class="form-control" id="inDislikeGenres" placeholder="如：恐怖, 古装" />
+          <button class="btn danger" onclick="addProfileTag('dislikeGenres','inDislikeGenres')">屏蔽</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">近期学习轨迹</div>
+          <span class="badge neutral">30天半衰期</span>
+        </div>
+        <div id="recentEventsBox"></div>
+      </div>
+    </div>
+    <div class="bottom-spacer"></div>
+  </main>
+
+  <!-- Tab 3: 片单与任务 -->
+  <main id="p-media" class="page">
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">追剧片单与批量导入</div>
+        <span class="badge purple" id="watchlistCountBadge">0 部</span>
+      </div>
+      <textarea class="form-control" id="batchImport" rows="2" placeholder="粘贴豆瓣豆列链接、含《片名》文案或多行片名"></textarea>
+      <div style="margin-top:10px;display:flex;gap:8px;">
+        <button class="btn" onclick="importList()">批量导入</button>
+      </div>
+      <div id="watchlistBox" style="margin-top:12px;"></div>
+    </div>
+
+    <div class="card">
+      <div class="card-header">
+        <div class="card-title">定时与追更监控</div>
+        <span class="badge accent" id="tasksCountBadge">0 个</span>
+      </div>
+      <div id="tasksBox"></div>
+    </div>
+    <div class="bottom-spacer"></div>
+  </main>
+
+  <!-- Tab 4: 设置与网络 -->
+  <main id="p-settings" class="page">
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">身份、域名与偏好</div>
+          <button class="btn" onclick="saveSettings()">保存</button>
+        </div>
+        <div class="form-group">
+          <label class="form-label">对外昵称</label>
+          <input class="form-control" id="aliasName" placeholder="例如：小明" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">Web 面板访问域名</label>
+          <input class="form-control" id="publicBaseUrl" placeholder="留空自动探测，或输入 https://your-domain.com" />
+          <div class="mono-sub" id="effectiveDomainTip"></div>
+        </div>
+        <div class="form-group">
+          <label class="form-label">默认保存目录</label>
+          <input class="form-control" id="saveRootDir" placeholder="/我的资源" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">画质偏好</label>
+          <input class="form-control" id="preferredQuality" placeholder="4K / 1080P / 原盘 / 4K杜比" />
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label">Alist / Emby 扫库 Webhook</label>
+          <input class="form-control" id="webhookUrl" placeholder="https://..." />
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">多网盘凭证绑定</div>
+          <span class="badge neutral">留空不变</span>
+        </div>
+        <div class="form-group">
+          <label class="form-label">夸克 Cookie</label>
+          <input class="form-control" id="quarkCookie" type="password" placeholder="粘贴新 Cookie 更新" />
+        </div>
+        <div class="form-group">
+          <label class="form-label">阿里云盘 Refresh Token</label>
+          <input class="form-control" id="aliyunToken" type="password" placeholder="粘贴 Refresh Token" />
+        </div>
+        <div class="form-group" style="margin-bottom:0;">
+          <label class="form-label">115 网盘 Cookie</label>
+          <input class="form-control" id="pan115Cookie" type="password" placeholder="需包含 UID/CID/SEID" />
+        </div>
+      </div>
+    </div>
+
+    <div class="grid-2">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">微信通讯录</div>
+          <span class="badge accent" id="contactsCountBadge">0 人</span>
+        </div>
+        <div id="contactsBox"></div>
+      </div>
+
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">资源频道健康度 Top 20</div>
+          <span class="badge success" id="channelsHealthBadge">0 / 0</span>
+        </div>
+        <div id="channelsBox"></div>
+      </div>
+    </div>
+    <div class="bottom-spacer"></div>
+  </main>
 </div>
+
+<nav class="dock">
+  <button class="dock-btn active" onclick="switchPage('p-overview','观影总览',this)">
+    <svg viewBox="0 0 24 24"><path d="M3 13h8V3H3v10zm0 8h8v-6H3v6zm10 0h8V11h-8v10zm0-18v6h8V3h-8z"/></svg>
+    <span>总览</span>
+  </button>
+  <button class="dock-btn" onclick="switchPage('p-profile','观影画像',this)">
+    <svg viewBox="0 0 24 24"><path d="M12 12c2.21 0 4-1.79 4-4s-1.79-4-4-4-4 1.79-4 4 1.79 4 4 4zm0 2c-2.67 0-8 1.34-8 4v2h16v-2c0-2.66-5.33-4-8-4z"/></svg>
+    <span>画像</span>
+  </button>
+  <button class="dock-btn" onclick="switchPage('p-media','片单与任务',this)">
+    <svg viewBox="0 0 24 24"><path d="M4 6H2v14c0 1.1.9 2 2 2h14v-2H4V6zm16-4H8c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h12c1.1 0 2-.9 2-2V4c0-1.1-.9-2-2-2zm-8 12.5v-9l6 4.5-6 4.5z"/></svg>
+    <span>片单</span>
+  </button>
+  <button class="dock-btn" onclick="switchPage('p-settings','配置与网络',this)">
+    <svg viewBox="0 0 24 24"><path d="M19.14 12.94c.04-.31.06-.63.06-.94 0-.31-.02-.63-.06-.94l2.03-1.58a.49.49 0 00.12-.61l-1.92-3.32a.49.49 0 00-.59-.22l-2.39.96c-.5-.38-1.03-.7-1.62-.94l-.36-2.54a.484.484 0 00-.48-.41h-3.84c-.24 0-.43.17-.47.41l-.36 2.54c-.59.24-1.13.57-1.62.94l-2.39-.96a.49.49 0 00-.59.22L2.74 8.87c-.12.21-.08.47.12.61l2.03 1.58c-.04.31-.06.63-.06.94s.02.63.06.94l-2.03 1.58a.49.49 0 00-.12.61l1.92 3.32c.12.22.37.29.59.22l2.39-.96c.5.38 1.03.7 1.62.94l.36 2.54c.05.24.24.41.48.41h3.84c.24 0 .44-.17.47-.41l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.22.08.47 0 .59-.22l1.92-3.32c.12-.22.07-.47-.12-.61l-2.01-1.58zM12 15.6c-1.98 0-3.6-1.62-3.6-3.6s1.62-3.6 3.6-3.6 3.6 1.62 3.6 3.6-1.62 3.6-3.6 3.6z"/></svg>
+    <span>设置</span>
+  </button>
+</nav>
+
+<script>
+${AUI_BUNDLE_JS}
+</script>
 <script>
 const TOKEN = "${safeToken}";
-function esc(s){ return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c])); }
+const QUICK_GENRES = ["悬疑","科幻","犯罪","动作","喜剧","爱情","剧情","战争","动画","纪录片","奇幻","恐怖"];
+const ACTION_LABELS = { save:"转存", share:"安利", search:"搜片", skip:"跳过" };
+const ACTION_BADGES = { save:"success", share:"purple", search:"accent", skip:"warning" };
+
+function esc(s){
+  return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function navTab(pageId, title, dockIndex){
+  const btns = document.querySelectorAll('.dock .dock-btn');
+  switchPage(pageId, title, btns[dockIndex]);
+}
+
 async function api(path, body){
   const res = await fetch(path + "?token=" + encodeURIComponent(TOKEN), {
     method: body ? "POST" : "GET",
@@ -508,38 +776,194 @@ async function api(path, body){
   });
   return res.json();
 }
-async function load(){
+
+function renderRemovableChips(containerId, items, category, badgeClass){
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!items || items.length === 0) {
+    el.innerHTML = '<span class="badge neutral">暂无</span>';
+    return;
+  }
+  el.innerHTML = items.map(val =>
+    '<span class="badge ' + badgeClass + '">' + esc(val) +
+    '<span class="chip-del" data-cat="' + esc(category) + '" data-val="' + esc(val) + '">×</span></span>'
+  ).join("");
+  el.querySelectorAll('.chip-del').forEach(btn => {
+    btn.onclick = () => removeProfileTag(btn.dataset.cat, btn.dataset.val);
+  });
+}
+
+async function load(manual){
   const d = await api("/api/panel/state");
-  document.getElementById("userMeta").textContent = "账号: " + d.userId + " | 找片 " + d.stats.totalSearches + " 次 | 转存 " + d.stats.totalSaves + " 部 | 夸克:" + (d.settings.hasQuarkCookie?"已绑":"未绑") + " 阿里:" + (d.settings.hasAliyunToken?"已绑":"未绑") + " 115:" + (d.settings.has115Cookie?"已绑":"未绑");
+  if (!d || d.error) {
+    showToast(d?.error || "数据加载失败", "error");
+    return;
+  }
+
+  document.getElementById("headerBadge").textContent = "TVDAZI · " + (d.settings.alias || d.userId);
+  document.getElementById("kpiSearches").textContent = d.stats?.totalSearches || 0;
+  document.getElementById("kpiSaves").textContent = d.stats?.totalSaves || 0;
+  document.getElementById("kpiWatchlist").textContent = (d.watchlist || []).length;
+  document.getElementById("kpiTasks").textContent = (d.tasks || []).filter(t => t.enabled).length;
+
+  const tp = d.tasteProfile || {};
+  const likes = tp.explicitLikes || { genres:[], regions:[], directors:[], actors:[], favoriteSeeds:[] };
+  const dislikes = tp.explicitDislikes || { genres:[] };
+
+  // Overview: 权重条
+  const bars = [
+    ...(tp.topGenres || []).map(g => ({ label: g.name, val: g.score, color: "var(--accent)", tag: "题材" })),
+    ...(tp.topRegions || []).map(r => ({ label: r.name, val: r.score, color: "var(--purple)", tag: "地区" })),
+    ...(tp.topDirectors || []).map(x => ({ label: x.name, val: x.score, color: "var(--success)", tag: "导演" })),
+  ].slice(0, 8);
+  const maxScore = Math.max(...bars.map(b => b.val), 5);
+  document.getElementById("overviewProfileBars").innerHTML = bars.length
+    ? bars.map(b =>
+        '<div class="diag-row-item"><div class="diag-row-header"><span style="font-weight:700;font-size:13px;">' + esc(b.label) +
+        ' <span class="badge neutral">' + b.tag + '</span></span><span class="mono-sub" style="margin:0;">' + b.val + '</span></div>' +
+        '<div class="diag-bar-track"><div class="diag-bar-fill" style="width:' + Math.min(100, Math.round((b.val / maxScore) * 100)) + '%;background:' + b.color + ';"></div></div></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">点击右上「调优」或转存几部电影即可自动生成权重</div>';
+
+  document.getElementById("overviewEventBadge").textContent = (tp.eventCount || 0) + " 条行为";
+  const allQuickChips = [
+    ...(likes.genres || []).map(g => '<span class="badge accent">❤️ ' + esc(g) + '</span>'),
+    ...(likes.favoriteSeeds || []).map(s => '<span class="badge purple">🎬 《' + esc(s) + '》</span>'),
+    ...(dislikes.genres || []).map(g => '<span class="badge danger">🚫 ' + esc(g) + '</span>'),
+  ];
+  document.getElementById("overviewProfileChips").innerHTML = allQuickChips.length
+    ? allQuickChips.join("")
+    : '<span class="badge neutral">冷启动模式 · 豆瓣高分推荐</span>';
+
+  const statusItems = [
+    { name: "夸克网盘", ok: d.settings.hasQuarkCookie },
+    { name: "阿里云盘", ok: d.settings.hasAliyunToken },
+    { name: "115网盘", ok: d.settings.has115Cookie },
+    { name: "DeepSeek独立Key", ok: d.settings.hasDeepSeekKey },
+    { name: "扫库Webhook", ok: Boolean(d.settings.webhookUrl) },
+  ];
+  document.getElementById("overviewStatusRows").innerHTML = statusItems.map(s =>
+    '<div class="list-row"><span class="list-main">' + s.name + '</span><span class="badge ' + (s.ok ? 'success' : 'neutral') + '">' + (s.ok ? '已配置' : '默认/未绑') + '</span></div>'
+  ).join("");
+
+  // Profile Tab
+  const likedGenreSet = new Set((likes.genres || []).map(g => g.toLowerCase()));
+  const qgEl = document.getElementById("quickGenreChips");
+  qgEl.innerHTML = QUICK_GENRES.map(g => {
+    const active = likedGenreSet.has(g.toLowerCase());
+    return '<button class="pill-btn ' + (active ? 'accent' : '') + '" data-genre="' + g + '" data-active="' + (active ? '1' : '0') + '">' + (active ? '✓ ' : '+ ') + g + '</button>';
+  }).join("");
+  qgEl.querySelectorAll('button').forEach(btn => {
+    btn.onclick = async () => {
+      if (btn.dataset.active === '1') await removeProfileTag('likeGenres', btn.dataset.genre);
+      else await submitProfileAdd('likeGenres', btn.dataset.genre);
+    };
+  });
+
+  renderRemovableChips("chipsLikeGenres", likes.genres, "likeGenres", "accent");
+  renderRemovableChips("chipsLikeRegions", likes.regions, "likeRegions", "purple");
+  renderRemovableChips("chipsLikeDirectors", likes.directors, "likeDirectors", "success");
+  renderRemovableChips("chipsFavoriteSeeds", likes.favoriteSeeds, "favoriteSeeds", "purple");
+  renderRemovableChips("chipsDislikeGenres", dislikes.genres, "dislikeGenres", "danger");
+
+  const events = tp.recentEvents || [];
+  document.getElementById("recentEventsBox").innerHTML = events.length
+    ? events.map(ev =>
+        '<div class="list-row"><span class="list-main">《' + esc(ev.title) + '》' +
+        ((ev.genres && ev.genres.length) ? ' <span class="badge neutral">' + esc(ev.genres.slice(0,2).join('/')) + '</span>' : '') +
+        '</span><span class="badge ' + (ACTION_BADGES[ev.action] || 'neutral') + '">' + (ACTION_LABELS[ev.action] || ev.action) + '</span></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">暂无行为记录</div>';
+
+  // Media & Tasks Tab
+  const wl = d.watchlist || [];
+  document.getElementById("watchlistCountBadge").textContent = wl.length + " 部";
+  const wb = document.getElementById("watchlistBox");
+  wb.innerHTML = wl.length
+    ? wl.map(w =>
+        '<div class="list-row"><span class="list-main">《' + esc(w.title) + '》 <span class="badge ' + (w.status === 'completed' ? 'success' : 'accent') + '">' + esc(w.status) + '</span></span>' +
+        '<div class="list-actions"><button class="pill-btn js-watch-done" data-title="' + esc(w.title) + '">已看</button><button class="pill-btn danger js-watch-del" data-title="' + esc(w.title) + '">删</button></div></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">暂无片单</div>';
+  wb.querySelectorAll(".js-watch-done").forEach(b => b.onclick = () => setStatus(b.dataset.title, "completed"));
+  wb.querySelectorAll(".js-watch-del").forEach(b => b.onclick = () => delWatch(b.dataset.title));
+
+  const tasks = d.tasks || [];
+  document.getElementById("tasksCountBadge").textContent = tasks.length + " 个";
+  const tb = document.getElementById("tasksBox");
+  tb.innerHTML = tasks.length
+    ? tasks.map(t =>
+        '<div class="list-row"><span class="list-main">' + esc(t.title) + ' <span class="badge ' + (t.enabled ? 'success' : 'neutral') + '">' + (t.enabled ? '运行中' : '已暂停') + '</span></span>' +
+        '<div class="list-actions"><button class="pill-btn js-task-tog" data-id="' + esc(t.id) + '">' + (t.enabled ? '暂停' : '恢复') + '</button><button class="pill-btn danger js-task-del" data-id="' + esc(t.id) + '">删</button></div></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">暂无定时任务</div>';
+  tb.querySelectorAll(".js-task-tog").forEach(b => b.onclick = () => toggleTask(b.dataset.id));
+  tb.querySelectorAll(".js-task-del").forEach(b => b.onclick = () => delTask(b.dataset.id));
+
+  // Settings Tab
   document.getElementById("aliasName").value = d.settings.alias || "";
   document.getElementById("publicBaseUrl").value = d.settings.publicBaseUrl || "";
-  document.getElementById("effectiveDomainTip").textContent = "当前微信 /web 生效前缀: " + (d.settings.effectiveBaseUrl || "");
+  document.getElementById("effectiveDomainTip").textContent = "生效前缀: " + (d.settings.effectiveBaseUrl || "");
   document.getElementById("saveRootDir").value = d.settings.saveRootDir || "";
   document.getElementById("preferredQuality").value = d.settings.preferredQuality || "any";
   document.getElementById("webhookUrl").value = d.settings.webhookUrl || "";
-  const tp = d.tasteProfile || {};
-  const tpParts = [];
-  if ((tp.topGenres||[]).length) tpParts.push("偏好题材：" + tp.topGenres.map(g => esc(g.name)+"("+g.score+")").join(" · "));
-  if ((tp.topRegions||[]).length) tpParts.push("常看地区：" + tp.topRegions.map(r => esc(r.name)+"("+r.score+")").join(" · "));
-  if ((tp.topDirectors||[]).length) tpParts.push("喜欢导演：" + tp.topDirectors.map(x => esc(x.name)).join("、"));
-  if ((tp.favoriteSeeds||[]).length) tpParts.push("心头好片：" + tp.favoriteSeeds.map(t => "《"+esc(t)+"》").join("、"));
-  if ((tp.dislikedGenres||[]).length) tpParts.push("排雷屏蔽：" + tp.dislikedGenres.map(g => esc(g)).join("、"));
-  document.getElementById("profileBox").innerHTML = tpParts.length ? tpParts.join("<br>") + "<br><span style='color:#94a3b8;'>累计行为事件：" + (tp.eventCount||0) + " 条</span>" : "<span style='color:#64748b;'>暂未沉淀偏好，可以在微信说“我喜欢科幻/悬疑”或转存几部电影自动生成。</span>";
-  document.getElementById("contactsBox").innerHTML = (d.contacts || []).map(c => '<div class="row"><span>'+c.index+'. '+esc(c.displayName)+(c.isSelf?' <span class="badge ok">我</span>':'')+'</span><span class="badge">'+esc(c.maskedId)+'</span></div>').join("") || "<div style='color:#64748b;font-size:13px;'>暂无联系人</div>";
-  const wb = document.getElementById("watchlistBox");
-  wb.innerHTML = d.watchlist.map(w => '<div class="row"><span>《'+esc(w.title)+'》 <span class="badge">'+esc(w.status)+'</span></span><div><button class="sec js-watch-done" data-title="'+esc(w.title)+'">标为已看</button> <button class="del js-watch-del" data-title="'+esc(w.title)+'">删</button></div></div>').join("") || "<div style='color:#64748b;font-size:13px;'>暂无片单</div>";
-  wb.querySelectorAll(".js-watch-done").forEach(b => b.onclick = () => setStatus(b.dataset.title, "completed"));
-  wb.querySelectorAll(".js-watch-del").forEach(b => b.onclick = () => delWatch(b.dataset.title));
-  const tb = document.getElementById("tasksBox");
-  tb.innerHTML = d.tasks.map(t => '<div class="row"><span>'+esc(t.title)+' <span class="badge '+(t.enabled?'ok':'')+'">'+(t.enabled?'运行中':'已暂停')+'</span></span><div><button class="sec js-task-tog" data-id="'+esc(t.id)+'">'+(t.enabled?'暂停':'恢复')+'</button> <button class="del js-task-del" data-id="'+esc(t.id)+'">删</button></div></div>').join("") || "<div style='color:#64748b;font-size:13px;'>暂无定时任务</div>";
-  tb.querySelectorAll(".js-task-tog").forEach(b => b.onclick = () => toggleTask(b.dataset.id));
-  tb.querySelectorAll(".js-task-del").forEach(b => b.onclick = () => delTask(b.dataset.id));
-  document.getElementById("channelsBox").innerHTML = d.channels.topChannels.map(c => '<div class="row"><span>@'+esc(c.channelId)+'</span><span class="badge '+(c.circuitOpen?'warn':'ok')+'">健康分 '+c.score+' · '+c.avgLatencyMs+'ms</span></div>').join("");
+
+  const contacts = d.contacts || [];
+  document.getElementById("contactsCountBadge").textContent = contacts.length + " 人";
+  document.getElementById("contactsBox").innerHTML = contacts.length
+    ? contacts.map(c =>
+        '<div class="list-row"><span class="list-main">' + c.index + '. ' + esc(c.displayName) + (c.isSelf ? ' <span class="badge success">我</span>' : '') + '</span><span class="badge neutral">' + esc(c.maskedId) + '</span></div>'
+      ).join("")
+    : '<div style="color:var(--text-sec);font-size:13px;">暂无联系人</div>';
+
+  const ch = d.channels || {};
+  const topCh = ch.topChannels || [];
+  document.getElementById("channelsHealthBadge").textContent = Math.max(0, (ch.total || 0) - (ch.circuitOpenCount || 0)) + " / " + (ch.total || 0);
+  const cb = document.getElementById("channelsBox");
+  cb.innerHTML = topCh.map(c =>
+    '<div class="list-row"><span class="list-main">@' + esc(c.channelId) + '</span>' +
+    '<div class="list-actions"><span class="badge ' + (c.circuitOpen ? 'danger' : 'success') + '">' + c.score + '分 · ' + c.avgLatencyMs + 'ms</span>' +
+    (c.circuitOpen ? '<button class="pill-btn warning js-ch-reset" data-id="' + esc(c.channelId) + '">重置</button>' : '') +
+    '</div></div>'
+  ).join("");
+  cb.querySelectorAll(".js-ch-reset").forEach(b => b.onclick = () => resetChannel(b.dataset.id));
+
+  if (manual) showToast("已同步最新状态", "success");
 }
+
+async function submitProfileAdd(category, value){
+  const r = await api("/api/panel/profile", { action: "add", category, value });
+  if (r && r.ok) {
+    showToast("画像偏好已更新", "success");
+    load();
+  } else {
+    showToast(r?.error || "更新失败", "error");
+  }
+}
+
+async function addProfileTag(category, inputId){
+  const input = document.getElementById(inputId);
+  const val = (input.value || "").trim();
+  if (!val) return;
+  input.value = "";
+  await submitProfileAdd(category, val);
+}
+
+async function removeProfileTag(category, value){
+  const r = await api("/api/panel/profile", { action: "remove", category, value });
+  if (r && r.ok) {
+    showToast("已移除 " + value, "info");
+    load();
+  }
+}
+
+async function resetProfile(){
+  await api("/api/panel/profile", { action: "reset" });
+  showToast("画像已清空重建", "warning");
+  load();
+}
+
 async function saveSettings(){
-  const msgEl = document.getElementById("saveMsg");
-  msgEl.textContent = "保存中...";
-  msgEl.style.color = "#94a3b8";
   const r = await api("/api/panel/settings", {
     alias: document.getElementById("aliasName").value,
     publicBaseUrl: document.getElementById("publicBaseUrl").value,
@@ -550,27 +974,29 @@ async function saveSettings(){
     aliyunToken: document.getElementById("aliyunToken").value,
     pan115Cookie: document.getElementById("pan115Cookie").value,
   });
-  if(r && r.ok === false){
-    msgEl.style.color = "#fca5a5";
-    msgEl.textContent = r.error || "保存失败";
+  if (r && r.ok === false) {
+    showToast(r.error || "保存失败", "error");
     return;
   }
-  msgEl.style.color = "#6ee7b7";
-  msgEl.textContent = "已保存并实时生效";
+  showToast("配置已保存并生效", "success");
   load();
 }
+
 async function importList(){
   const rawText = document.getElementById("batchImport").value;
-  if(!rawText.trim()) return;
-  await api("/api/panel/watchlist", { action: "import", rawText });
+  if (!rawText.trim()) return;
+  const r = await api("/api/panel/watchlist", { action: "import", rawText });
   document.getElementById("batchImport").value = "";
+  showToast("新增收录 " + (r?.added?.length || 0) + " 部", "success");
   load();
 }
-async function setStatus(title, status){ await api("/api/panel/watchlist", { action:"status", title, status }); load(); }
-async function delWatch(title){ await api("/api/panel/watchlist", { action:"remove", title }); load(); }
-async function toggleTask(taskId){ await api("/api/panel/tasks", { action:"toggle", taskId }); load(); }
-async function delTask(taskId){ await api("/api/panel/tasks", { action:"delete", taskId }); load(); }
-async function resetProfile(){ await api("/api/panel/profile/reset", {}); load(); }
+
+async function setStatus(title, status){ await api("/api/panel/watchlist", { action:"status", title, status }); showToast("已标为已看", "success"); load(); }
+async function delWatch(title){ await api("/api/panel/watchlist", { action:"remove", title }); showToast("已移出片单", "info"); load(); }
+async function toggleTask(taskId){ await api("/api/panel/tasks", { action:"toggle", taskId }); showToast("任务状态已切换", "info"); load(); }
+async function delTask(taskId){ await api("/api/panel/tasks", { action:"delete", taskId }); showToast("已删除任务", "warning"); load(); }
+async function resetChannel(channelId){ await api("/api/panel/channels/reset", { channelId }); showToast("频道熔断已重置", "success"); load(); }
+
 load();
 </script>
 </body>

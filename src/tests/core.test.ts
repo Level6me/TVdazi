@@ -181,11 +181,14 @@ test('DashboardServer issues and verifies HMAC user tokens and serves authentica
     const unauth = await fetch(`${baseUrl}/api/panel/state`);
     assert.equal(unauth.status, 401);
 
-    // 2. HTML 页面渲染包含域名输入框
+    // 2. HTML 页面渲染包含 AUI 规范骨架、Dock 与域名输入框
     const htmlRes = await fetch(`${baseUrl}/panel?token=${encodeURIComponent(token)}`);
     assert.equal(htmlRes.status, 200);
     const html = await htmlRes.text();
     assert.ok(html.includes('电视搭子 (TVdazi) 影视网盘控制台'));
+    assert.ok(html.includes('data-theme="auto"'));
+    assert.ok(html.includes('class="dock"'));
+    assert.ok(html.includes('id="p-profile"'));
     assert.ok(html.includes('publicBaseUrl'));
 
     // 3. 拉取状态 & 更新偏好与访问域名
@@ -203,12 +206,32 @@ test('DashboardServer issues and verifies HMAC user tokens and serves authentica
     assert.equal(saveJson.publicBaseUrl, 'https://tvdazi.test.local');
     assert.ok(saveJson.newPanelUrl.startsWith('https://tvdazi.test.local/panel?token='));
 
+    // 4. 在线增删个人观影画像标签
+    const addProfRes = await fetch(`${baseUrl}/api/panel/profile?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'add', category: 'likeGenres', value: '悬疑, 科幻' }),
+    });
+    assert.equal(addProfRes.status, 200);
+    const addProfJson: any = await addProfRes.json();
+    assert.deepEqual(addProfJson.tasteProfile.explicitLikes.genres, ['悬疑', '科幻']);
+
+    const remProfRes = await fetch(`${baseUrl}/api/panel/profile?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'remove', category: 'likeGenres', value: '悬疑' }),
+    });
+    assert.equal(remProfRes.status, 200);
+    const remProfJson: any = await remProfRes.json();
+    assert.deepEqual(remProfJson.tasteProfile.explicitLikes.genres, ['科幻']);
+
     const stateRes = await fetch(`${baseUrl}/api/panel/state?token=${encodeURIComponent(token)}`);
     assert.equal(stateRes.status, 200);
     const stateJson: any = await stateRes.json();
     assert.equal(stateJson.settings.publicBaseUrl, 'https://tvdazi.test.local');
     assert.equal(stateJson.settings.saveRootDir, '/TestMedia');
     assert.equal(stateJson.settings.preferredQuality, '4K杜比');
+    assert.deepEqual(stateJson.tasteProfile.explicitLikes.genres, ['科幻']);
 
     // 验证临时 .env 已持久写入 PUBLIC_BASE_URL
     const envText = fs.readFileSync(tmpEnvFile, 'utf-8');
