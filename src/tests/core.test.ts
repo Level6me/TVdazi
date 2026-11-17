@@ -583,7 +583,13 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     assert.ok(pageScript.includes('function renderVizTrend'));
     assert.ok(pageScript.includes('function refreshPanel'));
     assert.ok(pageScript.includes('function createWatch'));
+    assert.ok(pageScript.includes('function renderTasks'));
+    assert.ok(pageScript.includes('function updateTask'));
+    assert.ok(pageScript.includes('function runTaskNow'));
+    assert.ok(pageScript.includes('function createPresetTask'));
     assert.ok(pageScript.includes('function probeChannelsNow'));
+    assert.ok(html.includes('taskSummaryBar'));
+    assert.ok(html.includes('taskStatusTabs'));
     assert.equal(/\?\./.test(pageScript), false);
     assert.equal(/showToast\([^)]*["'](?:success|error|warning|info)["']\)/.test(pageScript), false);
     // 2. 创建电影/影视追更任务
@@ -604,9 +610,65 @@ test('DashboardServer supports panel watch creation, safe task deletion, live ch
     assert.equal(createJson.ok, true);
     assert.ok(createJson.task?.id);
     assert.equal(createJson.task.keyword, '测试电影追更作品');
+    assert.ok(createJson.task.panelMeta?.scheduleDesc);
+    assert.ok(createJson.task.panelMeta?.targetSummary.includes('测试电影追更作品'));
     assert.ok(createJson.watchlist.some((w: any) => w.title === '测试电影追更作品'));
 
     const taskId = createJson.task.id;
+
+    // 2.5 更新任务频率/自动转存/档期自适应 + 立即巡检 + 预设守护任务
+    const updRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'update',
+        taskId,
+        autoSave: true,
+        releaseDate: '2099-12-31',
+        adaptiveSchedule: true,
+      }),
+    });
+    assert.equal(updRes.status, 200);
+    const updJson: any = await updRes.json();
+    assert.equal(updJson.ok, true);
+    assert.equal(updJson.task.autoSave, true);
+    assert.equal(updJson.task.adaptiveSchedule, true);
+    assert.equal(updJson.task.releaseDate, '2099-12-31');
+    assert.equal(updJson.task.intervalMinutes, 1440);
+    assert.ok(updJson.task.panelMeta.adaptivePhaseLabel.includes('映前'));
+
+    const runRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'run_now', taskId }),
+    });
+    assert.equal(runRes.status, 200);
+    const runJson: any = await runRes.json();
+    assert.equal(runJson.ok, true);
+    assert.ok(typeof runJson.message === 'string' && runJson.message.length > 0);
+    assert.ok(typeof runJson.task.lastRunAt === 'number' && runJson.task.lastRunAt > 0);
+
+    const presetRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'create_preset', preset: 'daily_recommend', scheduleTime: '08:30' }),
+    });
+    assert.equal(presetRes.status, 200);
+    const presetJson: any = await presetRes.json();
+    assert.equal(presetJson.ok, true);
+    assert.equal(presetJson.task.type, 'daily_recommend');
+    assert.equal(presetJson.task.scheduleTime, '08:30');
+    assert.ok(presetJson.task.panelMeta.nextRunAt > Date.now());
+    await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: 'delete', taskId: presetJson.task.id }),
+    });
+
+    const stateAfterRes = await fetch(`${baseUrl}/api/panel/state?token=${encodeURIComponent(token)}`);
+    const stateAfterJson: any = await stateAfterRes.json();
+    const enrichedTask = (stateAfterJson.tasks || []).find((t: any) => t.id === taskId);
+    assert.ok(enrichedTask?.panelMeta?.scheduleDesc);
 
     // 3. 切换暂停 & 正常删除 & 重复/空 taskId 安全返回
     const togRes = await fetch(`${baseUrl}/api/panel/tasks?token=${encodeURIComponent(token)}`, {

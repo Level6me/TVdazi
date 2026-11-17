@@ -130,15 +130,239 @@ export class SchedulerService {
     }
   }
 
-  public toggleUserTaskById(userId: string, taskId: string): ScheduledTask | null {
+  public getTaskById(userId: string, taskId: string): ScheduledTask | undefined {
     const cleanId = String(taskId || '').trim();
-    if (!cleanId) return null;
-    const task = this.tasks.find((t) => t.userId === userId && t.id === cleanId);
+    if (!cleanId) return undefined;
+    return this.tasks.find((t) => t.userId === userId && t.id === cleanId);
+  }
+
+  public toggleUserTaskById(userId: string, taskId: string): ScheduledTask | null {
+    const task = this.getTaskById(userId, taskId);
     if (!task) return null;
     task.enabled = !task.enabled;
     task.status = task.enabled ? 'active' : 'paused';
     this.saveTasks();
     return task;
+  }
+
+  public updateUserTaskById(
+    userId: string,
+    taskId: string,
+    patch: {
+      intervalMinutes?: number;
+      autoSave?: boolean;
+      adaptiveSchedule?: boolean;
+      releaseDate?: string;
+      scheduleTime?: string;
+    }
+  ): ScheduledTask | null {
+    const task = this.getTaskById(userId, taskId);
+    if (!task) return null;
+
+    if (typeof patch.autoSave === 'boolean') {
+      task.autoSave = patch.autoSave;
+    }
+    if (patch.releaseDate !== undefined) {
+      const cleanDate = String(patch.releaseDate || '').trim();
+      task.releaseDate = /^\d{4}-\d{2}-\d{2}$/.test(cleanDate) ? cleanDate : undefined;
+    }
+    if (patch.scheduleTime !== undefined && /^\d{2}:\d{2}$/.test(String(patch.scheduleTime).trim())) {
+      task.scheduleTime = String(patch.scheduleTime).trim();
+    }
+    if (patch.adaptiveSchedule === true) {
+      task.adaptiveSchedule = true;
+      const plan = SchedulerService.computeAdaptiveWatchPlan(task.releaseDate);
+      task.intervalMinutes = plan.intervalMinutes;
+    } else if (patch.intervalMinutes !== undefined && Number.isFinite(Number(patch.intervalMinutes))) {
+      task.intervalMinutes = Math.min(1440, Math.max(5, Math.round(Number(patch.intervalMinutes))));
+      if (patch.adaptiveSchedule === false || patch.adaptiveSchedule === undefined) {
+        task.adaptiveSchedule = false;
+      }
+    }
+
+    this.saveTasks();
+    return task;
+  }
+
+  public async runUserTaskById(
+    userId: string,
+    taskId: string
+  ): Promise<{ ok: boolean; task?: ScheduledTask; message: string }> {
+    const task = this.getTaskById(userId, taskId);
+    if (!task) {
+      return { ok: false, message: '任务不存在或已被删除' };
+    }
+    const msg = await this.executeTask(task, true);
+    task.lastRunAt = Date.now();
+    this.saveTasks();
+    return {
+      ok: true,
+      task,
+      message: msg || '巡检完成，暂未发现新增资源或更新',
+    };
+  }
+
+  public createPresetTask(
+    userId: string,
+    preset: 'daily_recommend' | 'friday_weekly' | 'disk_guard',
+    options?: { scheduleTime?: string; tag?: string; mediaType?: 'movie' | 'tv' }
+  ): { task: ScheduledTask; created: boolean } {
+    const existing = this.tasks.find((t) => t.userId === userId && t.type === preset);
+    if (existing) {
+      existing.enabled = true;
+      existing.status = 'active';
+      if (options?.scheduleTime && /^\d{2}:\d{2}$/.test(options.scheduleTime)) {
+        existing.scheduleTime = options.scheduleTime;
+      }
+      this.saveTasks();
+      return { task: existing, created: false };
+    }
+
+    if (preset === 'daily_recommend') {
+      const cleanTime = options?.scheduleTime && /^\d{2}:\d{2}$/.test(options.scheduleTime) ? options.scheduleTime : '08:00';
+      const tag = String(options?.tag || '豆瓣高分').trim() || '豆瓣高分';
+      const mediaType = options?.mediaType === 'tv' ? 'tv' : 'movie';
+      const task = this.addTask({
+        userId,
+        type: 'daily_recommend',
+        title: `每天${cleanTime}精选${tag}${mediaType === 'tv' ? '剧集' : '电影'}推送`,
+        enabled: true,
+        scheduleTime: cleanTime,
+        mediaType,
+        tag,
+        query: `推荐一部适合今天看的${tag}${mediaType === 'tv' ? '口碑剧集' : '口碑电影'}`,
+        autoSave: false,
+      });
+      return { task, created: true };
+    }
+
+    if (preset === 'friday_weekly') {
+      const cleanTime = options?.scheduleTime && /^\d{2}:\d{2}$/.test(options.scheduleTime) ? options.scheduleTime : '19:00';
+      const task = this.addTask({
+        userId,
+        type: 'friday_weekly',
+        title: `每周五${cleanTime}周末观影热播片单周报`,
+        enabled: true,
+        scheduleTime: cleanTime,
+        daysOfWeek: [5],
+      });
+      return { task, created: true };
+    }
+
+    const cleanTime = options?.scheduleTime && /^\d{2}:\d{2}$/.test(options.scheduleTime) ? options.scheduleTime : '09:00';
+    const task = this.addTask({
+      userId,
+      type: 'disk_guard',
+      title: `每日${cleanTime}夸克网盘容量预警与防和谐巡检`,
+      enabled: true,
+      scheduleTime: cleanTime,
+      minFreeGb: 5,
+    });
+    return { task, created: true };
+  }
+
+  public static formatTaskDetailForPanel(
+    task: ScheduledTask,
+    nowMs: number = Date.now()
+  ): ScheduledTask & {
+    panelMeta: {
+      scheduleDesc: string;
+      adaptivePhase: string;
+      adaptivePhaseLabel: string;
+      daysUntilRelease?: number;
+      nextRunAt?: number;
+      targetSummary: string;
+      progressSummary?: string;
+    };
+  } {
+    let scheduleDesc = '';
+    if (task.scheduleTime) {
+      if (task.oneShotDate) {
+        scheduleDesc = `${task.oneShotDate} ${task.scheduleTime}`;
+      } else if (task.daysOfWeek && task.daysOfWeek.length > 0) {
+        const dayNames = ['周日', '周一', '周二', '周三', '周四', '周五', '周六'];
+        scheduleDesc = `每${task.daysOfWeek.map((d) => dayNames[d] || '').join('/')} ${task.scheduleTime}`;
+      } else {
+        scheduleDesc = `每天 ${task.scheduleTime}`;
+      }
+    } else if (task.triggerAt) {
+      const bj = new Date(task.triggerAt + 8 * 3600000);
+      const hh = String(bj.getUTCHours()).padStart(2, '0');
+      const mm = String(bj.getUTCMinutes()).padStart(2, '0');
+      scheduleDesc = `单次提醒 ${hh}:${mm}`;
+    } else {
+      scheduleDesc = `${SchedulerService.formatInterval(task.intervalMinutes || 30)}巡检`;
+    }
+
+    const plan = SchedulerService.computeAdaptiveWatchPlan(
+      task.releaseDate,
+      nowMs,
+      task.adaptiveSchedule ? undefined : task.intervalMinutes || 30
+    );
+    const datePlan = task.releaseDate
+      ? SchedulerService.computeAdaptiveWatchPlan(task.releaseDate, nowMs)
+      : undefined;
+
+    let nextRunAt: number | undefined;
+    if (task.enabled && task.status !== 'completed') {
+      if (task.triggerAt) {
+        nextRunAt = task.triggerAt;
+      } else if (task.scheduleTime && /^\d{2}:\d{2}$/.test(task.scheduleTime)) {
+        const [hh, mm] = task.scheduleTime.split(':').map((n) => parseInt(n, 10));
+        const bjNow = new Date(nowMs + 8 * 3600000);
+        for (let offset = 0; offset <= 7; offset++) {
+          const candUtc =
+            Date.UTC(bjNow.getUTCFullYear(), bjNow.getUTCMonth(), bjNow.getUTCDate() + offset, hh, mm, 0) -
+            8 * 3600000;
+          if (candUtc <= nowMs - 30000) continue;
+          const candBj = new Date(candUtc + 8 * 3600000);
+          if (task.daysOfWeek && task.daysOfWeek.length > 0 && !task.daysOfWeek.includes(candBj.getUTCDay())) {
+            continue;
+          }
+          nextRunAt = candUtc;
+          break;
+        }
+      } else {
+        const intervalMs = Math.max(5, task.intervalMinutes || 30) * 60000;
+        const base = task.lastRunAt || task.createdAt || nowMs;
+        nextRunAt = Math.max(nowMs, base + intervalMs);
+      }
+    }
+
+    let targetSummary = '';
+    if (task.keyword) {
+      targetSummary = `目标：《${task.keyword}》`;
+    } else if (task.type === 'daily_recommend') {
+      targetSummary = `题材：${task.tag || '豆瓣高分'} · ${task.mediaType === 'tv' ? '剧集' : '电影'}`;
+    } else if (task.type === 'disk_guard') {
+      targetSummary = `容量预警阈值：< ${task.minFreeGb || 5} GB`;
+    } else if (task.type === 'friday_weekly') {
+      targetSummary = '每周院线新片 & 口碑剧单汇总';
+    } else {
+      targetSummary = task.query || task.title;
+    }
+
+    let progressSummary: string | undefined;
+    if (task.type === 'episode_chase') {
+      const ep = task.lastEpisode || 0;
+      const shareCnt = (task.knownShareIds || []).length;
+      progressSummary = ep > 0 ? `已追至第 ${ep} 集 · 已记录 ${shareCnt} 条片源` : `等待首集命中 · 实时扫源中`;
+    } else if (task.type === 'quality_upgrade') {
+      progressSummary = `目标规格：${(task.targetQualities || ['4K', '2160P', 'REMUX', '杜比']).slice(0, 4).join(' / ')}`;
+    }
+
+    return {
+      ...task,
+      panelMeta: {
+        scheduleDesc,
+        adaptivePhase: plan.phase,
+        adaptivePhaseLabel: task.adaptiveSchedule ? plan.phaseLabel : '固定频率',
+        daysUntilRelease: datePlan?.daysUntilRelease,
+        nextRunAt,
+        targetSummary,
+        progressSummary,
+      },
+    };
   }
 
   public deleteUserTaskById(userId: string, taskId: string): boolean {
@@ -161,6 +385,9 @@ export class SchedulerService {
     intervalMinutes?: number;
     autoSave?: boolean;
     runInitialCheck?: boolean;
+    adaptiveSchedule?: boolean;
+    releaseDate?: string;
+    lastRunAt?: number;
   }): ScheduledTask {
     const cleanTitle = String(params.title || '').replace(/[《》]/g, '').trim();
     if (!cleanTitle) {
@@ -190,6 +417,9 @@ export class SchedulerService {
       enabled: true,
       intervalMinutes,
       autoSave,
+      ...(params.adaptiveSchedule ? { adaptiveSchedule: true } : {}),
+      ...(params.releaseDate ? { releaseDate: params.releaseDate } : {}),
+      ...(params.lastRunAt ? { lastRunAt: params.lastRunAt } : {}),
       ...(mode === 'episode_chase' ? { lastEpisode: 0, knownShareIds: [] } : {}),
       ...(mode === 'quality_upgrade' ? { targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'] } : {}),
     });
@@ -201,6 +431,48 @@ export class SchedulerService {
     }
 
     return task;
+  }
+
+  /**
+   * 支持「档期智能自适应」的 Web 控制台追更创建入口（识别豆瓣上映日期并动态切档频率）
+   */
+  public async createPanelWatchTaskSmart(params: {
+    userId: string;
+    title: string;
+    mode?: 'episode_chase' | 'resource_watch' | 'quality_upgrade';
+    intervalMinutes?: number | 'auto';
+    autoSave?: boolean;
+    runInitialCheck?: boolean;
+    adaptiveSchedule?: boolean;
+  }): Promise<ScheduledTask> {
+    const cleanTitle = String(params.title || '').replace(/[《》]/g, '').trim();
+    if (!cleanTitle) {
+      throw new Error('请输入有效的影视作品名称');
+    }
+    const wantAdaptive = params.adaptiveSchedule === true || params.intervalMinutes === 'auto';
+    if (!wantAdaptive) {
+      return this.createPanelWatchTask({
+        userId: params.userId,
+        title: cleanTitle,
+        mode: params.mode,
+        intervalMinutes: typeof params.intervalMinutes === 'number' ? params.intervalMinutes : 30,
+        autoSave: params.autoSave,
+        runInitialCheck: params.runInitialCheck,
+      });
+    }
+
+    const timing = await this.resolveWatchTiming(cleanTitle, undefined);
+    return this.createPanelWatchTask({
+      userId: params.userId,
+      title: cleanTitle,
+      mode: params.mode,
+      intervalMinutes: timing.intervalMinutes,
+      autoSave: params.autoSave,
+      adaptiveSchedule: true,
+      releaseDate: timing.releaseDate,
+      lastRunAt: timing.skipInitialScan ? Date.now() : undefined,
+      runInitialCheck: params.runInitialCheck !== false && !timing.skipInitialScan,
+    });
   }
 
   private async triggerInitialPanelCheck(task: ScheduledTask): Promise<void> {

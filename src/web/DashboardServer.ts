@@ -294,7 +294,7 @@ export class DashboardServer {
         ]);
         plan = userManager.getUserPlan(userId);
       }
-      const tasks = scheduler.getUserTasks(userId);
+      const tasks = scheduler.getUserTasks(userId).map((t) => SchedulerService.formatTaskDetailForPanel(t));
       const channels = health.getAllStats(channelIds);
       const relay = RelayService.getInstance();
       const directory = relay.getDirectory(userId);
@@ -625,6 +625,9 @@ export class DashboardServer {
     if (req.method === 'POST' && pathname === '/api/panel/tasks') {
       const action = String(body.action || '').trim();
       const taskId = String(body.taskId || '').trim();
+      const mapTasks = () =>
+        scheduler.getUserTasks(userId).map((t) => SchedulerService.formatTaskDetailForPanel(t));
+
       if (action === 'create_watch') {
         const title = String(body.title || '').replace(/[《》]/g, '').trim();
         if (!title) {
@@ -635,23 +638,100 @@ export class DashboardServer {
         const rawMode = String(body.mode || 'resource_watch');
         const mode: 'episode_chase' | 'resource_watch' | 'quality_upgrade' =
           rawMode === 'episode_chase' || rawMode === 'quality_upgrade' ? rawMode : 'resource_watch';
-        const intervalMinutes = Number(body.intervalMinutes || 30);
+        const isAuto = body.adaptiveSchedule === true || String(body.intervalMinutes || '') === 'auto';
+        const intervalMinutes = isAuto ? 'auto' : Number(body.intervalMinutes || 30);
         const autoSave = Boolean(body.autoSave);
-        const task = scheduler.createPanelWatchTask({
-          userId,
-          title,
-          mode,
-          intervalMinutes,
-          autoSave,
-          runInitialCheck: body.runInitialCheck !== false,
+        const task = isAuto
+          ? await scheduler.createPanelWatchTaskSmart({
+              userId,
+              title,
+              mode,
+              intervalMinutes: 'auto',
+              autoSave,
+              adaptiveSchedule: true,
+              runInitialCheck: body.runInitialCheck !== false,
+            })
+          : scheduler.createPanelWatchTask({
+              userId,
+              title,
+              mode,
+              intervalMinutes: typeof intervalMinutes === 'number' ? intervalMinutes : 30,
+              autoSave,
+              runInitialCheck: body.runInitialCheck !== false,
+            });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            task: SchedulerService.formatTaskDetailForPanel(task),
+            watchlist: userManager.getUserPlan(userId).watchlist,
+            tasks: mapTasks(),
+          })
+        );
+        return true;
+      }
+      if (action === 'create_preset') {
+        const rawPreset = String(body.preset || '').trim();
+        if (rawPreset !== 'daily_recommend' && rawPreset !== 'friday_weekly' && rawPreset !== 'disk_guard') {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '不支持的预设守护任务类型' }));
+          return true;
+        }
+        const result = scheduler.createPresetTask(userId, rawPreset, {
+          scheduleTime: typeof body.scheduleTime === 'string' ? body.scheduleTime : undefined,
+          tag: typeof body.tag === 'string' ? body.tag : undefined,
+          mediaType: body.mediaType === 'tv' ? 'tv' : 'movie',
         });
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
         res.end(
           JSON.stringify({
             ok: true,
-            task,
-            watchlist: userManager.getUserPlan(userId).watchlist,
-            tasks: scheduler.getUserTasks(userId),
+            created: result.created,
+            task: SchedulerService.formatTaskDetailForPanel(result.task),
+            tasks: mapTasks(),
+          })
+        );
+        return true;
+      }
+      if (action === 'update') {
+        if (!taskId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '缺少任务 ID' }));
+          return true;
+        }
+        const task = scheduler.updateUserTaskById(userId, taskId, {
+          intervalMinutes: body.intervalMinutes !== undefined ? Number(body.intervalMinutes) : undefined,
+          autoSave: typeof body.autoSave === 'boolean' ? body.autoSave : undefined,
+          adaptiveSchedule: typeof body.adaptiveSchedule === 'boolean' ? body.adaptiveSchedule : undefined,
+          releaseDate: body.releaseDate !== undefined ? String(body.releaseDate) : undefined,
+          scheduleTime: body.scheduleTime !== undefined ? String(body.scheduleTime) : undefined,
+        });
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: Boolean(task),
+            task: task ? SchedulerService.formatTaskDetailForPanel(task) : null,
+            tasks: mapTasks(),
+            error: task ? undefined : '任务不存在或已被删除',
+          })
+        );
+        return true;
+      }
+      if (action === 'run_now') {
+        if (!taskId) {
+          res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+          res.end(JSON.stringify({ ok: false, error: '缺少任务 ID' }));
+          return true;
+        }
+        const result = await scheduler.runUserTaskById(userId, taskId);
+        res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(
+          JSON.stringify({
+            ok: result.ok,
+            message: result.message,
+            task: result.task ? SchedulerService.formatTaskDetailForPanel(result.task) : null,
+            tasks: mapTasks(),
+            error: result.ok ? undefined : result.message,
           })
         );
         return true;
@@ -664,7 +744,14 @@ export class DashboardServer {
         }
         const task = scheduler.toggleUserTaskById(userId, taskId);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok: Boolean(task), task, error: task ? undefined : '任务不存在或已被删除' }));
+        res.end(
+          JSON.stringify({
+            ok: Boolean(task),
+            task: task ? SchedulerService.formatTaskDetailForPanel(task) : null,
+            tasks: mapTasks(),
+            error: task ? undefined : '任务不存在或已被删除',
+          })
+        );
         return true;
       }
       if (action === 'delete') {
@@ -675,7 +762,7 @@ export class DashboardServer {
         }
         const ok = scheduler.deleteUserTaskById(userId, taskId);
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(JSON.stringify({ ok, error: ok ? undefined : '任务不存在或已被删除' }));
+        res.end(JSON.stringify({ ok, tasks: mapTasks(), error: ok ? undefined : '任务不存在或已被删除' }));
         return true;
       }
       res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
@@ -928,6 +1015,21 @@ ${AUI_BUNDLE_CSS}
 .wl-progress-row .progress-track{flex:1;margin:0;}
 .wl-actions-row{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin-top:4px;}
 .wl-actions-row .pill-btn{padding:4px 10px;font-size:11.5px;}
+.task-kpi-strip{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px;margin-bottom:12px;}
+.task-kpi-item{padding:9px 10px;border-radius:12px;background:var(--card-sec);border:1px solid var(--border-subtle);}
+.task-kpi-val{font-size:16px;font-weight:800;line-height:1.2;}
+.task-kpi-lbl{font-size:10.5px;color:var(--text-sec);margin-top:2px;}
+.task-card{padding:13px 14px;border-radius:16px;background:var(--card-sec);border:1px solid var(--border-subtle);margin-bottom:10px;display:flex;flex-direction:column;gap:8px;}
+.task-card:last-child{margin-bottom:0;}
+.task-header{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;}
+.task-title-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:14px;font-weight:750;line-height:1.35;}
+.task-meta-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:6px 12px;font-size:11.5px;color:var(--text-sec);padding:8px 10px;border-radius:11px;background:var(--card);}
+.task-meta-item{display:flex;align-items:center;gap:5px;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.task-meta-item strong{color:var(--text);font-weight:650;overflow:hidden;text-overflow:ellipsis;}
+.task-actions{display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding-top:2px;}
+.task-actions .pill-btn{padding:4px 10px;font-size:11.5px;}
+.task-freq-sel{padding:4px 8px;font-size:11.5px;border-radius:99px;height:auto;max-width:145px;}
+@media(max-width:680px){.task-kpi-strip{grid-template-columns:repeat(2,minmax(0,1fr));}.task-meta-grid{grid-template-columns:1fr;}}
 @media(max-width:960px){.viz-grid-3{grid-template-columns:repeat(2,minmax(0,1fr));}}
 @media(max-width:680px){.profile-hero{grid-template-columns:48px minmax(0,1fr);gap:12px;padding:16px;border-radius:18px;}.profile-mark{width:46px;height:46px;border-radius:15px;font-size:23px;}.profile-hero h2{font-size:18px;}.profile-hero-actions{grid-column:1/-1;justify-content:flex-end;}.profile-chart-row{grid-template-columns:minmax(72px,90px) minmax(40px,1fr) 34px;gap:7px;}.viz-grid-3{grid-template-columns:1fr;}.viz-people{grid-template-columns:1fr;}.viz-box{min-height:170px;}}
 </style>
@@ -1169,9 +1271,11 @@ ${AUI_BUNDLE_CSS}
           <option value="quality_upgrade">4K / 杜比高画质洗版</option>
         </select>
         <select class="form-control" id="watchInterval">
+          <option value="auto">智能档期自适应（推荐）</option>
           <option value="15">每 15 分钟巡检</option>
           <option value="30" selected>每 30 分钟巡检</option>
           <option value="60">每 60 分钟巡检</option>
+          <option value="360">每 6 小时巡检</option>
         </select>
       </div>
       <div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;">
@@ -1250,6 +1354,18 @@ ${AUI_BUNDLE_CSS}
       <div class="card-header">
         <div class="card-title">定时与追更监控</div>
         <span class="badge accent" id="tasksCountBadge">0 个</span>
+      </div>
+      <div id="taskSummaryBar" class="task-kpi-strip"></div>
+      <div style="display:flex;gap:7px;flex-wrap:wrap;margin-bottom:10px;">
+        <button class="pill-btn accent" onclick="createPresetTask('daily_recommend', this)">+ 每日高分推片</button>
+        <button class="pill-btn" onclick="createPresetTask('friday_weekly', this)">+ 周五观影周报</button>
+        <button class="pill-btn" onclick="createPresetTask('disk_guard', this)">+ 每日网盘巡检</button>
+      </div>
+      <div class="segmented-control" id="taskStatusTabs" style="margin-bottom:12px;">
+        <button class="segment-btn active" data-tst="all" onclick="setTaskStatusFilter('all', this)">全部</button>
+        <button class="segment-btn" data-tst="active" onclick="setTaskStatusFilter('active', this)">运行中</button>
+        <button class="segment-btn" data-tst="paused" onclick="setTaskStatusFilter('paused', this)">已暂停</button>
+        <button class="segment-btn" data-tst="completed" onclick="setTaskStatusFilter('completed', this)">已命中</button>
       </div>
       <div id="tasksBox"></div>
     </div>
@@ -1848,25 +1964,8 @@ async function load(manual){
   renderWatchlist();
 
   const tasks = (d.tasks || []).filter(t => t && t.id);
-  document.getElementById("tasksCountBadge").textContent = tasks.length + " 个";
-  const tb = document.getElementById("tasksBox");
-  tb.innerHTML = tasks.length
-    ? tasks.map(t => {
-        const typeLabel = TASK_TYPE_LABELS[t.type] || "监控";
-        const statusCls = t.enabled ? "success" : (t.status === "completed" ? "accent" : "neutral");
-        const statusLabel = t.enabled ? "运行中" : (t.status === "completed" ? "已命中" : "已暂停");
-        return '<div class="list-row"><span class="list-main">' + esc(t.title) +
-          ' <span class="badge purple">' + esc(typeLabel) + '</span>' +
-          ' <span class="badge ' + statusCls + '">' + statusLabel + '</span></span>' +
-          '<div class="list-actions"><button class="pill-btn js-task-tog" data-id="' + esc(t.id) + '">' + (t.enabled ? '暂停' : '恢复') + '</button><button class="pill-btn danger js-task-del" data-id="' + esc(t.id) + '">删</button></div></div>';
-      }).join("")
-    : '<div style="color:var(--text-sec);font-size:13px;">暂无定时任务</div>';
-  tb.querySelectorAll(".js-task-tog").forEach(b => {
-    b.onclick = function(){ toggleTask(this.getAttribute("data-id"), this); };
-  });
-  tb.querySelectorAll(".js-task-del").forEach(b => {
-    b.onclick = function(){ delTask(this.getAttribute("data-id"), this); };
-  });
+  window.__tasksData = tasks;
+  renderTasks();
 
   // Settings Tab
   document.getElementById("aliasName").value = settings.alias || "";
@@ -1971,18 +2070,21 @@ async function createWatch(btnEl){
   const modeEl = document.getElementById("watchMode");
   const intervalEl = document.getElementById("watchInterval");
   const autoSaveEl = document.getElementById("watchAutoSave");
+  const rawVal = intervalEl ? String(intervalEl.value || "30") : "30";
+  const isAuto = rawVal === "auto";
   if (btnEl) btnEl.disabled = true;
   try {
     const r = await api("/api/panel/tasks", {
       action: "create_watch",
       title: title,
       mode: modeEl ? modeEl.value : "resource_watch",
-      intervalMinutes: intervalEl ? Number(intervalEl.value) : 30,
+      intervalMinutes: isAuto ? "auto" : Number(rawVal),
+      adaptiveSchedule: isAuto,
       autoSave: autoSaveEl ? Boolean(autoSaveEl.checked) : false
     });
     if (r && r.ok !== false) {
       input.value = "";
-      toast("已开启追更监控，有更新将微信通知");
+      toast(isAuto ? "已开启智能档期追更监控，临近上映自动提频" : "已开启追更监控，有更新将微信通知");
       await load(false);
     } else {
       toast((r && r.error) || "添加追更失败");
@@ -2422,6 +2524,252 @@ async function delWatch(title, btnEl){
     await load(false);
   } finally {
     if (btnEl) btnEl.disabled = false;
+  }
+}
+
+let taskStatusFilter = "all";
+
+function setTaskStatusFilter(st, btnEl){
+  taskStatusFilter = st || "all";
+  document.querySelectorAll("#taskStatusTabs .segment-btn").forEach(b => {
+    b.classList.toggle("active", b.getAttribute("data-tst") === taskStatusFilter);
+  });
+  renderTasks();
+}
+
+function fmtTaskRelTime(ts){
+  if (!ts) return "尚未执行";
+  const diff = Math.max(0, Date.now() - Number(ts));
+  if (diff < 60000) return "刚刚";
+  if (diff < 3600000) return Math.floor(diff / 60000) + " 分钟前";
+  if (diff < 86400000) return Math.floor(diff / 3600000) + " 小时前";
+  const d = new Date(Number(ts));
+  return String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0") + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+function fmtTaskNextTime(ts, task){
+  if (task && task.status === "completed") return "已达成目标";
+  if (task && !task.enabled) return "已暂停";
+  if (!ts) return "等待调度";
+  const diff = Number(ts) - Date.now();
+  if (diff <= 60000) return "即将巡检";
+  if (diff < 3600000) return Math.ceil(diff / 60000) + " 分钟后";
+  if (diff < 86400000) return Math.round(diff / 360000) / 10 + " 小时后";
+  const d = new Date(Number(ts));
+  return String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0") + " " + String(d.getHours()).padStart(2, "0") + ":" + String(d.getMinutes()).padStart(2, "0");
+}
+
+function renderTasks(){
+  const tasks = (window.__tasksData || []).filter(t => t && t.id);
+  const badge = document.getElementById("tasksCountBadge");
+  if (badge) badge.textContent = tasks.length + " 个";
+
+  let activeCnt = 0;
+  let pausedCnt = 0;
+  let hitCnt = 0;
+  let autoSaveCnt = 0;
+  tasks.forEach(t => {
+    if (t.status === "completed") hitCnt++;
+    else if (t.enabled) activeCnt++;
+    else pausedCnt++;
+    if (t.autoSave) autoSaveCnt++;
+  });
+
+  const sumBar = document.getElementById("taskSummaryBar");
+  if (sumBar) {
+    sumBar.innerHTML =
+      '<div class="task-kpi-item"><div class="task-kpi-val" style="color:var(--success)">' + activeCnt + '</div><div class="task-kpi-lbl">运行中监控</div></div>' +
+      '<div class="task-kpi-item"><div class="task-kpi-val" style="color:var(--accent)">' + hitCnt + '</div><div class="task-kpi-lbl">已命中完结</div></div>' +
+      '<div class="task-kpi-item"><div class="task-kpi-val" style="color:var(--purple)">' + autoSaveCnt + '</div><div class="task-kpi-lbl">自动转存网盘</div></div>' +
+      '<div class="task-kpi-item"><div class="task-kpi-val" style="color:var(--text-sec)">' + pausedCnt + '</div><div class="task-kpi-lbl">已暂停</div></div>';
+  }
+
+  const filtered = tasks.filter(t => {
+    if (taskStatusFilter === "active") return Boolean(t.enabled) && t.status !== "completed";
+    if (taskStatusFilter === "paused") return !t.enabled && t.status !== "completed";
+    if (taskStatusFilter === "completed") return t.status === "completed";
+    return true;
+  });
+
+  const tb = document.getElementById("tasksBox");
+  if (!tb) return;
+  if (!filtered.length) {
+    tb.innerHTML = '<div style="color:var(--text-sec);font-size:13px;padding:12px 2px;">' +
+      (tasks.length ? "当前筛选状态下暂无任务" : "暂无定时任务，可使用上方输入框或快捷守护按钮创建") + '</div>';
+    return;
+  }
+
+  tb.innerHTML = filtered.map(t => {
+    const pm = t.panelMeta || {};
+    const typeLabel = TASK_TYPE_LABELS[t.type] || "监控";
+    const statusCls = t.status === "completed" ? "accent" : (t.enabled ? "success" : "neutral");
+    const statusLabel = t.status === "completed" ? "已命中" : (t.enabled ? "运行中" : "已暂停");
+    const isWatchTask = t.type === "resource_watch" || t.type === "episode_chase" || t.type === "quality_upgrade";
+
+    let releaseBadge = "";
+    if (t.releaseDate) {
+      let dayHint = "";
+      if (typeof pm.daysUntilRelease === "number") {
+        dayHint = pm.daysUntilRelease > 0
+          ? " · 距上映 " + pm.daysUntilRelease + " 天"
+          : (pm.daysUntilRelease === 0 ? " · 今日上线" : " · 已上映 " + Math.abs(pm.daysUntilRelease) + " 天");
+      }
+      releaseBadge = '<span class="badge warning">📅 ' + esc(t.releaseDate + dayHint) + '</span>';
+    }
+    const adaptiveBadge = t.adaptiveSchedule
+      ? '<span class="badge accent">' + esc(pm.adaptivePhaseLabel || "智能档期自适应") + '</span>'
+      : '';
+    const autoSaveBadge = t.autoSave
+      ? '<span class="badge success">自动转存夸克</span>'
+      : '';
+
+    const scheduleStr = pm.scheduleDesc || (t.scheduleTime ? ("每天 " + t.scheduleTime) : ("每 " + (t.intervalMinutes || 30) + " 分钟巡检"));
+    const targetStr = pm.targetSummary || t.title;
+    const progressLine = pm.progressSummary
+      ? '<div class="task-meta-item" style="grid-column:1/-1;"><span>📌 进度</span><strong>' + esc(pm.progressSummary) + '</strong></div>'
+      : '';
+
+    let freqControl = "";
+    if (isWatchTask || !t.scheduleTime) {
+      const curVal = t.adaptiveSchedule ? "auto" : String(t.intervalMinutes || 30);
+      const opts = [
+        { v: "auto", l: "智能档期自适应" },
+        { v: "10", l: "每 10 分钟" },
+        { v: "15", l: "每 15 分钟" },
+        { v: "30", l: "每 30 分钟" },
+        { v: "60", l: "每 1 小时" },
+        { v: "360", l: "每 6 小时" },
+        { v: "1440", l: "每 24 小时" }
+      ];
+      if (!opts.some(o => o.v === curVal)) {
+        opts.push({ v: curVal, l: "每 " + curVal + " 分钟" });
+      }
+      freqControl = '<select class="select-custom task-freq-sel js-task-freq" data-id="' + esc(t.id) + '" title="调整巡检频率">' +
+        opts.map(o => '<option value="' + esc(o.v) + '"' + (o.v === curVal ? ' selected' : '') + '>' + esc(o.l) + '</option>').join("") +
+        '</select>';
+    } else if (t.scheduleTime) {
+      freqControl = '<button class="pill-btn js-task-time" data-id="' + esc(t.id) + '" data-time="' + esc(t.scheduleTime) + '">🕘 改时间</button>';
+    }
+
+    const autoSaveBtn = isWatchTask
+      ? '<button class="pill-btn ' + (t.autoSave ? 'accent' : '') + ' js-task-autosave" data-id="' + esc(t.id) + '" data-val="' + (t.autoSave ? '1' : '0') + '">' + (t.autoSave ? '💾 自动转存:开' : '💾 自动转存:关') + '</button>'
+      : '';
+
+    return '<div class="task-card">' +
+      '<div class="task-header">' +
+        '<div class="task-title-line">' +
+          '<span>' + esc(t.title) + '</span>' +
+          '<span class="badge purple">' + esc(typeLabel) + '</span>' +
+          '<span class="badge ' + statusCls + '">' + esc(statusLabel) + '</span>' +
+          autoSaveBadge + releaseBadge + adaptiveBadge +
+        '</div>' +
+      '</div>' +
+      '<div class="task-meta-grid">' +
+        '<div class="task-meta-item"><span>🎯 对象</span><strong>' + esc(targetStr) + '</strong></div>' +
+        '<div class="task-meta-item"><span>⏱️ 节奏</span><strong>' + esc(scheduleStr) + '</strong></div>' +
+        '<div class="task-meta-item"><span>🛰️ 上次巡检</span><strong>' + esc(fmtTaskRelTime(t.lastRunAt)) + '</strong></div>' +
+        '<div class="task-meta-item"><span>⏭️ 下次预计</span><strong>' + esc(fmtTaskNextTime(pm.nextRunAt, t)) + '</strong></div>' +
+        progressLine +
+      '</div>' +
+      '<div class="task-actions">' +
+        '<button class="pill-btn accent js-task-run" data-id="' + esc(t.id) + '">⚡ 立即巡检</button>' +
+        freqControl +
+        autoSaveBtn +
+        '<button class="pill-btn js-task-tog" data-id="' + esc(t.id) + '">' + (t.enabled ? '⏸️ 暂停' : '▶ 恢复') + '</button>' +
+        '<button class="pill-btn danger js-task-del" data-id="' + esc(t.id) + '">🗑️ 删除</button>' +
+      '</div>' +
+    '</div>';
+  }).join("");
+
+  tb.querySelectorAll(".js-task-run").forEach(b => {
+    b.onclick = function(){ runTaskNow(this.getAttribute("data-id"), this); };
+  });
+  tb.querySelectorAll(".js-task-freq").forEach(s => {
+    s.onchange = function(){
+      const v = this.value;
+      const patch = v === "auto" ? { adaptiveSchedule: true } : { intervalMinutes: Number(v), adaptiveSchedule: false };
+      updateTask(this.getAttribute("data-id"), patch, this);
+    };
+  });
+  tb.querySelectorAll(".js-task-autosave").forEach(b => {
+    b.onclick = function(){
+      const cur = this.getAttribute("data-val") === "1";
+      updateTask(this.getAttribute("data-id"), { autoSave: !cur }, this);
+    };
+  });
+  tb.querySelectorAll(".js-task-time").forEach(b => {
+    b.onclick = function(){
+      changeTaskScheduleTime(this.getAttribute("data-id"), this.getAttribute("data-time"), this);
+    };
+  });
+  tb.querySelectorAll(".js-task-tog").forEach(b => {
+    b.onclick = function(){ toggleTask(this.getAttribute("data-id"), this); };
+  });
+  tb.querySelectorAll(".js-task-del").forEach(b => {
+    b.onclick = function(){ delTask(this.getAttribute("data-id"), this); };
+  });
+}
+
+async function createPresetTask(preset, btnEl){
+  if (!preset) return;
+  if (btnEl) btnEl.disabled = true;
+  try {
+    const r = await api("/api/panel/tasks", { action: "create_preset", preset: preset });
+    if (r && r.ok !== false) {
+      toast(r.created === false ? "该守护任务已存在并已确保启用" : "已添加智能守护任务");
+      await load(false);
+    } else {
+      toast((r && r.error) || "添加守护任务失败");
+    }
+  } finally {
+    if (btnEl) btnEl.disabled = false;
+  }
+}
+
+async function updateTask(taskId, patch, el){
+  if (!taskId) return;
+  if (el) el.disabled = true;
+  try {
+    const r = await api("/api/panel/tasks", Object.assign({ action: "update", taskId: taskId }, patch || {}));
+    if (r && r.ok) {
+      toast("任务配置已更新");
+      await load(false);
+    } else {
+      toast((r && r.error) || "更新任务失败");
+      await load(false);
+    }
+  } finally {
+    if (el) el.disabled = false;
+  }
+}
+
+function changeTaskScheduleTime(taskId, currentTime, btnEl){
+  const nextTime = window.prompt("请输入新的每天触发时间（24小时制，如 08:30 或 21:00）", currentTime || "08:00");
+  if (!nextTime) return;
+  const clean = nextTime.trim();
+  if (!/^\\d{2}:\\d{2}$/.test(clean)) {
+    toast("时间格式不正确，请输入如 08:30");
+    return;
+  }
+  updateTask(taskId, { scheduleTime: clean }, btnEl);
+}
+
+async function runTaskNow(taskId, btnEl){
+  if (!taskId) return;
+  if (btnEl) { btnEl.disabled = true; btnEl.textContent = "巡检中..."; }
+  try {
+    const r = await api("/api/panel/tasks", { action: "run_now", taskId: taskId });
+    if (r && r.ok) {
+      document.getElementById("mediaModalTitle").textContent = "⚡ 任务立即巡检结果";
+      document.getElementById("mediaModalBody").innerHTML =
+        '<div style="white-space:pre-wrap;font-size:13px;line-height:1.7;color:var(--text);">' + esc(r.message || "巡检完成") + '</div>';
+      openModal("mediaActionModal");
+      await load(false);
+    } else {
+      toast((r && r.error) || "执行巡检失败");
+    }
+  } finally {
+    if (btnEl) { btnEl.disabled = false; btnEl.textContent = "⚡ 立即巡检"; }
   }
 }
 
