@@ -2,7 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { ResourceSearcher } from './Searcher';
 import { QuarkService } from './QuarkService';
-import { DoubanService } from './DoubanService';
+import { DoubanService, DoubanSubject } from './DoubanService';
 import { AiRecommender } from './AiRecommender';
 import { SessionManager } from './SessionManager';
 import { UserManager } from './UserManager';
@@ -37,6 +37,8 @@ export interface ScheduledTask {
   oneShotDate?: string;       // "YYYY-MM-DD" 单次提醒日期（执行后自动标记完成）
   triggerAt?: number;         // 精确毫秒级触发时间戳（适用于“2分钟后”、“半小时后”等相对延时单次任务）
   intervalMinutes?: number;   // 轮询间隔分钟数（适用于蹲守/追更/4K监控，默认 30 分钟）
+  releaseDate?: string;       // "YYYY-MM-DD" 作品预计上映/上线日期（用于未上映智能低频预热、近档期自动切高频）
+  adaptiveSchedule?: boolean; // 是否随距上映日期动态调节扫描频率（用户显式指定固定间隔时为 false）
 
   // 业务参数
   keyword?: string;           // 监控或搜索的影视片名
@@ -316,8 +318,15 @@ export class SchedulerService {
           continue;
         }
 
-        // 2. 周期轮询型任务
+        // 2. 周期轮询型任务（若开启档期自适应，根据距上映天数自动切换预热/高频/长尾频率）
         if (task.intervalMinutes || ['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
+          if (task.adaptiveSchedule && task.releaseDate && ['resource_watch', 'episode_chase', 'quality_upgrade'].includes(task.type)) {
+            const adaptive = SchedulerService.computeAdaptiveWatchPlan(task.releaseDate, nowMs);
+            if (adaptive.intervalMinutes !== task.intervalMinutes) {
+              task.intervalMinutes = adaptive.intervalMinutes;
+              stateChanged = true;
+            }
+          }
           const intervalMs = (task.intervalMinutes || 30) * 60 * 1000;
           const lastRun = task.lastRunAt || 0;
           if (nowMs - lastRun >= intervalMs) {
@@ -1154,6 +1163,7 @@ export class SchedulerService {
       }
       const target = userTasks[idx - 1];
       target.intervalMinutes = safeMinutes;
+      target.adaptiveSchedule = false;
       // 若原本是定点任务被用户主动改为轮询间隔模式，清除固定时刻使其按间隔运行
       if (target.scheduleTime) {
         delete target.scheduleTime;
@@ -1178,6 +1188,7 @@ export class SchedulerService {
       if (matched.length > 0) {
         for (const t of matched) {
           t.intervalMinutes = safeMinutes;
+          t.adaptiveSchedule = false;
           if (t.scheduleTime) {
             delete t.scheduleTime;
           }
@@ -1287,8 +1298,15 @@ export class SchedulerService {
           ? ' [自动转存]'
           : '';
 
+      const adaptiveHint =
+        t.releaseDate && t.adaptiveSchedule
+          ? ` · 📅 ${t.releaseDate} (${SchedulerService.computeAdaptiveWatchPlan(t.releaseDate).phaseLabel})`
+          : t.releaseDate
+          ? ` · 📅 档期 ${t.releaseDate}`
+          : '';
+
       lines.push(`${idx + 1}. [${badge}] ${t.title}${extraInfo}`);
-      lines.push(`   ⏱️ 触发：${scheduleDesc} | 状态：${stateIcon}`);
+      lines.push(`   ⏱️ 触发：${scheduleDesc}${adaptiveHint} | 状态：${stateIcon}`);
     });
 
     lines.push(`─────────────────────────`);
@@ -1492,10 +1510,115 @@ export class SchedulerService {
   }
 
   /**
+   * 档期感知动态扫频计算（按北京时间日历天差自动分 4 档）：
+   * - 用户显式指定频率时尊重用户设定
+   * - 距上映 > 7 天：每天 1 次低频预热（防提前偷跑与改档，减少 98% 无效频道扫描）
+   * - 距上映 -15 ~ +7 天（临近上映 ~ 上映半个月内）：30 分钟高频扫源窗口
+   * - 上映超 15 天仍未命中（长尾期）：每 6 小时（360 分钟）巡检一次
+   */
+  public static computeAdaptiveWatchPlan(
+    releaseDate?: string,
+    nowMs: number = Date.now(),
+    manualIntervalMinutes?: number
+  ): {
+    intervalMinutes: number;
+    phase: 'pre_release_dormant' | 'release_window' | 'post_release_tail' | 'standard';
+    phaseLabel: string;
+    daysUntilRelease?: number;
+  } {
+    if (manualIntervalMinutes !== undefined) {
+      return {
+        intervalMinutes: manualIntervalMinutes,
+        phase: 'standard',
+        phaseLabel: '固定频率',
+      };
+    }
+
+    if (!releaseDate || !/^\d{4}-\d{2}-\d{2}$/.test(releaseDate)) {
+      return {
+        intervalMinutes: 30,
+        phase: 'standard',
+        phaseLabel: '常规巡检',
+      };
+    }
+
+    const bjToday = new Date(nowMs + 8 * 3600000);
+    const todayUtcDay = Date.UTC(bjToday.getUTCFullYear(), bjToday.getUTCMonth(), bjToday.getUTCDate());
+    const [ry, rm, rd] = releaseDate.split('-').map((n) => parseInt(n, 10));
+    const releaseUtcDay = Date.UTC(ry, rm - 1, rd);
+    const daysUntilRelease = Math.round((releaseUtcDay - todayUtcDay) / 86400000);
+
+    if (daysUntilRelease > 7) {
+      return {
+        intervalMinutes: 1440,
+        phase: 'pre_release_dormant',
+        phaseLabel: '映前低频预热(每天1次)',
+        daysUntilRelease,
+      };
+    }
+    if (daysUntilRelease >= -15) {
+      return {
+        intervalMinutes: 30,
+        phase: 'release_window',
+        phaseLabel: '档期窗口高频(每30分钟)',
+        daysUntilRelease,
+      };
+    }
+    return {
+      intervalMinutes: 360,
+      phase: 'post_release_tail',
+      phaseLabel: '映后长尾守候(每6小时)',
+      daysUntilRelease,
+    };
+  }
+
+  /**
+   * 创建监控任务前先识别上映/上线档期，并确定自适应初始扫描节奏与是否跳过映前空扫
+   */
+  private async resolveWatchTiming(
+    movieTitle: string,
+    parsedInterval?: number,
+    hintSubject?: DoubanSubject
+  ): Promise<{
+    intervalMinutes: number;
+    adaptiveSchedule: boolean;
+    releaseDate?: string;
+    platforms?: string[];
+    skipInitialScan: boolean;
+    plan: ReturnType<typeof SchedulerService.computeAdaptiveWatchPlan>;
+  }> {
+    if (parsedInterval !== undefined) {
+      return {
+        intervalMinutes: parsedInterval,
+        adaptiveSchedule: false,
+        skipInitialScan: false,
+        plan: SchedulerService.computeAdaptiveWatchPlan(undefined, Date.now(), parsedInterval),
+      };
+    }
+
+    const rel = await Promise.race([
+      this.doubanService.getReleaseSchedule(movieTitle, hintSubject).catch(() => ({} as { releaseDate?: string; platforms?: string[] })),
+      new Promise<{ releaseDate?: string; platforms?: string[] }>((resolve) => setTimeout(() => resolve({}), 2200)),
+    ]);
+
+    const plan = SchedulerService.computeAdaptiveWatchPlan(rel?.releaseDate);
+    const skipInitialScan = Boolean(plan.daysUntilRelease !== undefined && plan.daysUntilRelease > 3);
+
+    return {
+      intervalMinutes: plan.intervalMinutes,
+      adaptiveSchedule: true,
+      releaseDate: rel?.releaseDate,
+      platforms: rel?.platforms,
+      skipInitialScan,
+      plan,
+    };
+  }
+
+  /**
    * 结合当前用户的榜单/搜索/近期讨论上下文，把“10 / 第10部 / 本页第1个 / 这部”准确还原成真实影视片名，
    * 绝不允许把纯数字或“第X部”直接当成片名创建监控任务。
    */
-  private resolveTargetMovieTitle(userId: string, rawInput: string): { title?: string; error?: string } {
+  private resolveTargetMovieTitle(userId: string, rawInput: string): { title?: string; subject?: DoubanSubject; error?: string } {
     const clean = SchedulerService.extractCleanMovieTitle(rawInput);
     if (!clean) return {};
 
@@ -1547,11 +1670,16 @@ export class SchedulerService {
         };
       }
 
-      const pickedTitle = String(targetList[finalIdx - 1]?.title || '').replace(/[《》]/g, '').trim();
+      const pickedItem = targetList[finalIdx - 1];
+      const pickedTitle = String(pickedItem?.title || '').replace(/[《》]/g, '').trim();
       if (!pickedTitle) {
         return { error: `第 ${finalIdx} 项没有取到有效片名，麻烦直接发片名给我~` };
       }
-      return { title: pickedTitle };
+      const subject =
+        lastType === 'hot' || !searchSess
+          ? (pickedItem as DoubanSubject)
+          : undefined;
+      return { title: pickedTitle, subject };
     }
 
     // 4. 兜底拦截裸数字
@@ -1857,22 +1985,30 @@ export class SchedulerService {
       if (resolvedTarget.error) return resolvedTarget.error;
       const movieTitle = resolvedTarget.title;
       if (movieTitle) {
+        const timing = await this.resolveWatchTiming(movieTitle, parsedInterval, resolvedTarget.subject);
         const task = this.addTask({
           userId,
           type: 'quality_upgrade',
           title: `《${movieTitle}》4K高画质洗版监控`,
           keyword: movieTitle,
           enabled: true,
-          intervalMinutes: activeInterval,
+          intervalMinutes: timing.intervalMinutes,
+          releaseDate: timing.releaseDate,
+          adaptiveSchedule: timing.adaptiveSchedule,
+          lastRunAt: timing.skipInitialScan ? Date.now() : undefined,
           autoSave: true,
           targetQualities: ['4K', '2160P', 'REMUX', '杜比', 'HDR'],
         });
-        const firstCheck = await this.runQualityUpgrade(task, true);
+        const firstCheck = timing.skipInitialScan ? null : await this.runQualityUpgrade(task, true);
         if (task.status === 'completed') {
           return firstCheck || `💎 《${movieTitle}》已命中 4K 高规格片源！`;
         }
+        const scheduleTip = timing.skipInitialScan && timing.releaseDate
+          ? `📅 预计档期 **${timing.releaseDate}**（距今约 ${timing.plan.daysUntilRelease} 天），映前先按每天 1 次低频预热，临近上映自动切每 30 分钟高频扫 4K 版~`
+          : `（${SchedulerService.formatInterval(timing.intervalMinutes)}巡检一次，出 4K / 原盘 / 杜比资源就自动帮你存网盘并喊你~）`;
         return [
-          `**💎 已帮你盯上《${movieTitle}》的 4K 高画质版**（${activeFreqText}巡检一次，出 4K / 原盘 / 杜比资源就自动帮你存网盘并喊你~）`,
+          `**💎 已帮你盯上《${movieTitle}》的 4K 高画质版**`,
+          scheduleTip,
           firstCheck ? `\n${firstCheck}` : '',
         ]
           .filter(Boolean)
@@ -1891,25 +2027,33 @@ export class SchedulerService {
       if (!movieTitle) {
         return '想追更哪部剧直接把片名或序号发我就行，比如「帮我追更《今天是太阳雨》」或「追更第1部」~';
       }
+      const timing = await this.resolveWatchTiming(movieTitle, parsedInterval, resolvedTarget.subject);
       const task = this.addTask({
         userId,
         type: 'episode_chase',
         title: `追更《${movieTitle}》`,
         keyword: movieTitle,
         enabled: true,
-        intervalMinutes: activeInterval,
+        intervalMinutes: timing.intervalMinutes,
+        releaseDate: timing.releaseDate,
+        adaptiveSchedule: timing.adaptiveSchedule,
+        lastRunAt: timing.skipInitialScan ? Date.now() : undefined,
         autoSave: true,
         lastEpisode: 0,
         knownShareIds: [],
       });
       // 同时加入个人追剧片单
       this.userManager.addToWatchlist(userId, movieTitle);
-      const firstCheck = await this.runEpisodeChase(task, true);
+      const firstCheck = timing.skipInitialScan ? null : await this.runEpisodeChase(task, true);
       if (task.status === 'completed') {
         return firstCheck || `📺 《${movieTitle}》全集已追更完毕并入库！`;
       }
+      const chaseTip = timing.skipInitialScan && timing.releaseDate
+        ? `📅 预计开播 **${timing.releaseDate}**（还有 ${timing.plan.daysUntilRelease} 天），开播前先低频预热，临近开播自动切每 30 分钟高频追新集~`
+        : `${SchedulerService.formatInterval(timing.intervalMinutes)}巡检一次新集数，一有更新自动存网盘并通知你~`;
       return [
-        `**📺 已经开始帮你自动追更《${movieTitle}》啦**（${activeFreqText}巡检一次新集数，一有更新自动存网盘并通知你~）`,
+        `**📺 已经开始帮你自动追更《${movieTitle}》啦**`,
+        chaseTip,
         firstCheck ? `\n${firstCheck}` : '',
       ]
         .filter(Boolean)
@@ -1928,22 +2072,31 @@ export class SchedulerService {
         return '想蹲哪部片直接发片名或列表序号就行，比如「蹲守《复仇者联盟5》」或「蹲一下第1部」~';
       }
       const notifyOnly = /(?:通知我|提醒我|告诉我|发给我)/.test(trimmed) && !wantAutoSave;
+      const timing = await this.resolveWatchTiming(movieTitle, parsedInterval, resolvedTarget.subject);
       const task = this.addTask({
         userId,
         type: 'resource_watch',
         title: `蹲守《${movieTitle}》全网首发资源`,
         keyword: movieTitle,
         enabled: true,
-        intervalMinutes: activeInterval,
+        intervalMinutes: timing.intervalMinutes,
+        releaseDate: timing.releaseDate,
+        adaptiveSchedule: timing.adaptiveSchedule,
+        lastRunAt: timing.skipInitialScan ? Date.now() : undefined,
         autoSave: wantAutoSave || !notifyOnly,
       });
-      const firstCheck = await this.runResourceWatch(task, true);
+      const firstCheck = timing.skipInitialScan ? null : await this.runResourceWatch(task, true);
       if (task.status === 'completed') {
         return firstCheck || `🎉 你蹲守的《${movieTitle}》已经有资源啦！`;
       }
+      const watchDesc = timing.skipInitialScan && timing.releaseDate
+        ? `📅 查到预计上映/上线日：**${timing.releaseDate}**（距今还有 ${timing.plan.daysUntilRelease} 天），映前先按**每天 1 次**低频预热避免空跑；临近上映前 7 天自动切到**每 30 分钟**高频扫片${task.autoSave ? '，出源自动存进夸克网盘并微信喊你' : '并通知你'}~`
+        : timing.releaseDate
+        ? `📅 档期为 **${timing.releaseDate}**（当前处于${timing.plan.phaseLabel}），后台按${SchedulerService.formatInterval(timing.intervalMinutes)}扫全网频道，出片立刻微信喊你${task.autoSave ? '并自动存进夸克网盘' : ''}~`
+        : `后台${SchedulerService.formatInterval(timing.intervalMinutes)}自动帮你扫一遍全网频道，一旦出片源立刻微信喊你${task.autoSave ? '并自动存进夸克网盘' : ''}~`;
       return [
         `**🛰️ 没问题，帮你把《${movieTitle}》挂上蹲守啦！**`,
-        `后台每${activeFreqText.replace(/^每/, '')}自动帮你扫一遍全网频道，一旦出片源立刻微信喊你${task.autoSave ? '并自动存进夸克网盘' : ''}~`,
+        watchDesc,
         firstCheck ? `\n${firstCheck}` : '',
       ]
         .filter(Boolean)

@@ -784,4 +784,71 @@ export class DoubanService {
 
     return lines.join('\n');
   }
+
+  /**
+   * 从豆瓣 pubdate 数组（如 ["2026-12-16(中国大陆)"]）或待映短日期（如 "12.16" + year="2026"）提取规范 YYYY-MM-DD 上映日
+   */
+  public static parseReleaseDate(
+    opts: { pubdates?: string[]; shortDate?: string; year?: string },
+    now: Date = new Date()
+  ): string | undefined {
+    const pubdates = Array.isArray(opts.pubdates) ? opts.pubdates : [];
+    const ordered = [
+      ...pubdates.filter((p) => /中国大陆/.test(p)),
+      ...pubdates.filter((p) => !/中国大陆/.test(p)),
+    ];
+
+    for (const raw of ordered) {
+      const fullMatch = String(raw).match(/((?:19|20)\d{2})-(\d{1,2})-(\d{1,2})/);
+      if (fullMatch) {
+        return `${fullMatch[1]}-${fullMatch[2].padStart(2, '0')}-${fullMatch[3].padStart(2, '0')}`;
+      }
+      const ymMatch = String(raw).match(/((?:19|20)\d{2})-(\d{1,2})(?!-\d)/);
+      if (ymMatch) {
+        return `${ymMatch[1]}-${ymMatch[2].padStart(2, '0')}-01`;
+      }
+    }
+
+    if (opts.shortDate) {
+      const m = String(opts.shortDate).match(/(\d{1,2})[.\-/](\d{1,2})/);
+      if (m) {
+        const yNum = opts.year && /^(?:19|20)\d{2}$/.test(opts.year) ? parseInt(opts.year, 10) : now.getFullYear();
+        const mo = m[1].padStart(2, '0');
+        const da = m[2].padStart(2, '0');
+        return `${yNum}-${mo}-${da}`;
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
+   * 获取作品院线/网络平台上线排期（优先复用上下文待映信息，缺失时回查豆瓣详情）
+   */
+  async getReleaseSchedule(
+    title: string,
+    hintSubject?: { releaseDate?: string; year?: string; isRerelease?: boolean }
+  ): Promise<{ releaseDate?: string; platforms?: string[] }> {
+    if (hintSubject && !hintSubject.isRerelease && hintSubject.releaseDate) {
+      const fastDate = DoubanService.parseReleaseDate({
+        shortDate: hintSubject.releaseDate,
+        year: hintSubject.year,
+      });
+      if (fastDate) {
+        return { releaseDate: fastDate };
+      }
+    }
+
+    const detail = await this.getSubjectFullDetail(title).catch(() => null);
+    if (!detail) return {};
+
+    const parsedDate = DoubanService.parseReleaseDate({
+      pubdates: detail.pubdate,
+      year: detail.year,
+    });
+    return {
+      releaseDate: parsedDate,
+      platforms: detail.linewatches,
+    };
+  }
 }

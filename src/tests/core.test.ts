@@ -1346,6 +1346,31 @@ test('DoubanService 全面接入待映/热映/口碑榜/Top250/深度详情/高�
     assert.ok(resolvedOutOfRange.error && resolvedOutOfRange.error.includes('超出范围'));
     const resolvedNoCtx = (sched as any).resolveTargetMovieTitle('__empty_ctx_user__', '蹲一下10');
     assert.ok(resolvedNoCtx.error && !resolvedNoCtx.title);
+
+    // 验证未上映档期解析与 4 档动态扫频策略
+    assert.equal(
+      DoubanService.parseReleaseDate({ pubdates: ['2026-12-16(中国大陆)', '2026-12-18(美国)'] }),
+      '2026-12-16'
+    );
+    assert.equal(DoubanService.parseReleaseDate({ shortDate: '12.16', year: '2026' }), '2026-12-16');
+
+    const nowTs = new Date('2026-11-17T12:00:00Z').getTime();
+    const dormantPlan = SchedulerService.computeAdaptiveWatchPlan('2026-12-16', nowTs);
+    assert.equal(dormantPlan.phase, 'pre_release_dormant');
+    assert.equal(dormantPlan.intervalMinutes, 1440);
+    assert.equal(dormantPlan.daysUntilRelease, 29);
+
+    const windowPlan = SchedulerService.computeAdaptiveWatchPlan('2026-11-20', nowTs);
+    assert.equal(windowPlan.phase, 'release_window');
+    assert.equal(windowPlan.intervalMinutes, 30);
+
+    const tailPlan = SchedulerService.computeAdaptiveWatchPlan('2026-10-01', nowTs);
+    assert.equal(tailPlan.phase, 'post_release_tail');
+    assert.equal(tailPlan.intervalMinutes, 360);
+
+    const manualPlan = SchedulerService.computeAdaptiveWatchPlan('2026-12-16', nowTs, 10);
+    assert.equal(manualPlan.phase, 'standard');
+    assert.equal(manualPlan.intervalMinutes, 10);
   } finally {
     (axios as any).get = origAxiosGet;
   }
