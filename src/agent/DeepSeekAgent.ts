@@ -1,7 +1,7 @@
 import OpenAI from 'openai';
 import { ResourceSearcher } from '../services/Searcher';
 import { QuarkService } from '../services/QuarkService';
-import { DoubanService } from '../services/DoubanService';
+import { DoubanService, DoubanChartType } from '../services/DoubanService';
 import { ChannelManager } from '../services/ChannelManager';
 import { CommandHandler } from '../commands/CommandHandler';
 import { SessionManager } from '../services/SessionManager';
@@ -699,6 +699,84 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'query_douban_cinema',
+            description:
+              '查询中国大陆院线「即将上映/待映电影」、「正在热映电影」，以及豆瓣「一周口碑电影榜」、「一周华语口碑剧集榜」、「一周全球口碑剧集榜」、「豆瓣电影 Top 250」。当用户问最近国内有什么快上映的电影、五一/春节档待映、电影院在放什么、本周口碑榜、Top 250 时必须调用！',
+            parameters: {
+              type: 'object',
+              properties: {
+                chart: {
+                  type: 'string',
+                  enum: ['upcoming', 'now_playing', 'weekly_movie', 'weekly_tv_chinese', 'weekly_tv_global', 'top250'],
+                  description:
+                    'upcoming=大陆即将上映/待映, now_playing=大陆正在热映, weekly_movie=一周口碑电影榜, weekly_tv_chinese=一周华语口碑剧集榜, weekly_tv_global=一周全球口碑剧集榜, top250=豆瓣电影Top250',
+                },
+                random_pick: {
+                  type: 'boolean',
+                  description: '是否从 Top250 或榜单中随机抽几部（如“Top250随机推一部”）',
+                },
+                limit: {
+                  type: 'number',
+                  description: '返回数量，默认 10',
+                },
+              },
+              required: ['chart'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'get_movie_deep_info',
+            description:
+              '查询某部电影或剧集的豆瓣深度信息：剧情简介、演职员、获奖荣誉、正版上线平台、豆瓣高赞短评口碑排雷、官方相似推荐（喜欢这部的人也喜欢）、以及剧集集数与更新完结进度。当用户问“《XX》讲什么的/值不值得看/口碑怎么样/拿过什么奖/有什么类似推荐/更到第几集/完结了没”时调用！',
+            parameters: {
+              type: 'object',
+              properties: {
+                title: {
+                  type: 'string',
+                  description: '目标电影或剧集片名（不带书名号）',
+                },
+                media_type: {
+                  type: 'string',
+                  enum: ['movie', 'tv'],
+                  description: '作品类型，不确定可省略',
+                },
+                focus: {
+                  type: 'string',
+                  enum: ['all', 'reviews', 'similar', 'episodes'],
+                  description: 'all=全面详情+热评+相似推荐, reviews=侧重高赞短评口碑排雷, similar=侧重相似影片, episodes=侧重剧集总集数与是否完结',
+                },
+              },
+              required: ['title'],
+            },
+          },
+        },
+        {
+          type: 'function',
+          function: {
+            name: 'search_celebrity_works',
+            description:
+              '按导演或演员姓名检索其豆瓣影人作品集。当用户问“诺兰拍过哪些电影”、“张译最近有什么剧”、“周星驰高分电影有哪些”时必须调用！',
+            parameters: {
+              type: 'object',
+              properties: {
+                name: {
+                  type: 'string',
+                  description: '导演或演员中文姓名（如 克里斯托弗·诺兰 / 诺兰 / 张译 / 周星驰）',
+                },
+                limit: {
+                  type: 'number',
+                  description: '返回作品数量，默认 10',
+                },
+              },
+              required: ['name'],
+            },
+          },
+        },
       ];
 
       const relay = RelayService.getInstance();
@@ -728,7 +806,10 @@ export class DeepSeekAgent {
 5. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
 6. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
 7. 当用户用自然语言表达自己喜欢/不喜欢什么样的【电影、电视剧、综艺、动漫、纪录片、题材、地区、导演、演员、代表作】（如“我平时喜欢看韩国悬疑电影和搞笑综艺”、“我爱看《漫长的季节》，不爱看恐怖片”），或让 bot 分析/查看自己的口味画像时，必须调用 update_user_taste_profile！
-8. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
+8. 当用户问国内院线「即将上映/待映新片」「正在热映」「一周口碑榜」「华语/全球口碑剧集榜」「豆瓣 Top 250」时，必须调用 query_douban_cinema 获取真实数据，严禁凭记忆瞎编或推脱说查不到！
+9. 当用户问某部作品「讲什么剧情、值不值得看、豆瓣短评评价/排雷、拿过什么奖、类似《XX》的电影、某部剧集总共多少集/完结没」时，调用 get_movie_deep_info！
+10. 当用户按导演或演员找作品（如“诺兰拍过哪些电影”“张译有什么剧”）时，调用 search_celebrity_works！
+11. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
         },
         ...chatHistory,
         { role: 'user', content: trimmed },
@@ -920,6 +1001,109 @@ export class DeepSeekAgent {
           }
           appendUserHistory(trimmed, profileReply);
           return profileReply;
+        } else if (toolCall.function.name === 'query_douban_cinema') {
+          const chartMap: Record<string, { type: DoubanChartType; title: string; media: 'movie' | 'tv'; showWishOrDate?: boolean; hint?: string }> = {
+            upcoming: {
+              type: 'movie_soon',
+              title: '🎬 大陆院线即将上映（豆瓣待映）',
+              media: 'movie',
+              showWishOrDate: true,
+              hint: '👉 想提前蹲哪部新片？回数字或说 **「蹲守第1部」**，出资源立刻微信喊你~',
+            },
+            now_playing: {
+              type: 'movie_showing',
+              title: '🎟️ 大陆院线正在热映（豆瓣实时）',
+              media: 'movie',
+              showWishOrDate: true,
+              hint: '👉 想看哪部直接回数字（如 **「1」**）我先帮你扒网盘或加入关注~',
+            },
+            weekly_movie: {
+              type: 'movie_weekly_best',
+              title: '🏆 豆瓣一周口碑电影榜',
+              media: 'movie',
+            },
+            weekly_tv_chinese: {
+              type: 'tv_chinese_best_weekly',
+              title: '📺 一周华语口碑剧集榜',
+              media: 'tv',
+            },
+            weekly_tv_global: {
+              type: 'tv_global_best_weekly',
+              title: '🌍 一周全球口碑剧集榜',
+              media: 'tv',
+            },
+            top250: {
+              type: 'movie_top250',
+              title: '💎 豆瓣电影 Top 250 精选',
+              media: 'movie',
+            },
+          };
+          const cfg = chartMap[String(args.chart || 'upcoming')] || chartMap.upcoming;
+          const limit = Math.min(15, Math.max(1, Number(args.limit) || (cfg.type === 'movie_soon' ? 12 : 10)));
+          const start = cfg.type === 'movie_top250' && args.random_pick ? Math.floor(Math.random() * 20) * 10 : 0;
+          const doubanSvc = new DoubanService();
+          let list = await doubanSvc.getDoubanChart(cfg.type, limit, start);
+          if (args.random_pick && list.length > 3) {
+            list = list.sort(() => Math.random() - 0.5).slice(0, 3);
+          }
+          this.sessionManager.setHot(userId, cfg.media, list, cfg.title, 1, list.length || limit);
+          if (list[0]?.title) {
+            this.sessionManager.setLastMentionedTitle(userId, list[0].title);
+          }
+          const cinemaReply = DoubanService.formatChartMarkdown(cfg.title, list, {
+            showWishOrDate: cfg.showWishOrDate,
+            hint: cfg.hint,
+          });
+          appendUserHistory(trimmed, cinemaReply);
+          return cinemaReply;
+        } else if (toolCall.function.name === 'get_movie_deep_info') {
+          const targetTitle = String(args.title || recentTitle || '').replace(/[《》]/g, '').trim();
+          const preferredType = args.media_type === 'movie' || args.media_type === 'tv' ? args.media_type : undefined;
+          const focus = String(args.focus || 'all');
+          const doubanSvc = new DoubanService();
+
+          const [detail, comments, similar] = await Promise.all([
+            doubanSvc.getSubjectFullDetail(targetTitle, preferredType),
+            focus === 'all' || focus === 'reviews' ? doubanSvc.getHotComments(targetTitle, preferredType, 5) : Promise.resolve([]),
+            focus === 'all' || focus === 'similar' ? doubanSvc.getSimilarSubjects(targetTitle, preferredType, 6) : Promise.resolve([]),
+          ]);
+
+          if (!detail) {
+            const missReply = `暂时没在豆瓣查到《${targetTitle || trimmed}》的详细条目，要不直接回 **「搜 ${targetTitle || trimmed}」** 我帮你全网翻找网盘资源？`;
+            appendUserHistory(trimmed, missReply);
+            return missReply;
+          }
+
+          this.sessionManager.setLastMentionedTitle(userId, detail.title);
+          if (similar.length > 0) {
+            this.sessionManager.setHot(userId, detail.type, similar, `类似《${detail.title}》`, 1, similar.length);
+          }
+
+          const deepReply = DoubanService.formatDeepDetailMarkdown({
+            detail,
+            comments: focus === 'similar' || focus === 'episodes' ? [] : comments,
+            similar: focus === 'reviews' || focus === 'episodes' ? [] : similar,
+          });
+          appendUserHistory(trimmed, deepReply);
+          return deepReply;
+        } else if (toolCall.function.name === 'search_celebrity_works') {
+          const personName = String(args.name || '').trim();
+          const limit = Math.min(15, Math.max(3, Number(args.limit) || 10));
+          const celeb = await new DoubanService().searchCelebrityWorks(personName, limit);
+          if (!celeb || celeb.works.length === 0) {
+            const missReply = `没在豆瓣找到「${personName || trimmed}」的作品单，你可以直接把具体片名发我，我帮你搜资源~`;
+            appendUserHistory(trimmed, missReply);
+            return missReply;
+          }
+          this.sessionManager.setHot(userId, 'movie', celeb.works, `${celeb.name}作品`, 1, celeb.works.length);
+          if (celeb.works[0]?.title) {
+            this.sessionManager.setLastMentionedTitle(userId, celeb.works[0].title);
+          }
+          const celebReply = DoubanService.formatChartMarkdown(`🎭 ${celeb.name} · 豆瓣代表作品`, celeb.works, {
+            hint: `👉 看中哪部直接回数字（如 **「1」**）我帮你搜网盘资源~`,
+          });
+          appendUserHistory(trimmed, celebReply);
+          return celebReply;
         }
       }
 

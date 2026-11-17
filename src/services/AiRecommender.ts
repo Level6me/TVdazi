@@ -426,7 +426,31 @@ export class AiRecommender {
     const startOffset = Math.max(0, ((page || 1) - 1) * 10);
     const tasks: Array<{ promise: Promise<DoubanSubject[]>; weight: number }> = [];
 
+    // 若用户提到「类似《XX》/像《XX》」，并发拉取豆瓣官方同好推荐列表
+    const similarMatch = slots.rawQuery.match(/(?:类似|像|同款|风格接近)\s*[《「]?([^》」\s，。！？?]{1,24})[》」]?/);
+    if (similarMatch && similarMatch[1]) {
+      const refTitle = similarMatch[1].replace(/(?:的电影|的剧|电视剧|电影|这样|那样|一样)$/g, '').trim();
+      if (refTitle.length >= 2) {
+        tasks.push({
+          promise: this.doubanService.getSimilarSubjects(refTitle, slots.mediaType, 10),
+          weight: 2.4,
+        });
+      }
+    }
+
     if (slots.timeScope === 'current_season') {
+      if (!slots.country && !slots.genre) {
+        const weeklyChart =
+          slots.mediaType === 'movie'
+            ? 'movie_weekly_best'
+            : slots.doubanTag === '国产剧'
+            ? 'tv_chinese_best_weekly'
+            : 'tv_global_best_weekly';
+        tasks.push({
+          promise: this.doubanService.getDoubanChart(weeklyChart, 10, 0),
+          weight: 1.7,
+        });
+      }
       // 【这两个月/最近正在热播/最新】：
       // 第一优先级：豆瓣实时热播榜 (search_subjects)，代表当前 1~2 个月内正在热播的剧集/电影
       tasks.push({
@@ -537,6 +561,12 @@ export class AiRecommender {
         });
       }
     } else if (slots.timeScope === 'classic') {
+      if (slots.mediaType === 'movie' && !slots.genre) {
+        tasks.push({
+          promise: this.doubanService.getDoubanChart('movie_top250', 12, startOffset),
+          weight: 1.9,
+        });
+      }
       tasks.push({
         promise: this.doubanService.getAdvancedCandidates({
           tags: slots.doubanTag,

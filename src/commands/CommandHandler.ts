@@ -80,7 +80,7 @@ export class CommandHandler {
 
     if (
       trimmed.startsWith('/') ||
-      /^(?:配置|帮助|排行榜|热门|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|片单抽签|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表|我的画像|观影画像|我的口味)(?:\s+.*)?$/i.test(
+      /^(?:配置|帮助|排行榜|热门|热映|正在热映|待映|即将上映|口碑榜|一周口碑榜|top250|豆瓣top250|追剧|追剧清单|我的追剧|片单|我的片单|查看片单|片单抽签|修改目录|设置目录|保存目录|转存目录|画质偏好|设置画质|控制台|找字幕|通讯录|用户列表|我的画像|观影画像|我的口味)(?:\s+.*)?$/i.test(
         trimmed
       ) ||
       /^(?:我叫|叫我|我的名字叫|我的名字是)\s*[^\s，。！!？?]{1,20}$/.test(trimmed) ||
@@ -285,6 +285,37 @@ export class CommandHandler {
       }
 
       return await this.renderHot(type, tag, userId);
+    }
+
+    if (['/热映', '热映', '正在热映'].includes(cmd)) {
+      const list = await this.doubanService.getNowPlaying(10);
+      this.sessionManager.setHot(userId, 'movie', list, '正在热映', 1, 10);
+      return DoubanService.formatChartMarkdown('🎟️ 大陆院线正在热映（豆瓣实时）', list, {
+        showWishOrDate: true,
+        hint: '👉 想看哪部直接回数字（如 **「1」**）搜资源或加入蹲守~',
+      });
+    }
+
+    if (['/待映', '待映', '即将上映'].includes(cmd)) {
+      const list = await this.doubanService.getUpcomingMovies(12);
+      this.sessionManager.setHot(userId, 'movie', list, '即将上映', 1, 12);
+      return DoubanService.formatChartMarkdown('🎬 大陆院线即将上映（豆瓣待映）', list, {
+        showWishOrDate: true,
+        hint: '👉 想提前盯哪部新片？直接说 **「蹲守第1部」** 或回数字先搜看看~',
+      });
+    }
+
+    if (['/口碑榜', '口碑榜', '一周口碑榜'].includes(cmd)) {
+      const list = await this.doubanService.getDoubanChart('movie_weekly_best', 10, 0);
+      this.sessionManager.setHot(userId, 'movie', list, '一周口碑榜', 1, 10);
+      return DoubanService.formatChartMarkdown('🏆 豆瓣一周口碑电影榜', list);
+    }
+
+    if (['/top250', 'top250', '豆瓣top250'].includes(cmd)) {
+      const randomStart = Math.floor(Math.random() * 10) * 10;
+      const list = await this.doubanService.getDoubanChart('movie_top250', 10, randomStart);
+      this.sessionManager.setHot(userId, 'movie', list, '豆瓣Top250', 1, 10);
+      return DoubanService.formatChartMarkdown('💎 豆瓣电影 Top 250 精选', list);
     }
 
     if (['/search', '/搜索', '搜', '搜索'].includes(cmd)) {

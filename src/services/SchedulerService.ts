@@ -583,6 +583,18 @@ export class SchedulerService {
     const prevEp = task.lastEpisode || 0;
     const knownIds = new Set(task.knownShareIds || []);
 
+    // 查询豆瓣剧集总集数与完结进度，辅助判断全集完结并展示官方进度
+    const epProg = await Promise.race([
+      new DoubanService().getEpisodeProgress(keyword).catch(() => null),
+      new Promise<null>((resolve) => setTimeout(() => resolve(null), 2200)),
+    ]);
+    if (epProg?.isFinished && epProg.episodesCount && highestEp >= epProg.episodesCount) {
+      completeFlag = true;
+    }
+    const doubanEpLine = epProg
+      ? `📖 豆瓣官方进度：${epProg.episodesInfo || (epProg.episodesCount ? `共 ${epProg.episodesCount} 集` : '连载中')}${epProg.isFinished ? '（已完结）' : ''}`
+      : '';
+
     // 判断是否有新集数更新（仅当明确识别到更高集数，或首次完全未见过资源时才触发通知，避免无集号分享换链接反复轰炸）
     const hasNewEpisode = highestEp > prevEp || (prevEp === 0 && knownIds.size === 0);
 
@@ -593,9 +605,12 @@ export class SchedulerService {
           `📺 【智能追更状态】《${keyword}》`,
           `─────────────────────────`,
           `📌 当前全网最新进度：${highestEp > 0 ? `更至第 ${highestEp} 集` : '暂无明确集数标号（已为你备好当前活链）'}`,
+          doubanEpLine,
           `✅ 你已同步过该进度（上次记录：${prevEp > 0 ? `第 ${prevEp} 集` : '已收录'}）。`,
           `💡 一旦后续放出第 ${highestEp + 1} 集或新更新包，我会自动为你转存网盘并推送微信消息！`,
-        ].join('\n');
+        ]
+          .filter(Boolean)
+          .join('\n');
       }
       return null;
     }
@@ -633,6 +648,7 @@ export class SchedulerService {
       `📣 【热播追更提醒】你追的《${keyword}》更新啦！`,
       `─────────────────────────`,
       `🆕 最新进度：${epText}`,
+      doubanEpLine,
       `🎬 资源版本：${bestCandidate.title}`,
       saveDetail,
       `─────────────────────────`,

@@ -13,6 +13,7 @@ import { encodeWechatMediaAesKey } from '../wechat/CdnUpload';
 import { WeixinBot } from '../wechat/WeixinBot';
 import { isAllowedPosterUrl, detectImageMimeAndExt, sendCoverToWechatUser } from '../utils/PosterHelper';
 import { MetadataResolver } from '../services/MetadataResolver';
+import { DoubanService } from '../services/DoubanService';
 
 import { maskSensitive } from '../utils/Logger';
 import { LruCache } from '../utils/LruCache';
@@ -1116,4 +1117,182 @@ test('AiRecommender.formatChattyParagraphs 将拥挤长段落自动拆分为清�
   assert.ok(parts[0].includes('《欢迎来龙餐馆》'));
   assert.ok(parts[1].includes('8.7分'));
   assert.ok(parts[2].includes('换一部'));
+});
+
+test('DoubanService 全面接入待映/热映/口碑榜/Top250/深度详情/高赞短评/相似推荐/影人/分集进度及快捷指令', async () => {
+  const origAxiosGet = axios.get;
+  try {
+    (axios as any).get = async (reqUrl: string, config?: any) => {
+      if (reqUrl.includes('/subject_collection/movie_soon/items')) {
+        return {
+          data: {
+            subject_collection_items: [
+              {
+                id: '35211934',
+                title: '深度安静',
+                year: '2025',
+                release_date: '11.19',
+                wish_count: 11756,
+                card_subtitle: '2025 / 中国台湾 / 剧情 / 沈可尚 / 张孝全 林依晨',
+                rating: { value: 6.8 },
+                cover: { url: 'https://img3.doubanio.com/view/photo/m_ratio_poster/public/p1.jpg' },
+                type: 'movie',
+              },
+            ],
+          },
+        };
+      }
+      if (reqUrl.includes('/subject_collection/movie_showing/items')) {
+        return {
+          data: {
+            subject_collection_items: [
+              {
+                id: '37409137',
+                title: '热映新片',
+                year: '2026',
+                release_date: '11.14',
+                card_subtitle: '2026 / 中国大陆 / 喜剧 / 张三',
+                rating: { value: 7.9 },
+                type: 'movie',
+              },
+            ],
+          },
+        };
+      }
+      if (reqUrl.includes('/subject_collection/movie_weekly_best/items') || reqUrl.includes('/subject_collection/movie_top250/items')) {
+        return {
+          data: {
+            subject_collection_items: [
+              {
+                id: '1292052',
+                title: '肖申克的救赎',
+                year: '1994',
+                card_subtitle: '1994 / 美国 / 剧情 犯罪 / 弗兰克',
+                rating: { value: 9.7 },
+                comment: '自由与希望的经典颂歌',
+                type: 'movie',
+              },
+            ],
+          },
+        };
+      }
+      if (reqUrl.includes('subject_suggest')) {
+        if (config?.params?.q === '诺兰') {
+          return {
+            data: [{ id: '1054524', title: '克里斯托弗·诺兰', type: 'celebrity', img: 'https://img2.doubanio.com/p21241.jpg' }],
+          };
+        }
+        return {
+          data: [{ id: '36155236', title: '伟大的长征', year: '2026', type: 'tv', img: 'https://img3.doubanio.com/p123.jpg' }],
+        };
+      }
+      if (reqUrl.includes('/celebrity/1054524/works')) {
+        return {
+          data: {
+            works: [
+              {
+                roles: ['导演', '编剧'],
+                work: {
+                  id: '1889243',
+                  title: '星际穿越',
+                  year: '2014',
+                  rating: { value: 9.4 },
+                  card_subtitle: '2014 / 美国 / 科幻 冒险',
+                  type: 'movie',
+                },
+              },
+            ],
+          },
+        };
+      }
+      if (reqUrl.includes('/tv/36155236/recommendations')) {
+        return {
+          data: [
+            {
+              id: '999999',
+              title: '觉醒年代',
+              year: '2021',
+              rating: { value: 9.3 },
+              card_subtitle: '2021 / 中国大陆 / 历史',
+              type: 'tv',
+            },
+          ],
+        };
+      }
+      if (reqUrl.includes('/tv/36155236/interests')) {
+        return {
+          data: {
+            interests: [
+              { user: { name: '影迷A' }, rating: { value: 5 }, comment: '史诗质感拉满，群像极稳！', vote_count: 320 },
+            ],
+          },
+        };
+      }
+      if (reqUrl.includes('/tv/36155236')) {
+        return {
+          data: {
+            id: '36155236',
+            title: '伟大的长征',
+            is_tv: true,
+            year: '2026',
+            pubdate: ['2026-10-09(中国大陆)'],
+            episodes_count: 60,
+            episodes_info: '60集全',
+            genres: ['剧情', '历史'],
+            countries: ['中国大陆'],
+            rating: { value: 8.8, count: 20899 },
+            intro: '全景展现长征波澜壮阔历史的史诗剧集。',
+            directors: [{ name: '张永新' }],
+            actors: [{ name: '于和伟' }],
+            honor_infos: [{ title: '一周华语口碑剧集榜', rank: 1 }],
+            linewatches: [{ source: { name: '腾讯视频' } }],
+          },
+        };
+      }
+      return { data: {} };
+    };
+
+    const ds = new DoubanService();
+    const soon = await ds.getUpcomingMovies(5);
+    assert.equal(soon.length, 1);
+    assert.equal(soon[0].releaseDate, '11.19');
+    assert.equal(soon[0].wishCount, 11756);
+
+    const showing = await ds.getNowPlaying(5);
+    assert.equal(showing[0].title, '热映新片');
+
+    const top = await ds.getDoubanChart('movie_top250', 5);
+    assert.equal(top[0].title, '肖申克的救赎');
+    assert.equal(top[0].rate, '9.7');
+
+    const ep = await ds.getEpisodeProgress('伟大的长征');
+    assert.equal(ep?.episodesCount, 60);
+    assert.equal(ep?.isFinished, true);
+
+    const detail = await ds.getSubjectFullDetail('36155236', 'tv');
+    const comments = await ds.getHotComments('36155236', 'tv', 3);
+    const similar = await ds.getSimilarSubjects('36155236', 'tv', 3);
+    assert.ok(detail && detail.honors[0].includes('一周华语口碑剧集榜'));
+    assert.equal(comments[0].content, '史诗质感拉满，群像极稳！');
+    assert.equal(similar[0].title, '觉醒年代');
+
+    const md = DoubanService.formatDeepDetailMarkdown({ detail: detail!, comments, similar });
+    assert.ok(md.includes('**🎬 《伟大的长征》**'));
+    assert.ok(md.includes('60集全'));
+    assert.ok(md.includes('觉醒年代'));
+
+    const celeb = await ds.searchCelebrityWorks('诺兰', 5);
+    assert.equal(celeb?.name, '克里斯托弗·诺兰');
+    assert.equal(celeb?.works[0].title, '星际穿越');
+
+    const handler = new CommandHandler();
+    assert.equal(handler.isCommand('/待映', '__douban_cmd_u__'), true);
+    assert.equal(handler.isCommand('正在热映', '__douban_cmd_u__'), true);
+    assert.equal(handler.isCommand('/top250', '__douban_cmd_u__'), true);
+    const soonText = await handler.handle('/待映', '__douban_cmd_u__');
+    assert.ok(soonText.includes('深度安静'));
+    assert.ok(soonText.includes('11.19上映'));
+  } finally {
+    (axios as any).get = origAxiosGet;
+  }
 });
