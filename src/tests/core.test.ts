@@ -1066,3 +1066,62 @@ test('MetadataResolver.extractMediaQuery 能准确剥离网盘画质与标签噪
     year: undefined,
   });
 });
+
+test('CommandHandler.renderHot 单部推荐自动配发影视海报封面，多部榜单不刷屏', async () => {
+  const { AiRecommender } = require('../services/AiRecommender');
+  const recommender = AiRecommender.getInstance();
+  const origGenerate = recommender.generateXiaohongshuNote;
+  const origAxiosGet = axios.get;
+  const pngBytes = await QRCode.toBuffer('https://movie.douban.com/subject/3541415/', { width: 120 });
+  const sentImages: Array<{ to: string; existsAtSend: boolean }> = [];
+
+  try {
+    (axios as any).get = async () => ({ data: pngBytes });
+    PushGateway.getInstance().registerImageSender(async (to, imgPath) => {
+      sentImages.push({ to, existsAtSend: fs.existsSync(imgPath) });
+      return true;
+    });
+
+    const handler = new CommandHandler();
+    recommender.generateXiaohongshuNote = async () => ({
+      title: '欢迎来龙餐馆',
+      items: [],
+      formattedNote: '给你推荐《欢迎来龙餐馆》~',
+      subjects: [
+        {
+          id: '35633851',
+          title: '欢迎来龙餐馆',
+          rate: '8.7',
+          year: '2026',
+          cover: 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/p2935109312.jpg',
+          url: '',
+        },
+      ],
+      slots: { mediaType: 'movie', doubanTag: '热门', count: 1 },
+    });
+
+    const reply1 = await handler.renderHot('movie', '热门', '__rec_cover_user__', 1, undefined, '给我推荐一部电影');
+    assert.ok(reply1.includes('欢迎来龙餐馆'));
+    assert.equal(sentImages.length, 1);
+    assert.equal(sentImages[0].to, '__rec_cover_user__');
+    assert.equal(sentImages[0].existsAtSend, true);
+
+    // 多部榜单不应连发多张图片刷屏
+    recommender.generateXiaohongshuNote = async () => ({
+      title: '热门榜单',
+      items: [],
+      formattedNote: '热门片单如下...',
+      subjects: [
+        { id: '1', title: 'A', rate: '8.5', cover: 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/p1.jpg', url: '' },
+        { id: '2', title: 'B', rate: '8.6', cover: 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/p2.jpg', url: '' },
+      ],
+      slots: { mediaType: 'movie', doubanTag: '热门', count: 2 },
+    });
+    await handler.renderHot('movie', '热门', '__rec_cover_user__', 1);
+    assert.equal(sentImages.length, 1);
+  } finally {
+    recommender.generateXiaohongshuNote = origGenerate;
+    (axios as any).get = origAxiosGet;
+    PushGateway.getInstance().registerImageSender(null);
+  }
+});

@@ -10,6 +10,7 @@ import { CategoryClassifier, ResourceCategory } from './CategoryClassifier';
 import { CloudResource } from '../types';
 import { SerializedJsonStore } from '../utils/StorageQueue';
 import { ScheduleTimeParser } from './scheduler/ScheduleTimeParser';
+import { sendCoverToWechatUser } from '../utils/PosterHelper';
 
 export type TaskType =
   | 'daily_recommend'   // 场景1：每日/周期定时推送指定类型影视推荐
@@ -402,6 +403,17 @@ export class SchedulerService {
     });
 
     this.sessionManager.setHot(task.userId, mediaType, result.subjects, tag, randomPage, 6, query);
+
+    if (result.subjects && result.subjects.length === 1) {
+      const s = result.subjects[0];
+      await sendCoverToWechatUser(task.userId, {
+        title: s.title,
+        knownCover: s.cover,
+        year: s.year,
+        mediaType,
+        timeoutMs: 2800,
+      }).catch(() => false);
+    }
 
     let autoSaveNotice = '';
     if (task.autoSave && result.subjects && result.subjects.length > 0) {

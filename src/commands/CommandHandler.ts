@@ -1264,6 +1264,19 @@ export class CommandHandler {
     });
 
     this.sessionManager.setHot(userId, type, result.subjects, tag, page, 6, query);
+
+    // 单部精准推片时顺带发一张影视海报封面（多部榜单不刷屏；无图或超时静默降级）
+    if (result.subjects && result.subjects.length === 1) {
+      const s = result.subjects[0];
+      await sendCoverToWechatUser(userId, {
+        title: s.title,
+        knownCover: s.cover,
+        year: s.year,
+        mediaType: type,
+        timeoutMs: 2800,
+      }).catch(() => false);
+    }
+
     return result.formattedNote;
   }
 
