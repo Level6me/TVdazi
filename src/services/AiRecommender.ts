@@ -2,6 +2,11 @@ import { UserManager } from './UserManager';
 import { DoubanService, DoubanSubject } from './DoubanService';
 import { UserProfileService } from './UserProfileService';
 import { LlmClientFactory } from '../utils/LlmClientFactory';
+import {
+  getDoubanSubjectId,
+  getRecommendationSubjectKey,
+  normalizeRecommendationTitle,
+} from '../utils/RecommendationUtils';
 
 export type TimeScope = 'current_season' | 'this_year' | 'last_year' | 'custom_year' | 'classic' | 'mixed';
 
@@ -40,8 +45,6 @@ export class AiRecommender {
   private static instance: AiRecommender;
   private userManager: UserManager;
   private doubanService: DoubanService;
-  // 记录每个用户近期已推荐过的片名，实现“换一部/换一批”与多轮推荐自动去重
-  private recommendedHistory: Map<string, Set<string>> = new Map();
   // 记录每个用户上一次推荐的意图槽位，用于多轮追问（如“换一部悬疑的”、“不要古装的”）自动继承上下文
   private lastUserSlots: Map<string, IntentSlots> = new Map();
 
@@ -274,11 +277,13 @@ export class AiRecommender {
     // 5. 解析否定题材约束 (excludeGenres)、豆瓣标准类型 (genre) 与细分题材标签 (subTheme)
     const excludeGenres: string[] = isFollowUp && prevSlots ? [...prevSlots.excludeGenres] : [];
     const allGenres = [
-      { key: '古装', pattern: /古装|仙侠|古偶|宫斗/ },
+      { key: '古装', pattern: /古装|宫斗|权谋|宅斗/ },
+      { key: '仙侠', pattern: /仙侠|古偶|修仙/ },
       { key: '爱情', pattern: /爱情|甜宠|恋爱|偶像/ },
       { key: '悬疑', pattern: /悬疑|推理|烧脑|破案|刑侦/ },
       { key: '犯罪', pattern: /犯罪|黑帮|警匪|扫黑/ },
-      { key: '恐怖', pattern: /惊悚|恐怖|吓人|灵异|鬼片/ },
+      { key: '惊悚', pattern: /惊悚|心理战/ },
+      { key: '恐怖', pattern: /恐怖|吓人|灵异|鬼片/ },
       { key: '喜剧', pattern: /喜剧|搞笑|沙雕|无厘头/ },
       { key: '科幻', pattern: /科幻|太空|赛博|外星|机甲/ },
       { key: '动作', pattern: /动作|打斗|格斗|爽片/ },
@@ -286,12 +291,18 @@ export class AiRecommender {
       { key: '奇幻', pattern: /奇幻|魔幻|玄幻/ },
       { key: '冒险', pattern: /冒险|探险|盗墓/ },
       { key: '灾难', pattern: /灾难|末日|丧尸/ },
-      { key: '历史', pattern: /历史|年代|朝代/ },
-      { key: '战争', pattern: /战争|抗战|军旅|谍战/ },
+      { key: '历史', pattern: /历史|朝代/ },
+      { key: '年代', pattern: /年代|复古|怀旧/ },
+      { key: '战争', pattern: /战争|抗战|军旅/ },
+      { key: '谍战', pattern: /谍战|特务|潜伏/ },
+      { key: '西部', pattern: /西部|牛仔/ },
       { key: '传记', pattern: /传记|真实事件|真实改编/ },
       { key: '家庭', pattern: /家庭|亲情|生活|伦理/ },
+      { key: '青春', pattern: /青春|校园|成长/ },
+      { key: '职场', pattern: /职场|商战|律政|医疗/ },
       { key: '运动', pattern: /运动|体育|竞技|热血/ },
       { key: '音乐', pattern: /音乐|歌舞/ },
+      { key: '美食', pattern: /美食|料理|旅行/ },
       { key: '动画', pattern: /动画|动漫/ },
     ];
 
@@ -379,17 +390,37 @@ export class AiRecommender {
     page: number = 1
   ): Promise<DoubanSubject[]> {
     const { year: currentYear } = this.getCurrentYearAndMonth();
-    const excludeSet = new Set<string>();
+    const excludedSavedTitles = new Set<string>();
+    let recentRecommendations: NonNullable<ReturnType<UserManager['getUserPlan']>['recommendationHistory']> = [];
     if (userId) {
       const plan = this.userManager.getUserPlan(userId);
       for (const w of plan.watchlist || []) {
-        excludeSet.add(w.title.trim());
+        const normalizedTitle = normalizeRecommendationTitle(w.title);
+        if (normalizedTitle) excludedSavedTitles.add(normalizedTitle);
       }
-      const hist = this.recommendedHistory.get(userId);
-      if (hist) {
-        for (const t of hist) excludeSet.add(t);
+      const cutoff = Date.now() - 30 * 24 * 60 * 60 * 1000;
+      const history = plan.recommendationHistory || [];
+      recentRecommendations = history.filter((item) => item.recommendedAt >= cutoff && item.title);
+      if (recentRecommendations.length !== history.length) {
+        plan.recommendationHistory = recentRecommendations;
+        this.userManager.saveUserPlan(plan);
       }
     }
+
+    const isExcluded = (item: DoubanSubject, ignoreHistory: boolean): boolean => {
+      const normalizedTitle = normalizeRecommendationTitle(item.title);
+      if (!normalizedTitle || excludedSavedTitles.has(normalizedTitle)) return true;
+      if (ignoreHistory) return false;
+      const itemId = getDoubanSubjectId(item);
+      const itemYear = String(item.year || '').match(/(?:19|20)\d{2}/)?.[0];
+      return recentRecommendations.some((record) => {
+        const recordId = getDoubanSubjectId({ id: record.id || '', title: record.title, rate: '', cover: '', url: '' });
+        if (itemId && recordId) return itemId === recordId;
+        if (normalizeRecommendationTitle(record.title) !== normalizedTitle) return false;
+        const recordYear = String(record.year || '').match(/(?:19|20)\d{2}/)?.[0];
+        return !itemYear || !recordYear || itemYear === recordYear;
+      });
+    };
 
     const hotTag = this.resolveDoubanHotTag(slots);
     const startOffset = Math.max(0, ((page || 1) - 1) * 10);
@@ -562,29 +593,55 @@ export class AiRecommender {
 
     const settled = await Promise.allSettled(tasks.map((t) => t.promise));
     const collectCandidates = (ignoreHistory: boolean) => {
-      const map = new Map<string, { subject: DoubanSubject; score: number }>();
+      const map = new Map<string, { subject: DoubanSubject; score: number; ratingSignal: number }>();
+      const titleAliases = new Map<string, string>();
       settled.forEach((res, idx) => {
         const weight = tasks[idx].weight;
         if (res.status === 'fulfilled' && Array.isArray(res.value)) {
           res.value.forEach((item, rankIdx) => {
             const cleanTitle = (item.title || '').trim();
-            if (!cleanTitle || (!ignoreHistory && excludeSet.has(cleanTitle))) return;
+            if (!cleanTitle || isExcluded(item, ignoreHistory)) return;
 
             const rateNum = parseFloat(item.rate) || 0;
             if (rateNum > 0 && rateNum < 6.2) return;
 
-            const rankScore = Math.max(0, 20 - rankIdx) * weight;
-            const ratingBonus = rateNum >= 7.0 ? rateNum * 2.8 : rateNum > 0 ? rateNum * 1.8 : 16;
-            const totalScore = rankScore + ratingBonus;
-
-            if (map.has(cleanTitle)) {
-              const existing = map.get(cleanTitle)!;
-              existing.score += 14;
-              if (!existing.subject.actors && item.actors) existing.subject.actors = item.actors;
-              if (!existing.subject.id && item.id) existing.subject.id = item.id;
+            const normalizedTitle = normalizeRecommendationTitle(cleanTitle);
+            const itemYear = String(item.year || '').match(/(?:19|20)\d{2}/)?.[0] || '';
+            const alias = `${normalizedTitle}|${itemYear}`;
+            const canonicalKey = getRecommendationSubjectKey(item);
+            const itemId = getDoubanSubjectId(item);
+            const aliasKey = titleAliases.get(alias) || (!itemYear ? undefined : titleAliases.get(`${normalizedTitle}|`));
+            const aliased = aliasKey ? map.get(aliasKey) : undefined;
+            const aliasedId = aliased ? getDoubanSubjectId(aliased.subject) : undefined;
+            const canMergeAlias = Boolean(aliased && (!itemId || !aliasedId || itemId === aliasedId));
+            const key = map.has(canonicalKey) ? canonicalKey : canMergeAlias ? aliasKey! : canonicalKey;
+            // 倒数排名融合：榜单位置可比，重复出现在榜单中的收益自然递减，不再额外叠加固定大分。
+            const reciprocalRankScore = (1000 * weight) / (60 + rankIdx + 1);
+            // 豆瓣评分仅作有界、以 7 分为中性的辅助信号；无评分不再获得虚假的正向加分。
+            const ratingSignal = rateNum > 0 ? Math.max(-3, Math.min(4, (rateNum - 7) * 2)) : 0;
+            const existing = map.get(key);
+            if (existing) {
+              existing.score += reciprocalRankScore;
+              const nextRatingSignal = Math.max(existing.ratingSignal, ratingSignal);
+              existing.score += nextRatingSignal - existing.ratingSignal;
+              existing.ratingSignal = nextRatingSignal;
+              const target = existing.subject;
+              if (!getDoubanSubjectId(target) && getDoubanSubjectId(item)) target.id = item.id;
+              if (!target.year && item.year) target.year = item.year;
+              if (!target.rate && item.rate) target.rate = item.rate;
+              if (!target.actors && item.actors) target.actors = item.actors;
+              if (!target.directors && item.directors) target.directors = item.directors;
+              if (!target.types?.length && item.types?.length) target.types = item.types;
+              if (!target.region && item.region) target.region = item.region;
             } else {
-              map.set(cleanTitle, { subject: { ...item }, score: totalScore });
+              map.set(key, {
+                subject: { ...item },
+                score: reciprocalRankScore + ratingSignal,
+                ratingSignal,
+              });
             }
+            if (!titleAliases.has(alias)) titleAliases.set(alias, key);
+            if (!itemYear && !titleAliases.has(`${normalizedTitle}|`)) titleAliases.set(`${normalizedTitle}|`, key);
           });
         }
       });
@@ -592,19 +649,22 @@ export class AiRecommender {
     };
 
     let mergedMap = collectCandidates(false);
-    // 若用户多次点击“换一批”导致当前页候选不足，保留最近 5 条防立刻复推并适度放宽去重（不粗暴清空全部历史）
+    // 候选不足时只放宽“近期推荐”过滤，已在片单中的作品仍始终排除。
     if (mergedMap.size < slots.count) {
-      if (userId) {
-        const hist = this.recommendedHistory.get(userId);
-        if (hist && hist.size > 5) {
-          const recentKeep = Array.from(hist).slice(-5);
-          this.recommendedHistory.set(userId, new Set(recentKeep));
-        }
-      }
       mergedMap = collectCandidates(true);
     }
 
-    const initialRanked = Array.from(mergedMap.values()).sort((a, b) => b.score - a.score);
+    const profileService = UserProfileService.getInstance();
+    const initialRanked = Array.from(mergedMap.values()).sort((a, b) => {
+      const selectionScore = (entry: typeof a) => {
+        if (!userId) return entry.score;
+        const profileScore = profileService.scoreCandidate(userId, entry.subject);
+        if (profileScore === -Infinity) return -Infinity;
+        return entry.score + Math.max(-12, Math.min(27, profileScore * 1.5));
+      };
+      return selectionScore(b) - selectionScore(a);
+    });
+    // 先用轻量画像分参与候选截断，再补详情；不增加外部请求数量。
     const topPool = initialRanked.slice(0, 22);
 
     // 限流并发拉取豆瓣单条目真实详情摘要 (release_year / types / actors / shortComment)，降低集中请求被限流概率
@@ -680,27 +740,102 @@ export class AiRecommender {
     }
 
     verified.sort((a, b) => b.score - a.score);
-    return UserProfileService.getInstance().rerankWithMMR(
+    return profileService.rerankWithMMR(
       userId,
       verified,
       Math.max(slots.count * 2 + 4, 12)
     );
   }
 
-  private recordRecommended(userId: string | undefined, titles: string[]): void {
+  private recordRecommended(userId: string | undefined, subjects: DoubanSubject[]): void {
     if (!userId) return;
-    let set = this.recommendedHistory.get(userId);
-    if (!set) {
-      set = new Set<string>();
-      this.recommendedHistory.set(userId, set);
+    const plan = this.userManager.getUserPlan(userId);
+    const now = Date.now();
+    const cutoff = now - 30 * 24 * 60 * 60 * 1000;
+    const history = (plan.recommendationHistory || []).filter((item) => item.recommendedAt >= cutoff);
+    for (const subject of subjects) {
+      const title = String(subject.title || '').trim();
+      if (!title) continue;
+      const id = getDoubanSubjectId(subject);
+      const year = String(subject.year || '').match(/(?:19|20)\d{2}/)?.[0];
+      const existingIndex = history.findIndex((item) => {
+        const existingId = item.id && /^\d+$/.test(item.id) ? item.id : undefined;
+        if (id && existingId) return id === existingId;
+        if (normalizeRecommendationTitle(item.title) !== normalizeRecommendationTitle(title)) return false;
+        const existingYear = String(item.year || '').match(/(?:19|20)\d{2}/)?.[0];
+        return !year || !existingYear || year === existingYear;
+      });
+      if (existingIndex >= 0) history.splice(existingIndex, 1);
+      history.push({ title, id, year, recommendedAt: now });
     }
-    if (set.size > 35) {
-      set.clear();
+    plan.recommendationHistory = history.slice(-100);
+    this.userManager.saveUserPlan(plan);
+  }
+
+  /**
+   * 将密密麻麻的长段落按自然句界拆分为 2~3 个舒适短段（保留书名号与引号完整性），提升微信端可读性
+   */
+  public static formatChattyParagraphs(text: string): string {
+    const clean = String(text || '')
+      .replace(/\r\n/g, '\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+    if (!clean) return '';
+
+    const paragraphs = clean
+      .split(/\n{2,}/)
+      .map((p) => p.trim())
+      .filter(Boolean);
+
+    const out: string[] = [];
+    for (const para of paragraphs) {
+      if (para.includes('\n') || para.length <= 95) {
+        out.push(para);
+        continue;
+      }
+
+      // 按中英文句末标点切分整段，注意不切碎《...》或“...”内部
+      const sentences: string[] = [];
+      let buf = '';
+      let quoteDepth = 0;
+      for (let i = 0; i < para.length; i++) {
+        const ch = para[i];
+        buf += ch;
+        if (ch === '“' || ch === '「' || ch === '《') quoteDepth++;
+        else if ((ch === '”' || ch === '」' || ch === '》') && quoteDepth > 0) quoteDepth--;
+
+        const nextCh = para[i + 1] || '';
+        const isEnd = (ch === '。' || ch === '！' || ch === '？' || ch === '~') && quoteDepth === 0;
+        if (isEnd && !/[”」》~。！？]/.test(nextCh)) {
+          const s = buf.trim();
+          if (s) sentences.push(s);
+          buf = '';
+        }
+      }
+      if (buf.trim()) sentences.push(buf.trim());
+
+      if (sentences.length <= 2) {
+        out.push(para);
+        continue;
+      }
+
+      // 第1句单独作开场，中间看点合并成段，末句提示单独成段
+      const first = sentences[0];
+      const last = sentences[sentences.length - 1];
+      const middle = sentences.slice(1, -1).join('');
+      const hasActionTail = /(?:回个?|回复|换一部|换一批|转存|夸克|搜好|存好)/.test(last);
+
+      if (hasActionTail && middle) {
+        out.push(first, middle, last);
+      } else if (hasActionTail) {
+        out.push(sentences.slice(0, -1).join(''), last);
+      } else {
+        const splitAt = Math.ceil(sentences.length / 2);
+        out.push(sentences.slice(0, splitAt).join(''), sentences.slice(splitAt).join(''));
+      }
     }
-    for (const t of titles) {
-      const clean = t.replace(/[《》""''「」]/g, '').trim();
-      if (clean) set.add(clean);
-    }
+
+    return out.filter(Boolean).join('\n\n');
   }
 
   /**
@@ -791,8 +926,12 @@ ${profileSummary ? `【该用户的长期观影画像（用于个性化贴合，
 【用户当前说的原话】："${slots.rawQuery}"
 ${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` : ''}
 【你必须遵守的核心原则】：
-1. **真正理解用户的意思，拒绝机械式套格式**：
+1. **真正理解用户的意思，排版清爽有呼吸感（严禁挤成一大坨文字墙）**：
    - 绝对不要输出冷冰冰的表单卡片！**严禁**出现“🎯 为你精选...”、“----”分割线、“🎬 片名：”、“🏷️ 标签：”、“⭐ 评分：”、“🔥 推荐理由：”这种机械模板前缀！
+   - 手机微信阅读务必留白分层！当推荐 1 部时，请分成 **3 个轻巧短段（用空行 \\n\\n 隔开）**：
+     - 第 1 段：用一句轻巧标题/开场引出作品，例如「🎬《片名》（年份 · ⭐ 8.7分）」或自然的一句话开场；
+     - 第 2 段：像朋友一样口语化聊 1~2 句剧情看点与口碑亮点（控制在 2~3 句话内）；
+     - 第 3 段：单独一行轻巧收尾引导转存或换片。
    - 要顺着用户的原话自然接话（例如用户指定了具体剧情设定、“类似《XX》”、年份或类型，就在聊天中自然点出这些作品在剧情设定、人物张力或反转节奏上为什么正好戳中他的需求）。
 2. **严格遵守数量、年份与剧情设定要求**：
    - 用户要求的推荐数量：**${slots.count} 部**（如果 count=1，正文中重点只推荐 1 部最匹配的，绝不要罗列五六部！如果 count>1，用清爽的 1. 《片名》... 2. 《片名》... 自然分段介绍 ${slots.count} 部）。
@@ -844,13 +983,11 @@ ${candidateContext}
           }
 
           const cleanTitles = rawTitles.map((t) => String(t).replace(/[《》""''「」]/g, '').trim()).filter(Boolean);
-          this.recordRecommended(userId, cleanTitles);
 
           const subjects: DoubanSubject[] = await Promise.all(
             cleanTitles.map(async (title) => {
-              const matched = topCandidates.find(
-                (c) => c.title === title || c.title.includes(title) || title.includes(c.title)
-              );
+              const normalizedTitle = normalizeRecommendationTitle(title);
+              const matched = topCandidates.find((c) => normalizeRecommendationTitle(c.title) === normalizedTitle);
               if (matched) return matched;
 
               const enriched = await this.doubanService.searchAndEnrichSubjectByTitle(title);
@@ -866,6 +1003,8 @@ ${candidateContext}
             })
           );
 
+          this.recordRecommended(userId, subjects);
+
           const items: RecommendItem[] = subjects.map((s, idx) => ({
             title: s.title,
             displayTitle: slots.count === 1 ? `《${s.title}》` : `${idx + 1}.《${s.title}》`,
@@ -877,7 +1016,7 @@ ${candidateContext}
           return {
             title: cleanTitles[0] || '',
             items,
-            formattedNote: replyText,
+            formattedNote: AiRecommender.formatChattyParagraphs(replyText),
             subjects,
             slots,
           };
@@ -941,27 +1080,24 @@ ${candidateContext}
           ];
     const picked = (candidates.length > 0 ? candidates : defaultFallbacks).slice(0, slots.count);
 
-    this.recordRecommended(
-      userId,
-      picked.map((p) => p.title)
-    );
+    this.recordRecommended(userId, picked);
 
     let replyText = '';
     if (slots.count === 1 && picked.length === 1) {
       const s = picked[0];
       const yearStr = s.year || String(currentYear);
-      const rateStr = s.rate ? `豆瓣 ${s.rate} 分` : '目前正在热播';
-      const actorStr = s.actors ? `，由 ${s.actors} 主演` : '';
+      const rateBadge = s.rate ? ` · ⭐ ${s.rate}分` : '';
+      const actorStr = s.actors ? `${s.actors} 主演，` : '';
       const commentStr = s.shortComment
-        ? `观众评价它“${s.shortComment}”`
-        : '近期讨论度和口碑都很稳，节奏紧凑不注水，非常值得追。';
+        ? `${actorStr}豆瓣短评都在夸“${s.shortComment}”。`
+        : `${actorStr}近期讨论度和口碑都很稳，节奏紧凑不注水，非常值得看。`;
 
       replyText = [
-        `要看近期比较火的${slots.country === '中国大陆' ? '国产剧' : slots.doubanTag}，很推荐你看看《${s.title}》（${yearStr}年，${rateStr}${actorStr}）。`,
+        `🎬 《${s.title}》（${yearStr}${rateBadge}）`,
         '',
-        `${commentStr}`,
+        commentStr,
         '',
-        `想看这部的话直接回个「1」或者「转存」，我马上帮你去搜夸克网盘资源存好；如果看过了跟我说声「换一部」就行~`,
+        `👉 想看直接回「1」或「转存」帮你找网盘存好；看过就回「换一部」~`,
       ].join('\n');
     } else {
       const lines: string[] = [

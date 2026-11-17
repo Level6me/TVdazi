@@ -1125,3 +1125,15 @@ test('CommandHandler.renderHot 单部推荐自动配发影视海报封面，多�
     PushGateway.getInstance().registerImageSender(null);
   }
 });
+
+test('AiRecommender.formatChattyParagraphs 将拥挤长段落自动拆分为清爽分段排版', () => {
+  const { AiRecommender } = require('../services/AiRecommender');
+  const wall =
+    '你平时就爱看动作、犯罪、战争这类硬核题材，那这部《欢迎来龙餐馆》应该挺对你胃口的。沈腾这次不纯搞笑，跟蒋奇明搭戏，把战争背景下的紧张感和人情味揉在一起，豆瓣8.7分不是白给的。有热评说华语片该学会留白，说明它节奏克制、不煽情，反而更有后劲。想看的话回个「1」或者「转存」，我帮你搜好存夸克网盘，看过了就回「换一部」。';
+  const formatted = AiRecommender.formatChattyParagraphs(wall);
+  const parts = formatted.split('\n\n');
+  assert.equal(parts.length, 3);
+  assert.ok(parts[0].includes('《欢迎来龙餐馆》'));
+  assert.ok(parts[1].includes('8.7分'));
+  assert.ok(parts[2].includes('换一部'));
+});

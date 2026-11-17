@@ -909,7 +909,7 @@ export class CommandHandler {
   }
 
   /**
-   * 格式化精简紧凑的搜索结果页面（去掉冗余大段介绍，仅呈现纯净片名与关键网盘标）
+   * 格式化精简清晰的搜索结果页面（图文呼应、留白分段、无锯齿分割线）
    */
   private formatSearchResultPage(pageData: {
     items: CloudResource[];
@@ -922,11 +922,13 @@ export class CommandHandler {
     metaHeader?: string;
   }): string {
     const { items, page, totalPages, startIdx, total, keyword, metaHeader } = pageData;
-    let msg = `🎬 【${keyword}】搜索结果 (${page}/${totalPages}页 共${total}条)\n`;
+    const lines: string[] = [
+      `🎬 《${keyword}》找到 ${total} 条网盘资源（第 ${page}/${totalPages} 页）`,
+    ];
     if (metaHeader) {
-      msg += `${metaHeader}\n`;
+      lines.push(metaHeader);
     }
-    msg += `----------------------------------------\n`;
+    lines.push('');
 
     items.forEach((item, index) => {
       const seq = startIdx + index + 1;
@@ -942,35 +944,33 @@ export class CommandHandler {
           : item.panType === 'baidu'
           ? '百度'
           : '网盘';
-      const cat = item.category ? `[${item.category}]` : '';
       const fullText = `${item.title} ${item.rawText || ''}`;
-      let qBadge = '';
+      const tags: string[] = [panTag];
       if (item.qualityTags?.badges && item.qualityTags.badges.length > 0) {
-        qBadge = item.qualityTags.badges.map((b) => `[${b}]`).join('');
-      } else if (!/4k|2160p/i.test(item.title) && /(?:4k|2160p|杜比|dolby)/i.test(fullText)) {
-        qBadge = '[4K]';
-      } else if (!/remux|原盘/i.test(item.title) && /(?:remux|蓝光原盘)/i.test(fullText)) {
-        qBadge = '[原盘]';
-      } else if (!/1080p/i.test(item.title) && /1080p/i.test(fullText)) {
-        qBadge = '[1080P]';
+        tags.push(...item.qualityTags.badges.slice(0, 2));
+      } else if (/(?:4k|2160p|杜比|dolby)/i.test(fullText)) {
+        tags.push('4K');
+      } else if (/(?:remux|蓝光原盘)/i.test(fullText)) {
+        tags.push('原盘');
+      } else if (/1080p/i.test(fullText)) {
+        tags.push('1080P');
       }
-      const pwdBadge = item.passcode ? '[含密码]' : '';
-      msg += `${seq}. [${panTag}]${cat}${qBadge}${pwdBadge} ${item.title}\n`;
+      if (item.passcode) tags.push('含码');
+
+      lines.push(`${seq}. [${tags.join(' · ')}] ${item.title}`);
     });
 
-    msg += `----------------------------------------\n`;
-    if (page > 1) {
-      msg += `💡 回复序号（如「${startIdx + 1}」或「本页第1个」）一键转存`;
-    } else {
-      msg += `💡 回复序号一键转存（如「1」或「存第1个」）`;
-    }
+    lines.push('');
+    const saveHint =
+      page > 1
+        ? `👉 回复序号（如「${startIdx + 1}」或「本页第1个」）直接转存`
+        : `👉 回复数字序号（如「1」）直接帮你存进网盘`;
     const navHints: string[] = [];
     if (page > 1) navHints.push('「上一页」');
     if (page < totalPages) navHints.push('「下一页」');
-    if (navHints.length > 0) {
-      msg += `；回复${navHints.join('/')}翻页`;
-    }
-    return msg.trim();
+    lines.push(navHints.length > 0 ? `${saveHint}；回复${navHints.join('/')}翻页` : saveHint);
+
+    return lines.join('\n').trim();
   }
 
   async renderSearch(
