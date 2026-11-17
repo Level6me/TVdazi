@@ -9,6 +9,7 @@ export interface MediaResolveInput {
   guessTitle?: string;
   alternateTitles?: string[];
   year?: string;
+  mediaType?: 'movie' | 'tv';
   clues?: string;
   userId?: string;
   forceLlm?: boolean;
@@ -23,6 +24,7 @@ export interface ResolvedMediaInfo {
   year?: string;
   mediaType?: 'movie' | 'tv';
   overview?: string;
+  coverUrl?: string;
   source: 'tmdb' | 'bangumi' | 'douban' | 'llm' | 'raw';
 }
 
@@ -43,6 +45,26 @@ export class MetadataResolver {
   private doubanService = new DoubanService();
 
   private constructor() {}
+
+  private normalizeEntityName(value: unknown): string {
+    return String(value || '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  }
+
+  /** 用归一化包含度与双字片段重合度估算标题是否为同一实体。 */
+  private titleSimilarity(query: string, candidate: string): number {
+    const a = this.normalizeEntityName(query);
+    const b = this.normalizeEntityName(candidate);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.includes(b) || b.includes(a)) return 0.82 * Math.min(a.length, b.length) / Math.max(a.length, b.length);
+    if (a.length < 2 || b.length < 2) return 0;
+    const grams = (s: string) => new Set(Array.from({ length: s.length - 1 }, (_, i) => s.slice(i, i + 2)));
+    const ga = grams(a);
+    const gb = grams(b);
+    let overlap = 0;
+    for (const gram of ga) if (gb.has(gram)) overlap++;
+    return (2 * overlap) / (ga.size + gb.size);
+  }
 
   public static getInstance(): MetadataResolver {
     if (!MetadataResolver.instance) {
@@ -180,7 +202,11 @@ export class MetadataResolver {
   /**
    * 方案 B：通过 TMDB API 获取官方简体中文译名及多地区/原语别名
    */
-  private async resolveWithTmdb(queries: string[], preferredYear?: string): Promise<ResolvedMediaInfo | null> {
+  private async resolveWithTmdb(
+    queries: string[],
+    preferredYear?: string,
+    preferredMediaType?: 'movie' | 'tv'
+  ): Promise<ResolvedMediaInfo | null> {
     const cred = this.getTmdbCredential();
     if (!cred) return null;
 
@@ -216,14 +242,29 @@ export class MetadataResolver {
           : [];
         if (items.length === 0) continue;
 
-        let best = items[0];
-        if (preferredYear) {
-          const yearMatched = items.find((item: any) => {
-            const d = String(item.release_date || item.first_air_date || '');
-            return d.startsWith(preferredYear);
-          });
-          if (yearMatched) best = yearMatched;
-        }
+        const ranked = items
+          .map((item: any) => {
+            const names = [item.title, item.name, item.original_title, item.original_name].filter(Boolean);
+            const nameScore = Math.max(0, ...names.map((name: string) => this.titleSimilarity(cleanQ, name)));
+            const date = String(item.release_date || item.first_air_date || '');
+            const yearMatch = Boolean(preferredYear && date.startsWith(preferredYear));
+            const yearMismatch = Boolean(preferredYear && /^\d{4}/.test(date) && !yearMatch);
+            const typeMatch = Boolean(preferredMediaType && item.media_type === preferredMediaType);
+            const typeMismatch = Boolean(preferredMediaType && item.media_type !== preferredMediaType);
+            const score = nameScore * 0.78 + (preferredYear ? (yearMatch ? 0.18 : yearMismatch ? -0.12 : 0) : 0.1) +
+              (preferredMediaType ? (typeMatch ? 0.08 : typeMismatch ? -0.12 : 0) : 0.08);
+            return { item, nameScore, yearMatch, yearMismatch, typeMatch, score };
+          })
+          .sort((a: any, b: any) => b.score - a.score);
+        const bestRanked = ranked[0];
+        const runnerUp = ranked[1];
+        if (!bestRanked || bestRanked.nameScore < 0.58) continue;
+        if (preferredYear && bestRanked.yearMismatch) continue;
+        const exactName = bestRanked.nameScore >= 0.999;
+        const clearWinner = !runnerUp || bestRanked.score - runnerUp.score >= 0.08;
+        if (!exactName && !bestRanked.yearMatch && !bestRanked.typeMatch && !clearWinner) continue;
+        if (runnerUp && bestRanked.score - runnerUp.score < 0.06) continue;
+        const best = bestRanked.item;
 
         const mediaType: 'movie' | 'tv' = best.media_type === 'tv' ? 'tv' : 'movie';
         const officialTitle = this.normalizeCleanTitle(best.title || best.name);
@@ -297,6 +338,7 @@ export class MetadataResolver {
           year: year || undefined,
           mediaType,
           overview: best.overview ? String(best.overview).trim() : undefined,
+          coverUrl: best.poster_path ? `https://image.tmdb.org/t/p/w500${best.poster_path}` : undefined,
           source: 'tmdb',
         };
       } catch {
@@ -323,22 +365,31 @@ export class MetadataResolver {
         const list = Array.isArray(resp.data?.list) ? resp.data.list : [];
         if (list.length === 0) continue;
 
-        const exact =
-          list.find(
-            (item: any) =>
-              this.normalizeCleanTitle(item.name_cn) === cleanQ || this.normalizeCleanTitle(item.name) === cleanQ
-          ) || list[0];
+        const ranked = list
+          .map((item: any) => ({
+            item,
+            score: Math.max(
+              this.titleSimilarity(cleanQ, item.name_cn),
+              this.titleSimilarity(cleanQ, item.name)
+            ),
+          }))
+          .sort((a: any, b: any) => b.score - a.score);
+        if (!ranked[0] || ranked[0].score < 0.58) continue;
+        if (ranked[1] && ranked[0].score - ranked[1].score < 0.06) continue;
+        const exact = ranked[0].item;
 
         const cn = this.normalizeCleanTitle(exact?.name_cn);
         const orig = this.normalizeCleanTitle(exact?.name);
         if (!cn && !orig) continue;
 
         const primary = cn || orig;
+        const bgmImg = exact?.images?.common || exact?.images?.large || exact?.images?.medium;
         return {
           standardTitle: primary,
           originalTitle: orig && orig !== primary ? orig : undefined,
           aliases: this.buildUniqueAliases(primary, [orig]),
           year: exact?.air_date ? String(exact.air_date).slice(0, 4) : undefined,
+          coverUrl: bgmImg ? String(bgmImg).replace(/^http:\/\//i, 'https://') : undefined,
           source: 'bangumi',
         };
       } catch {
@@ -433,7 +484,16 @@ export class MetadataResolver {
     const cleanGuess = this.normalizeCleanTitle(input.guessTitle);
     const fallbackPrimary = cleanGuess || cleanQuery || cleanOrig;
 
-    const cacheKey = [cleanOrig, cleanGuess, cleanQuery, input.year || ''].join('::').toLowerCase();
+    const cacheKey = [
+      cleanOrig,
+      cleanGuess,
+      cleanQuery,
+      input.year || '',
+      input.mediaType || '',
+      input.forceLlm ? 'force-llm' : '',
+      input.userId || 'default_user',
+      ...(input.alternateTitles || []).map((title) => this.normalizeCleanTitle(title)).sort(),
+    ].join('::').toLowerCase();
     const cached = this.cache.get(cacheKey);
     if (
       cached &&
@@ -459,7 +519,7 @@ export class MetadataResolver {
 
     // 1. 方案 B：若配置了 TMDB_API_KEY，优先调用 TMDB 对齐官方中文译名与多语言别名
     if (this.hasTmdbConfigured()) {
-      const tmdbRes = await this.resolveWithTmdb(rawCandidates, input.year);
+      const tmdbRes = await this.resolveWithTmdb(rawCandidates, input.year, input.mediaType);
       if (tmdbRes) {
         const merged: ResolvedMediaInfo = {
           ...tmdbRes,
@@ -509,6 +569,7 @@ export class MetadataResolver {
           ...(input.alternateTitles || []),
         ]),
         year: doubanMeta.year || input.year,
+        coverUrl: doubanMeta.cover || bgmMeta?.coverUrl || undefined,
         source: 'douban',
       };
       this.setCache(cacheKey, res);
@@ -686,5 +747,31 @@ export class MetadataResolver {
       console.warn('[AI 精筛降级] 跳过 AI 筛选，保留原检索结果:', err.message);
       return { filteredItems: items, aiFiltered: false, droppedCount: 0 };
     }
+  }
+
+  /**
+   * 快捷解析单部影视作品的官方海报封面 URL（优先豆瓣，缺失时回退 TMDB / Bangumi）
+   */
+  public async resolveCoverUrl(
+    title: string,
+    opts?: { year?: string; mediaType?: 'movie' | 'tv' }
+  ): Promise<string | undefined> {
+    const clean = this.normalizeCleanTitle(title);
+    if (!clean) return undefined;
+
+    const doubanMeta = await this.doubanService.getMovieMeta(clean).catch(() => null);
+    if (doubanMeta?.cover) {
+      return doubanMeta.cover;
+    }
+
+    const resolved = await this.resolveMedia({
+      query: clean,
+      guessTitle: clean,
+      year: opts?.year,
+      mediaType: opts?.mediaType,
+      forceLlm: false,
+    }).catch(() => null);
+
+    return resolved?.coverUrl;
   }
 }

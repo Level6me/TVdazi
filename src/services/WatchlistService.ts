@@ -1,6 +1,7 @@
 import axios from 'axios';
 import * as cheerio from 'cheerio';
 import { DoubanService } from './DoubanService';
+import { MetadataResolver } from './MetadataResolver';
 import { QuarkService } from './QuarkService';
 import { UserManager, WatchlistItem } from './UserManager';
 import { UserProfileService } from './UserProfileService';
@@ -170,13 +171,20 @@ export class WatchlistService {
       const inferredMedia = UserProfileService.getInstance().inferSubjectMediaTypes(sub);
       const primaryCategory = inferredMedia[0] || undefined;
 
+      let coverUrl = sub.cover || undefined;
+      if (!coverUrl) {
+        coverUrl = await MetadataResolver.getInstance()
+          .resolveCoverUrl(cleanTitle, { year: sub.year })
+          .catch(() => undefined);
+      }
+
       return userManager.updateWatchlistItem(userId, cleanTitle, {
         rating: sub.rate || undefined,
         year: sub.year || undefined,
         region: sub.region || undefined,
         genres: sub.types && sub.types.length > 0 ? sub.types.slice(0, 4) : undefined,
         totalEpisodes,
-        cover: sub.cover || undefined,
+        cover: coverUrl,
         doubanId: sub.id || undefined,
         type: totalEpisodes || (primaryCategory && /剧|动画|综艺|纪录片/.test(primaryCategory)) ? 'tv' : 'movie',
         ...(primaryCategory ? { category: primaryCategory } : {}),
@@ -187,11 +195,13 @@ export class WatchlistService {
   }
 
   /**
-   * 批量补全尚未拉取豆瓣元数据的片单条目（最多处理 maxItems 条）
+   * 批量补全尚未拉取豆瓣元数据或封面的片单条目（最多处理 maxItems 条）
    */
   static async enrichPendingItems(userId: string, maxItems: number = 8): Promise<number> {
     const plan = UserManager.getInstance().getUserPlan(userId);
-    const pending = plan.watchlist.filter((w) => !w.rating && !w.doubanId && !w.year).slice(0, maxItems);
+    const pending = plan.watchlist
+      .filter((w) => (!w.rating && !w.doubanId && !w.year) || !w.cover)
+      .slice(0, maxItems);
     let updated = 0;
     for (const item of pending) {
       const res = await this.enrichWatchlistItem(userId, item.title);

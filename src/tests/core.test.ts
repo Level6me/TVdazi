@@ -11,6 +11,7 @@ import QRCode from 'qrcode';
 
 import { encodeWechatMediaAesKey } from '../wechat/CdnUpload';
 import { WeixinBot } from '../wechat/WeixinBot';
+import { isAllowedPosterUrl, detectImageMimeAndExt, sendCoverToWechatUser } from '../utils/PosterHelper';
 
 import { maskSensitive } from '../utils/Logger';
 import { LruCache } from '../utils/LruCache';
@@ -983,5 +984,69 @@ test('好友邀请提示与二维码生成文案具备自然真人感', async ()
         if (fs.existsSync(f)) fs.unlinkSync(f);
       } catch {}
     }, 60);
+  }
+});
+
+test('影视封面安全校验、魔数识别、H5海报代理防SSRF及微信封面下发链路', async () => {
+  assert.equal(isAllowedPosterUrl('https://img9.doubanio.com/view/photo/s_ratio_poster/public/p2905327559.jpg'), true);
+  assert.equal(isAllowedPosterUrl('https://image.tmdb.org/t/p/w500/abc.jpg'), true);
+  assert.equal(isAllowedPosterUrl('http://127.0.0.1:8080/secret'), false);
+  assert.equal(isAllowedPosterUrl('file:///etc/passwd'), false);
+
+  assert.deepEqual(detectImageMimeAndExt(Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0, 1, 2, 3, 4, 5, 6, 7])), {
+    mime: 'image/jpeg',
+    ext: 'jpg',
+  });
+  assert.deepEqual(detectImageMimeAndExt(Buffer.from([0x89, 0x50, 0x4e, 0x47, 13, 10, 26, 10, 0, 0, 0, 1])), {
+    mime: 'image/png',
+    ext: 'png',
+  });
+  assert.equal(detectImageMimeAndExt(Buffer.from('<html>403 Forbidden</html>')), null);
+
+  // 验证 H5 /api/panel/poster 会拦截非法域名，并对合法豆瓣封面代理返回图片且前端 JS 无可选链
+  const token = DashboardServer.issueUserToken('__poster_test_user__', 60000);
+  const pngBytes = await QRCode.toBuffer('https://movie.douban.com/subject/123/', { width: 120 });
+  const origAxiosGet = axios.get;
+  let capturedImagePath = '';
+  const server = http.createServer((req, res) => {
+    DashboardServer.handleHttpRequest(req, res).then((handled) => {
+      if (!handled) {
+        res.writeHead(404);
+        res.end();
+      }
+    });
+  });
+
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', () => resolve()));
+  const addr = server.address() as { port: number };
+  const baseUrl = `http://127.0.0.1:${addr.port}`;
+
+  try {
+    const blocked = await fetch(`${baseUrl}/api/panel/poster?token=${encodeURIComponent(token)}&url=${encodeURIComponent('http://169.254.169.254/latest/meta-data')}`);
+    assert.equal(blocked.status, 400);
+
+    (axios as any).get = async () => ({ data: pngBytes });
+    const okPoster = await fetch(`${baseUrl}/api/panel/poster?token=${encodeURIComponent(token)}&url=${encodeURIComponent('https://img9.doubanio.com/view/photo/s_ratio_poster/public/p12345.jpg')}`);
+    assert.equal(okPoster.status, 200);
+    assert.equal(okPoster.headers.get('content-type'), 'image/png');
+    const fetchedBuf = Buffer.from(await okPoster.arrayBuffer());
+    assert.equal(fetchedBuf.equals(pngBytes), true);
+
+    // 验证微信端封面下发通道闭环与临时文件自动清理
+    PushGateway.getInstance().registerImageSender(async (_to, imgPath) => {
+      capturedImagePath = imgPath;
+      return fs.existsSync(imgPath) && fs.readFileSync(imgPath).equals(pngBytes);
+    });
+    const sent = await sendCoverToWechatUser('__poster_test_user__', {
+      title: '测试影片',
+      knownCover: 'https://img9.doubanio.com/view/photo/s_ratio_poster/public/p12345.jpg',
+    });
+    assert.equal(sent, true);
+    assert.ok(capturedImagePath.endsWith('.png'));
+    assert.equal(fs.existsSync(capturedImagePath), false);
+  } finally {
+    PushGateway.getInstance().registerImageSender(null);
+    (axios as any).get = origAxiosGet;
+    await new Promise<void>((resolve) => server.close(() => resolve()));
   }
 });

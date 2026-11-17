@@ -15,7 +15,9 @@ import { UserProfileService } from '../services/UserProfileService';
 import { ResourceSearcher } from '../services/Searcher';
 import { QuarkService } from '../services/QuarkService';
 import { CategoryClassifier } from '../services/CategoryClassifier';
+import { MetadataResolver } from '../services/MetadataResolver';
 import { maskSensitive } from '../utils/Logger';
+import { fetchPosterBuffer, isAllowedPosterUrl } from '../utils/PosterHelper';
 import { upsertEnvVar } from '../utils/FileUtils';
 import { AUI_BUNDLE_CSS, AUI_BUNDLE_JS } from './auiBundle';
 
@@ -246,6 +248,27 @@ export class DashboardServer {
     if (!userId) {
       res.writeHead(401, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(JSON.stringify({ error: 'Unauthorized or expired panel token' }));
+      return true;
+    }
+
+    if (req.method === 'GET' && pathname === '/api/panel/poster') {
+      const rawTarget = String(parsedUrl.query.url || '').trim();
+      if (!rawTarget || !isAllowedPosterUrl(rawTarget)) {
+        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify({ ok: false, error: '非法或不受支持的海报地址' }));
+        return true;
+      }
+      const poster = await fetchPosterBuffer(rawTarget, 4500);
+      if (!poster) {
+        res.writeHead(404);
+        res.end();
+        return true;
+      }
+      res.writeHead(200, {
+        'Content-Type': poster.mime,
+        'Cache-Control': 'private, max-age=86400',
+      });
+      res.end(poster.buffer);
       return true;
     }
 
@@ -552,16 +575,26 @@ export class DashboardServer {
 
       const searcher = new ResourceSearcher();
       const plan = userManager.getUserPlan(userId);
-      const searchRes = await searcher.search({
-        keyword: title,
-        quality: plan.preferences?.preferredQuality,
-        maxResults: 8,
-      });
+      const wlHit = plan.watchlist.find((w) => w.title.toLowerCase() === title.toLowerCase());
+      const [searchRes, resolvedCover] = await Promise.all([
+        searcher.search({
+          keyword: title,
+          quality: plan.preferences?.preferredQuality,
+          maxResults: 8,
+        }),
+        wlHit?.cover
+          ? Promise.resolve(wlHit.cover)
+          : Promise.race([
+              MetadataResolver.getInstance().resolveCoverUrl(title).catch(() => undefined),
+              new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 1800)),
+            ]),
+      ]);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
       res.end(
         JSON.stringify({
           ok: true,
           title,
+          cover: resolvedCover || wlHit?.cover || '',
           items: (searchRes.items || []).slice(0, 8).map((item) => ({
             title: item.title,
             panType: item.panType,
@@ -868,8 +901,13 @@ ${AUI_BUNDLE_CSS}
 .viz-rank-row span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
 .viz-strategy{margin-top:12px;padding:10px 12px;border-radius:12px;background:var(--accent-bg);color:var(--accent);font-size:12px;font-weight:600;line-height:1.6;}
 .wl-toolbar{display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin:12px 0;}
-.wl-card{padding:11px 0;border-bottom:1px solid var(--border-subtle);}
+.wl-card{padding:11px 0;border-bottom:1px solid var(--border-subtle);display:flex;gap:12px;align-items:flex-start;}
 .wl-card:last-child{border-bottom:none;}
+.wl-poster{width:50px;height:70px;border-radius:10px;overflow:hidden;flex-shrink:0;background:var(--card-sec);border:1px solid var(--border-subtle);box-shadow:0 3px 10px rgba(0,0,0,.08);}
+.wl-poster.wl-poster-sm{width:42px;height:58px;border-radius:8px;}
+.wl-poster img{width:100%;height:100%;object-fit:cover;display:block;}
+.wl-poster-fallback{display:flex;align-items:center;justify-content:center;background:linear-gradient(145deg,rgba(0,122,255,.18),rgba(175,82,222,.22));color:var(--accent);font-weight:800;font-size:18px;}
+.wl-body{flex:1;min-width:0;}
 .wl-top{display:flex;justify-content:space-between;align-items:flex-start;gap:10px;flex-wrap:wrap;}
 .wl-title-wrap{min-width:0;flex:1;}
 .wl-title-line{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-weight:700;font-size:13.5px;}
@@ -1326,6 +1364,28 @@ const ACTION_BADGES = { save:"success", share:"purple", search:"accent", skip:"w
 
 function esc(s){
   return String(s||"").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+}
+
+function posterUrl(rawCover){
+  if (!rawCover) return "";
+  return "/api/panel/poster?token=" + encodeURIComponent(TOKEN) + "&url=" + encodeURIComponent(rawCover);
+}
+
+function posterFallback(img){
+  if (!img || !img.parentNode) return;
+  var ch = img.getAttribute("data-ch") || "片";
+  img.parentNode.classList.add("wl-poster-fallback");
+  img.parentNode.innerHTML = "<span>" + esc(ch) + "</span>";
+}
+
+function posterThumbHtml(cover, title, cls){
+  var c = posterUrl(cover);
+  var ch = esc((title || "片").slice(0, 1));
+  var baseCls = cls || "wl-poster";
+  if (!c) {
+    return '<div class="' + baseCls + ' wl-poster-fallback"><span>' + ch + '</span></div>';
+  }
+  return '<div class="' + baseCls + '"><img src="' + esc(c) + '" alt="' + esc(title || "") + '" data-ch="' + ch + '" loading="lazy" onerror="posterFallback(this)" /></div>';
 }
 
 let autoProbedOnce = false;
@@ -1985,6 +2045,8 @@ function renderWatchlist(){
     if (w.note) metaParts.push("📝 " + esc(w.note));
 
     return '<div class="wl-card">' +
+      posterThumbHtml(w.cover, w.title) +
+      '<div class="wl-body">' +
       '<div class="wl-top"><div class="wl-title-wrap">' +
         '<div class="wl-title-line"><span>《' + esc(w.title) + '》</span>' +
           '<span class="badge ' + stCls + '">' + esc(stLabel) + '</span>' +
@@ -2002,6 +2064,7 @@ function renderWatchlist(){
         '<button class="pill-btn js-watch-share" data-title="' + esc(w.title) + '">安利</button>' +
         '<button class="pill-btn js-watch-note" data-title="' + esc(w.title) + '" data-note="' + esc(w.note || '') + '">备注</button>' +
         '<button class="pill-btn danger js-watch-del" data-title="' + esc(w.title) + '">删</button>' +
+      '</div>' +
       '</div>' +
     '</div>';
   }).join("");
@@ -2130,10 +2193,12 @@ async function pickWatchlistTonight(btnEl){
     document.getElementById("mediaModalBody").innerHTML = picks.length
       ? picks.map((p, i) => {
           const it = p.item || {};
-          return '<div class="diag-row-item"><div class="diag-row-header"><span style="font-weight:700;font-size:14px;">' + (i + 1) + '. 《' + esc(it.title) + '》</span>' +
+          return '<div class="diag-row-item" style="display:flex;gap:10px;align-items:flex-start;">' +
+            posterThumbHtml(it.cover, it.title, "wl-poster wl-poster-sm") +
+            '<div style="flex:1;min-width:0;"><div class="diag-row-header"><span style="font-weight:700;font-size:14px;">' + (i + 1) + '. 《' + esc(it.title) + '》</span>' +
             (it.rating ? '<span class="badge warning">⭐ ' + esc(it.rating) + '</span>' : '') + '</div>' +
             '<div class="mono-sub" style="margin:4px 0 8px;">' + esc((p.reasons || []).join(" · ")) + '</div>' +
-            '<div style="display:flex;gap:8px;"><button class="pill-btn accent js-pick-search" data-title="' + esc(it.title) + '" data-cat="' + esc(it.category || '') + '">立即搜链转存</button></div></div>';
+            '<div style="display:flex;gap:8px;"><button class="pill-btn accent js-pick-search" data-title="' + esc(it.title) + '" data-cat="' + esc(it.category || '') + '">立即搜链转存</button></div></div></div>';
         }).join("")
       : '<div style="color:var(--text-sec);font-size:13px;">片单暂无待看作品，先加入几部电影或剧集吧~</div>';
     document.getElementById("mediaModalBody").querySelectorAll(".js-pick-search").forEach(b => {
@@ -2217,8 +2282,15 @@ async function searchWatchItem(title, category, btnEl){
   try {
     const r = await api("/api/panel/watchlist/search", { action:"search", title:title });
     const items = (r && r.items) || [];
+    const coverHero = (r && r.cover)
+      ? '<div style="display:flex;gap:12px;align-items:center;padding-bottom:10px;margin-bottom:10px;border-bottom:1px solid var(--border-subtle);">' +
+          posterThumbHtml(r.cover, title, "wl-poster wl-poster-sm") +
+          '<div style="min-width:0;"><div style="font-weight:700;font-size:14px;">《' + esc(title) + '》</div><div class="mono-sub" style="margin:2px 0 0;">已匹配到 ' + items.length + ' 条可转存网盘资源</div></div>' +
+        '</div>'
+      : '';
     if (!items.length) {
       document.getElementById("mediaModalBody").innerHTML =
+        coverHero +
         '<div style="color:var(--text-sec);font-size:13px;margin-bottom:12px;">暂未搜到《' + esc(title) + '》公开活链，可以一键加入后台蹲守监控，出资源立刻微信通知你！</div>' +
         '<button class="btn js-empty-chase" data-title="' + esc(title) + '">转入新片蹲守</button>';
       const chaseBtn = document.getElementById("mediaModalBody").querySelector(".js-empty-chase");
@@ -2230,7 +2302,7 @@ async function searchWatchItem(title, category, btnEl){
       }
       return;
     }
-    document.getElementById("mediaModalBody").innerHTML = items.map(it => {
+    document.getElementById("mediaModalBody").innerHTML = coverHero + items.map(it => {
       const canSave = it.panType === "quark" && it.shareId;
       const badges = (it.qualityBadges || []).slice(0, 3).map(b => '<span class="badge neutral">' + esc(b) + '</span>').join(" ");
       return '<div class="diag-row-item"><div class="diag-row-header"><span style="font-weight:700;font-size:13px;">' + esc(it.title) + '</span><span class="badge accent">' + esc(it.panType) + '</span></div>' +

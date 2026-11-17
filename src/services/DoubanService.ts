@@ -21,6 +21,25 @@ export class DoubanService {
   private baseUrl = 'https://movie.douban.com/j';
   private abstractCache: Map<string, Partial<DoubanSubject>> = new Map();
 
+  private normalizeTitle(value: unknown): string {
+    return String(value || '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]/gu, '');
+  }
+
+  private titleSimilarity(query: string, candidate: string): number {
+    const a = this.normalizeTitle(query);
+    const b = this.normalizeTitle(candidate);
+    if (!a || !b) return 0;
+    if (a === b) return 1;
+    if (a.includes(b) || b.includes(a)) return 0.82 * Math.min(a.length, b.length) / Math.max(a.length, b.length);
+    if (a.length < 2 || b.length < 2) return 0;
+    const grams = (s: string) => new Set(Array.from({ length: s.length - 1 }, (_, i) => s.slice(i, i + 2)));
+    const ga = grams(a);
+    const gb = grams(b);
+    let overlap = 0;
+    for (const gram of ga) if (gb.has(gram)) overlap++;
+    return (2 * overlap) / (ga.size + gb.size);
+  }
+
   /**
    * 获取豆瓣单部作品的真实详情摘要（包含准确上映年份、题材类型、主演、导演、集数与热门短评）
    */
@@ -99,9 +118,9 @@ export class DoubanService {
   }
 
   /**
-   * 根据片名检索豆瓣信息，获取准确 ID、年份、评分、原名与演员
+   * 根据片名检索豆瓣信息，获取准确 ID、年份、评分、原名与海报封面
    */
-  async getMovieMeta(keyword: string): Promise<{ id?: string; title: string; year?: string; rate?: string; subTitle?: string } | null> {
+  async getMovieMeta(keyword: string): Promise<{ id?: string; title: string; year?: string; rate?: string; subTitle?: string; cover?: string } | null> {
     const clean = keyword.replace(/^(电影|电视剧|网剧|动漫)\s*/, '').trim();
     if (!clean) return null;
 
@@ -116,15 +135,29 @@ export class DoubanService {
       });
 
       if (Array.isArray(resp.data) && resp.data.length > 0) {
-        const matched =
-          resp.data.find((item: any) => item.title === clean) ||
-          resp.data.find((item: any) => clean.includes(item.title) || item.title.includes(clean)) ||
-          resp.data[0];
+        const yearMatch = clean.match(/(?:19|20)\d{2}/)?.[0];
+        const queryTitle = clean.replace(/[（(](?:19|20)\d{2}[）)]?/g, '').replace(/(?:19|20)\d{2}/g, '').trim() || clean;
+        const ranked = resp.data
+          .map((item: any) => {
+            const similarity = Math.max(
+              this.titleSimilarity(queryTitle, item.title),
+              this.titleSimilarity(queryTitle, item.sub_title)
+            );
+            const matchesYear = Boolean(yearMatch && String(item.year || '') === yearMatch);
+            const hasYearConflict = Boolean(yearMatch && item.year && String(item.year) !== yearMatch);
+            return { item, similarity, matchesYear, hasYearConflict, score: similarity + (matchesYear ? 0.2 : hasYearConflict ? -0.2 : 0) };
+          })
+          .sort((a: any, b: any) => b.score - a.score);
+        const best = ranked[0];
+        if (!best || best.similarity < 0.58 || (yearMatch && best.hasYearConflict)) return null;
+        if (ranked[1] && best.score - ranked[1].score < 0.06) return null;
+        const matched = best.item;
         return {
           id: matched.id ? String(matched.id) : undefined,
           title: matched.title,
           year: matched.year,
           subTitle: matched.sub_title,
+          cover: matched.img ? String(matched.img).trim() : undefined,
         };
       }
       return null;
@@ -145,7 +178,7 @@ export class DoubanService {
       id: meta.id,
       title: meta.title || title,
       rate: abs?.rate || '',
-      cover: '',
+      cover: meta.cover || '',
       url: `https://movie.douban.com/subject/${meta.id}/`,
       year: abs?.year || meta.year,
       types: abs?.types || [],

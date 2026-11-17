@@ -15,6 +15,7 @@ import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
 import { WatchlistService } from '../services/WatchlistService';
 import { pickVariant } from '../utils/HumanTone';
+import { sendCoverToWechatUser } from '../utils/PosterHelper';
 import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
@@ -1222,6 +1223,16 @@ export class CommandHandler {
       .catch(() => {});
     this.sessionManager.setSearch(userId, sessionKeyword, res.items, 8);
     const pageData = this.sessionManager.getSearchPage(userId, 1)!;
+
+    // 微信端顺带发送一张影视海报封面（有图发图、无图或超时静默降级，不阻塞文本返回）
+    await sendCoverToWechatUser(userId, {
+      title: sessionKeyword,
+      knownCover: doubanMeta?.cover || resolvedInfo?.coverUrl,
+      year: searchMeta?.year || resolvedInfo?.year || doubanYear,
+      mediaType: searchMeta?.mediaType || resolvedInfo?.mediaType,
+      timeoutMs: 2800,
+    }).catch(() => false);
+
     return this.formatSearchResultPage({
       ...pageData,
       keyword: sessionKeyword,

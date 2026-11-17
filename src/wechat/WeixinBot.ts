@@ -466,9 +466,12 @@ export class WeixinBot {
       }
     }
 
-    // 注册全局主动推送网关（供跨用户传话与后台任务调用）
+    // 注册全局主动推送网关（供跨用户传话、封面图片下发与后台任务调用）
     PushGateway.getInstance().registerSender(async (userId, text) => {
       return await this.pushMessageToUser(userId, text);
+    });
+    PushGateway.getInstance().registerImageSender(async (userId, imagePath) => {
+      return await this.sendImageMessage(userId, imagePath);
     });
 
     // 启动全局智能定时与资源监控引擎
