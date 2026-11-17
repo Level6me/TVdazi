@@ -1067,18 +1067,15 @@ test('MetadataResolver.extractMediaQuery 能准确剥离网盘画质与标签噪
   });
 });
 
-test('CommandHandler.renderHot 单部推荐自动配发影视海报封面，多部榜单不刷屏', async () => {
+test('CommandHandler.renderHot 微信端只下发精排版文字推荐且不发送影视图片消息', async () => {
   const { AiRecommender } = require('../services/AiRecommender');
   const recommender = AiRecommender.getInstance();
   const origGenerate = recommender.generateXiaohongshuNote;
-  const origAxiosGet = axios.get;
-  const pngBytes = await QRCode.toBuffer('https://movie.douban.com/subject/3541415/', { width: 120 });
-  const sentImages: Array<{ to: string; existsAtSend: boolean }> = [];
+  const sentImages: string[] = [];
 
   try {
-    (axios as any).get = async () => ({ data: pngBytes });
-    PushGateway.getInstance().registerImageSender(async (to, imgPath) => {
-      sentImages.push({ to, existsAtSend: fs.existsSync(imgPath) });
+    PushGateway.getInstance().registerImageSender(async (_to, imgPath) => {
+      sentImages.push(imgPath);
       return true;
     });
 
@@ -1086,7 +1083,7 @@ test('CommandHandler.renderHot 单部推荐自动配发影视海报封面，多�
     recommender.generateXiaohongshuNote = async () => ({
       title: '欢迎来龙餐馆',
       items: [],
-      formattedNote: '给你推荐《欢迎来龙餐馆》~',
+      formattedNote: '**🎬 《欢迎来龙餐馆》**（2026 · ⭐ 8.7分）\n\n> 节奏克制不煽情，越品越有后劲。\n\n👉 回 **「1」** 或 **「转存」** 帮你存网盘~',
       subjects: [
         {
           id: '35633851',
@@ -1100,28 +1097,11 @@ test('CommandHandler.renderHot 单部推荐自动配发影视海报封面，多�
       slots: { mediaType: 'movie', doubanTag: '热门', count: 1 },
     });
 
-    const reply1 = await handler.renderHot('movie', '热门', '__rec_cover_user__', 1, undefined, '给我推荐一部电影');
-    assert.ok(reply1.includes('欢迎来龙餐馆'));
-    assert.equal(sentImages.length, 1);
-    assert.equal(sentImages[0].to, '__rec_cover_user__');
-    assert.equal(sentImages[0].existsAtSend, true);
-
-    // 多部榜单不应连发多张图片刷屏
-    recommender.generateXiaohongshuNote = async () => ({
-      title: '热门榜单',
-      items: [],
-      formattedNote: '热门片单如下...',
-      subjects: [
-        { id: '1', title: 'A', rate: '8.5', cover: 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/p1.jpg', url: '' },
-        { id: '2', title: 'B', rate: '8.6', cover: 'https://img3.doubanio.com/view/photo/s_ratio_poster/public/p2.jpg', url: '' },
-      ],
-      slots: { mediaType: 'movie', doubanTag: '热门', count: 2 },
-    });
-    await handler.renderHot('movie', '热门', '__rec_cover_user__', 1);
-    assert.equal(sentImages.length, 1);
+    const reply1 = await handler.renderHot('movie', '热门', '__rec_text_only_user__', 1, undefined, '给我推荐一部电影');
+    assert.ok(reply1.includes('**🎬 《欢迎来龙餐馆》**'));
+    assert.equal(sentImages.length, 0);
   } finally {
     recommender.generateXiaohongshuNote = origGenerate;
-    (axios as any).get = origAxiosGet;
     PushGateway.getInstance().registerImageSender(null);
   }
 });

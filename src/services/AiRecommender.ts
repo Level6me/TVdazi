@@ -926,12 +926,13 @@ ${profileSummary ? `【该用户的长期观影画像（用于个性化贴合，
 【用户当前说的原话】："${slots.rawQuery}"
 ${genreAndThemeHint ? `【提取到的细分维度】：${genreAndThemeHint}\n` : ''}
 【你必须遵守的核心原则】：
-1. **真正理解用户的意思，排版清爽有呼吸感（严禁挤成一大坨文字墙）**：
-   - 绝对不要输出冷冰冰的表单卡片！**严禁**出现“🎯 为你精选...”、“----”分割线、“🎬 片名：”、“🏷️ 标签：”、“⭐ 评分：”、“🔥 推荐理由：”这种机械模板前缀！
-   - 手机微信阅读务必留白分层！当推荐 1 部时，请分成 **3 个轻巧短段（用空行 \\n\\n 隔开）**：
-     - 第 1 段：用一句轻巧标题/开场引出作品，例如「🎬《片名》（年份 · ⭐ 8.7分）」或自然的一句话开场；
-     - 第 2 段：像朋友一样口语化聊 1~2 句剧情看点与口碑亮点（控制在 2~3 句话内）；
-     - 第 3 段：单独一行轻巧收尾引导转存或换片。
+1. **真正理解用户的意思，用轻量 Markdown 精排版（严禁挤成一大坨文字墙）**：
+   - 绝对不要输出冷冰冰的表单卡片！**严禁**出现“🎯 为你精选...”、“----”分割线、“🎬 片名：”、“🏷️ 标签：”、“⭐ 评分：”、“🔥 推荐理由：”这种机械模板前缀，也**不要**输出「![图片](url)」语法！
+   - 手机微信阅读务必留白分层，适度使用加粗与引用让层级更清爽！当推荐 1 部时，请分成 **3 个轻巧短段（用空行 \\n\\n 隔开）**：
+     - 第 1 段：**🎬《片名》**（年份 · ⭐ 8.7分）或自然的一句加粗片名开场；
+     - 第 2 段：像朋友一样口语化聊 1~2 句剧情看点（可选加一行「> 一句豆瓣短评/点睛评价」）；
+     - 第 3 段：单独一行轻巧收尾引导，例如「👉 回 **「1」** 或 **「转存」** 帮你存进夸克网盘；看过就回 **「换一部」**」。
+   - 当推荐多部时，每部用 **1. 《片名》**（年份 · ⭐ 评分）做小标题，空行分隔，清楚好扫读。
    - 要顺着用户的原话自然接话（例如用户指定了具体剧情设定、“类似《XX》”、年份或类型，就在聊天中自然点出这些作品在剧情设定、人物张力或反转节奏上为什么正好戳中他的需求）。
 2. **严格遵守数量、年份与剧情设定要求**：
    - 用户要求的推荐数量：**${slots.count} 部**（如果 count=1，正文中重点只推荐 1 部最匹配的，绝不要罗列五六部！如果 count>1，用清爽的 1. 《片名》... 2. 《片名》... 自然分段介绍 ${slots.count} 部）。
@@ -1087,31 +1088,31 @@ ${candidateContext}
       const s = picked[0];
       const yearStr = s.year || String(currentYear);
       const rateBadge = s.rate ? ` · ⭐ ${s.rate}分` : '';
-      const actorStr = s.actors ? `${s.actors} 主演，` : '';
-      const commentStr = s.shortComment
-        ? `${actorStr}豆瓣短评都在夸“${s.shortComment}”。`
-        : `${actorStr}近期讨论度和口碑都很稳，节奏紧凑不注水，非常值得看。`;
+      const actorLine = s.actors ? `主演：${s.actors}\n` : '';
+      const commentLine = s.shortComment
+        ? `> ${s.shortComment}`
+        : `> 近期讨论度和口碑都很稳，节奏紧凑不注水，非常值得看。`;
 
       replyText = [
-        `🎬 《${s.title}》（${yearStr}${rateBadge}）`,
+        `**🎬 《${s.title}》**（${yearStr}${rateBadge}）`,
         '',
-        commentStr,
+        `${actorLine}${commentLine}`,
         '',
-        `👉 想看直接回「1」或「转存」帮你找网盘存好；看过就回「换一部」~`,
+        `👉 回 **「1」** 或 **「转存」** 帮你找网盘存好；看过就回 **「换一部」**~`,
       ].join('\n');
     } else {
       const lines: string[] = [
-        `给你挑了这几部热度与口碑都很不错的${slots.country === '中国大陆' ? '国产剧' : slots.doubanTag}：`,
+        `给你挑了这几部口碑和热度都很稳的${slots.country === '中国大陆' ? '国产剧' : slots.doubanTag}：`,
         '',
       ];
       picked.forEach((s, idx) => {
         const yearStr = s.year || String(currentYear);
-        const rateStr = s.rate ? `豆瓣 ${s.rate}分` : '近期热播';
-        const actorStr = s.actors ? `｜${s.actors}` : '';
+        const rateStr = s.rate ? `⭐ ${s.rate}分` : '近期热播';
+        const actorStr = s.actors ? ` · ${s.actors}` : '';
         const desc = s.shortComment || '近期口碑与热度兼具的诚意佳作，值得一看。';
-        lines.push(`${idx + 1}. 《${s.title}》（${yearStr}｜${rateStr}${actorStr}）\n${desc}\n`);
+        lines.push(`**${idx + 1}. 《${s.title}》**（${yearStr} · ${rateStr}${actorStr}）\n> ${desc}\n`);
       });
-      lines.push(`想看哪部直接回数字（比如 1、2），我马上帮你搜夸克网盘存好；或者回「换一批」换几部看看~`);
+      lines.push(`👉 想看哪部直接回数字（如 **「1」**），我帮你搜夸克网盘存好；或者回 **「换一批」**~`);
       replyText = lines.join('\n').trim();
     }
 

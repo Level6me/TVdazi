@@ -15,7 +15,6 @@ import { RelayService } from '../services/RelayService';
 import { UserProfileService } from '../services/UserProfileService';
 import { WatchlistService } from '../services/WatchlistService';
 import { pickVariant } from '../utils/HumanTone';
-import { sendCoverToWechatUser } from '../utils/PosterHelper';
 import { handleExtendedCommand } from './ExtendedCommands';
 import { CloudResource } from '../types';
 import axios from 'axios';
@@ -909,7 +908,7 @@ export class CommandHandler {
   }
 
   /**
-   * 格式化精简清晰的搜索结果页面（图文呼应、留白分段、无锯齿分割线）
+   * 格式化精排版 Markdown 搜索结果页面（层级分明、留白舒适、无锯齿分割线）
    */
   private formatSearchResultPage(pageData: {
     items: CloudResource[];
@@ -923,10 +922,10 @@ export class CommandHandler {
   }): string {
     const { items, page, totalPages, startIdx, total, keyword, metaHeader } = pageData;
     const lines: string[] = [
-      `🎬 《${keyword}》找到 ${total} 条网盘资源（第 ${page}/${totalPages} 页）`,
+      `**🎬 《${keyword}》** 找到 **${total}** 条网盘资源（${page}/${totalPages} 页）`,
     ];
     if (metaHeader) {
-      lines.push(metaHeader);
+      lines.push(`> ${metaHeader.replace(/\n+/g, '\n> ')}`);
     }
     lines.push('');
 
@@ -957,18 +956,18 @@ export class CommandHandler {
       }
       if (item.passcode) tags.push('含码');
 
-      lines.push(`${seq}. [${tags.join(' · ')}] ${item.title}`);
+      lines.push(`**${seq}.** \`${tags.join(' · ')}\` ${item.title}`);
     });
 
     lines.push('');
     const saveHint =
       page > 1
-        ? `👉 回复序号（如「${startIdx + 1}」或「本页第1个」）直接转存`
-        : `👉 回复数字序号（如「1」）直接帮你存进网盘`;
+        ? `👉 回复序号（如 **「${startIdx + 1}」** 或 **「本页第1个」**）直接转存`
+        : `👉 回复数字（如 **「1」**）直接帮你存进网盘`;
     const navHints: string[] = [];
-    if (page > 1) navHints.push('「上一页」');
-    if (page < totalPages) navHints.push('「下一页」');
-    lines.push(navHints.length > 0 ? `${saveHint}；回复${navHints.join('/')}翻页` : saveHint);
+    if (page > 1) navHints.push('**「上一页」**');
+    if (page < totalPages) navHints.push('**「下一页」**');
+    lines.push(navHints.length > 0 ? `${saveHint}；说${navHints.join('/')}翻页` : saveHint);
 
     return lines.join('\n').trim();
   }
@@ -1228,15 +1227,6 @@ export class CommandHandler {
     this.sessionManager.setSearch(userId, sessionKeyword, res.items, 8);
     const pageData = this.sessionManager.getSearchPage(userId, 1)!;
 
-    // 微信端顺带发送一张影视海报封面（有图发图、无图或超时静默降级，不阻塞文本返回）
-    await sendCoverToWechatUser(userId, {
-      title: sessionKeyword,
-      knownCover: doubanMeta?.cover || resolvedInfo?.coverUrl,
-      year: searchMeta?.year || resolvedInfo?.year || doubanYear,
-      mediaType: searchMeta?.mediaType || resolvedInfo?.mediaType,
-      timeoutMs: 2800,
-    }).catch(() => false);
-
     return this.formatSearchResultPage({
       ...pageData,
       keyword: sessionKeyword,
@@ -1264,19 +1254,6 @@ export class CommandHandler {
     });
 
     this.sessionManager.setHot(userId, type, result.subjects, tag, page, 6, query);
-
-    // 单部精准推片时顺带发一张影视海报封面（多部榜单不刷屏；无图或超时静默降级）
-    if (result.subjects && result.subjects.length === 1) {
-      const s = result.subjects[0];
-      await sendCoverToWechatUser(userId, {
-        title: s.title,
-        knownCover: s.cover,
-        year: s.year,
-        mediaType: type,
-        timeoutMs: 2800,
-      }).catch(() => false);
-    }
-
     return result.formattedNote;
   }
 

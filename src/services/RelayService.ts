@@ -7,7 +7,6 @@ import { DoubanService, DoubanSubject } from './DoubanService';
 import { UserProfileService } from './UserProfileService';
 import { SerializedJsonStore } from '../utils/StorageQueue';
 import { pickVariant, humanizeWithLlm } from '../utils/HumanTone';
-import { sendCoverToWechatUser } from '../utils/PosterHelper';
 
 export interface ActiveWechatContact {
   userId: string;
@@ -752,7 +751,6 @@ export class RelayService {
     let rate = matchedSubject?.rate;
     let types = matchedSubject?.types;
     let shortComment = matchedSubject?.shortComment;
-    let cover = matchedSubject?.cover;
     let mediaType: 'movie' | 'tv' | undefined = hotSess?.type;
 
     if (!year && !rate && !options?.skipNetworkLookup) {
@@ -763,7 +761,6 @@ export class RelayService {
         ]);
         if (meta) {
           year = meta.year || year;
-          cover = meta.cover || cover;
           if (!title && meta.title) title = meta.title;
         }
       } catch {}
@@ -799,13 +796,14 @@ export class RelayService {
     );
     const cardLines = [
       intro,
-      `📽️ 《${title}》${yearPart}${ratePart}`,
+      '',
+      `**📽️ 《${title}》**${yearPart}${ratePart}`,
     ];
     if (types && types.length > 0) {
-      cardLines.push(`标签：${types.slice(0, 4).join(' / ')}`);
+      cardLines.push(`标签：${types.slice(0, 4).join(' · ')}`);
     }
     if (shortComment) {
-      cardLines.push(`看点：${shortComment.slice(0, 80)}`);
+      cardLines.push(`> ${shortComment.slice(0, 80)}`);
     }
     if (note) {
       cardLines.push(`${senderNameForTarget} 说：「${note}」`);
@@ -814,17 +812,7 @@ export class RelayService {
       cardLines.push(`网盘直达：${sharedResourceUrl}`);
     }
     cardLines.push('');
-    cardLines.push(`想看直接回个「存一下」或「搜一下」我帮你存好；要回 ${senderNameForTarget} 话也直接跟我说~`);
-
-    if (!options?.skipNetworkLookup) {
-      await sendCoverToWechatUser(recipient.userId, {
-        title,
-        knownCover: cover,
-        year,
-        mediaType,
-        timeoutMs: 2600,
-      }).catch(() => false);
-    }
+    cardLines.push(`👉 想看回 **「存一下」** 或 **「搜一下」** 帮你存好；要回 ${senderNameForTarget} 话直接说就行~`);
 
     const delivered = await PushGateway.getInstance().sendToUser(recipient.userId, cardLines.join('\n'));
     if (!delivered) {
