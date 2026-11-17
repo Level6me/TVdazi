@@ -1324,6 +1324,28 @@ test('DoubanService 全面接入待映/热映/口碑榜/Top250/深度详情/高�
     assert.ok(page2.includes('重映'));
     const endHint = await handler.handle('还有吗', '__pag_chart_u__');
     assert.ok(endHint.includes('全部 12 部都已经看完啦'));
+
+    // 验证「蹲一下10 / 蹲守第1部 / 蹲守这部」能正确解析成真实片名，绝不创建《10》
+    const { SchedulerService } = require('../services/SchedulerService');
+    const sched = SchedulerService.getInstance();
+    const watchUser = `__watch_idx_test_${Date.now()}__`;
+    const upcomingWithAvengers = [
+      ...Array.from({ length: 9 }, (_, i) => ({ id: String(i + 1), title: `待映新片${i + 1}`, rate: '', cover: '', url: '' })),
+      { id: '9999', title: '复仇者联盟5', rate: '', cover: '', url: '' },
+    ];
+    SessionManager.getInstance().setHot(watchUser, 'movie', upcomingWithAvengers, '即将上映', 1, 10, undefined, {
+      mode: 'chart',
+      chartHeading: '🎬 大陆院线即将上映（豆瓣待映）',
+    });
+    assert.equal(sched.isScheduleIntent('蹲一下10'), true);
+    const resolved10 = (sched as any).resolveTargetMovieTitle(watchUser, '蹲一下10');
+    assert.equal(resolved10.title, '复仇者联盟5');
+    const resolvedFirst = (sched as any).resolveTargetMovieTitle(watchUser, '蹲守第1部');
+    assert.equal(resolvedFirst.title, '待映新片1');
+    const resolvedOutOfRange = (sched as any).resolveTargetMovieTitle(watchUser, '蹲守99');
+    assert.ok(resolvedOutOfRange.error && resolvedOutOfRange.error.includes('超出范围'));
+    const resolvedNoCtx = (sched as any).resolveTargetMovieTitle('__empty_ctx_user__', '蹲一下10');
+    assert.ok(resolvedNoCtx.error && !resolvedNoCtx.title);
   } finally {
     (axios as any).get = origAxiosGet;
   }

@@ -1492,6 +1492,77 @@ export class SchedulerService {
   }
 
   /**
+   * 结合当前用户的榜单/搜索/近期讨论上下文，把“10 / 第10部 / 本页第1个 / 这部”准确还原成真实影视片名，
+   * 绝不允许把纯数字或“第X部”直接当成片名创建监控任务。
+   */
+  private resolveTargetMovieTitle(userId: string, rawInput: string): { title?: string; error?: string } {
+    const clean = SchedulerService.extractCleanMovieTitle(rawInput);
+    if (!clean) return {};
+
+    // 1. 明确包含书名号《片名》时直接信任
+    if (/《[^》]+》/.test(rawInput)) {
+      return { title: clean };
+    }
+
+    // 2. 指代词（“这部 / 那部 / 它 / 上面那部 / 刚才那部”）
+    if (/^(?:这部|这个|它|那部|那个|上面那部|刚才那部|最新那部)$/i.test(clean)) {
+      const recent = this.sessionManager.getRecentTargetTitle(userId);
+      if (recent) return { title: recent };
+      return { error: '还没确定你说的是哪一部呀，直接把片名发给我，比如「蹲守《复仇者联盟5》」~' };
+    }
+
+    // 3. 序号引用（“10”、“第10部”、“第1个”、“本页第2部”）
+    const strippedForSel = clean.replace(/(?:这个|这部|那部|那个)$/, '').trim();
+    const sel = SessionManager.parseSelection(strippedForSel);
+    const ordinalMatch = clean.match(/^(?:本页|当前页|这页)?\s*(?:第)?\s*([0-9]{1,3}|[一二两三四五六七八九十]+)\s*(?:个|条|部|名)?$/);
+    const parsedIndex = sel?.index ?? (ordinalMatch ? SessionManager.parseNumberSelection(ordinalMatch[0]) : null);
+
+    if (parsedIndex !== null && (sel || ordinalMatch || /^\d{1,3}$/.test(clean))) {
+      const lastType = this.sessionManager.getLastActiveType(userId);
+      const hotSess = this.sessionManager.getHot(userId);
+      const searchSess = this.sessionManager.getSearch(userId);
+
+      const targetList: Array<{ title: string }> | undefined =
+        lastType === 'hot' && hotSess?.items?.length
+          ? hotSess.items
+          : searchSess?.items?.length
+          ? searchSess.items
+          : hotSess?.items?.length
+          ? hotSess.items
+          : undefined;
+
+      if (!targetList || targetList.length === 0) {
+        return {
+          error: `没找到对应的第 ${parsedIndex} 部片单记录哦，请直接发片名给我（比如「蹲守《复仇者联盟5》」），或先查一下待映/热榜~`,
+        };
+      }
+
+      const activePage = lastType === 'hot' || !searchSess ? hotSess?.page || 1 : searchSess.page || 1;
+      const activeSize = lastType === 'hot' || !searchSess ? hotSess?.pageSize || 10 : searchSess.pageSize || 8;
+      const finalIdx = sel?.isPageRelative && activePage > 1 ? (activePage - 1) * activeSize + parsedIndex : parsedIndex;
+
+      if (finalIdx < 1 || finalIdx > targetList.length) {
+        return {
+          error: `当前列表一共只有 ${targetList.length} 部，序号 ${finalIdx} 超出范围啦~ 请选 1~${targetList.length} 之间的数字，或直接发片名给我。`,
+        };
+      }
+
+      const pickedTitle = String(targetList[finalIdx - 1]?.title || '').replace(/[《》]/g, '').trim();
+      if (!pickedTitle) {
+        return { error: `第 ${finalIdx} 项没有取到有效片名，麻烦直接发片名给我~` };
+      }
+      return { title: pickedTitle };
+    }
+
+    // 4. 兜底拦截裸数字
+    if (/^\d{1,4}$/.test(clean)) {
+      return { error: `没找到序号「${clean}」对应的影视作品，麻烦直接把片名告诉我哦~` };
+    }
+
+    return { title: clean };
+  }
+
+  /**
    * 从自然语言文本中解析时间（委托给 ScheduleTimeParser 模块）
    */
   public static parseTimeFromText(text: string): {
@@ -1782,7 +1853,9 @@ export class SchedulerService {
 
     // 6. 扩展 D：4K / 高画质洗版监控
     if (/(?:出\s*4[kK]|有\s*4[kK]|4[kK]\s*资源|4[kK]\s*原盘|高画质|洗版)/i.test(trimmed)) {
-      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed);
+      const resolvedTarget = this.resolveTargetMovieTitle(userId, trimmed);
+      if (resolvedTarget.error) return resolvedTarget.error;
+      const movieTitle = resolvedTarget.title;
       if (movieTitle) {
         const task = this.addTask({
           userId,
@@ -1799,12 +1872,8 @@ export class SchedulerService {
           return firstCheck || `💎 《${movieTitle}》已命中 4K 高规格片源！`;
         }
         return [
-          `💎 已为你创建【4K 高画质洗版监控】任务！`,
-          `📺 监控目标：《${movieTitle}》（匹配 4K / 2160P / REMUX / 杜比）`,
-          `⏱️ 轮询间隔：${activeFreqText}自动巡检一次`,
-          `⚡ 动作设定：一旦出 4K 洗版资源，自动转存至你的夸克网盘并微信通知你`,
-          `─────────────────────────`,
-          firstCheck || '',
+          `**💎 已帮你盯上《${movieTitle}》的 4K 高画质版**（${activeFreqText}巡检一次，出 4K / 原盘 / 杜比资源就自动帮你存网盘并喊你~）`,
+          firstCheck ? `\n${firstCheck}` : '',
         ]
           .filter(Boolean)
           .join('\n');
@@ -1816,9 +1885,11 @@ export class SchedulerService {
       /(?:^\/追更|帮我追更|给我追更|自动追更|追更|订阅更新)/i.test(trimmed) ||
       /(?:更新了|出新集了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
     ) {
-      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/追更\s*/i, ''));
+      const resolvedTarget = this.resolveTargetMovieTitle(userId, trimmed.replace(/^\/追更\s*/i, ''));
+      if (resolvedTarget.error) return resolvedTarget.error;
+      const movieTitle = resolvedTarget.title;
       if (!movieTitle) {
-        return '请告诉我要追更哪部剧呀，例如发送：「帮我追更《今天是太阳雨》」或「每15分钟追更《小城良方》」~';
+        return '想追更哪部剧直接把片名或序号发我就行，比如「帮我追更《今天是太阳雨》」或「追更第1部」~';
       }
       const task = this.addTask({
         userId,
@@ -1838,10 +1909,8 @@ export class SchedulerService {
         return firstCheck || `📺 《${movieTitle}》全集已追更完毕并入库！`;
       }
       return [
-        `📺 已为你开启【连载热播剧全自动追更】：《${movieTitle}》！`,
-        `🔄 巡检频率：${activeFreqText}自动检测全网最新集数，发现新集数将自动转存夸克网盘 + 防和谐改名 + 微信推送通知你！`,
-        `─────────────────────────`,
-        firstCheck || '',
+        `**📺 已经开始帮你自动追更《${movieTitle}》啦**（${activeFreqText}巡检一次新集数，一有更新自动存网盘并通知你~）`,
+        firstCheck ? `\n${firstCheck}` : '',
       ]
         .filter(Boolean)
         .join('\n');
@@ -1849,12 +1918,14 @@ export class SchedulerService {
 
     // 8. 场景 2：某部未出资源电影/剧集全网蹲守监控
     if (
-      /(?:^\/watch|^\/蹲守|帮我蹲守|帮我蹲|给我蹲|蹲守|蹲一下|蹲一个|^蹲\s+)/i.test(trimmed) ||
+      /(?:^\/watch|^\/蹲守|帮我蹲守|帮我蹲|给我蹲|蹲守|蹲一下|蹲一个|^蹲\s*)/i.test(trimmed) ||
       /(?:有资源了|出资源了|出了资源|资源出了|有片源了|上线了).*?(?:推送|通知|告诉我|发给我|提醒|帮我存|自动存|转存)/i.test(trimmed)
     ) {
-      const movieTitle = SchedulerService.extractCleanMovieTitle(trimmed.replace(/^\/(?:watch|蹲守)\s*/i, ''));
+      const resolvedTarget = this.resolveTargetMovieTitle(userId, trimmed.replace(/^\/(?:watch|蹲守)\s*/i, ''));
+      if (resolvedTarget.error) return resolvedTarget.error;
+      const movieTitle = resolvedTarget.title;
       if (!movieTitle) {
-        return '请告诉我要蹲守哪部电影或剧集呀，例如：「《流浪地球3》有资源了通知我」或「每10分钟蹲守《奥德赛》」~';
+        return '想蹲哪部片直接发片名或列表序号就行，比如「蹲守《复仇者联盟5》」或「蹲一下第1部」~';
       }
       const notifyOnly = /(?:通知我|提醒我|告诉我|发给我)/.test(trimmed) && !wantAutoSave;
       const task = this.addTask({
@@ -1871,10 +1942,9 @@ export class SchedulerService {
         return firstCheck || `🎉 你蹲守的《${movieTitle}》已经有资源啦！`;
       }
       return [
-        `🛰️ 已为你挂载【全网资源雷达蹲守】：《${movieTitle}》！`,
-        `⚡ 触发动作：后台${activeFreqText}轮询 50+ 频道，一旦出资源立即微信推送给你${task.autoSave ? '并自动转存至你的夸克网盘' : ''}！`,
-        `─────────────────────────`,
-        firstCheck || '',
+        `**🛰️ 没问题，帮你把《${movieTitle}》挂上蹲守啦！**`,
+        `后台每${activeFreqText.replace(/^每/, '')}自动帮你扫一遍全网频道，一旦出片源立刻微信喊你${task.autoSave ? '并自动存进夸克网盘' : ''}~`,
+        firstCheck ? `\n${firstCheck}` : '',
       ]
         .filter(Boolean)
         .join('\n');
