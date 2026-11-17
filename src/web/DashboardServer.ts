@@ -30,6 +30,7 @@ export class DashboardServer {
   private static cachedSecret: string | null = null;
   private static detectedPublicHost: string | null = null;
   private static customEnvPath: string | null = null;
+  private static autoEnrichCooldown: Map<string, number> = new Map();
 
   static setEnvFilePath(envPath: string | null): void {
     this.customEnvPath = envPath;
@@ -281,7 +282,18 @@ export class DashboardServer {
       if (parsedUrl.query.probe === '1') {
         await health.probeChannels(channelIds);
       }
-      const plan = userManager.getUserPlan(userId);
+      let plan = userManager.getUserPlan(userId);
+      // 首次打开控制台若片单存在缺失封面的历史条目，限时并发补全并立即随状态下发
+      const now = Date.now();
+      const lastEnrich = this.autoEnrichCooldown.get(userId) || 0;
+      if (!userId.startsWith('__') && plan.watchlist.some((w) => !w.cover) && now - lastEnrich > 60000) {
+        this.autoEnrichCooldown.set(userId, now);
+        await Promise.race([
+          WatchlistService.enrichPendingItems(userId, 8).catch(() => 0),
+          new Promise<number>((resolve) => setTimeout(() => resolve(0), 2600)),
+        ]);
+        plan = userManager.getUserPlan(userId);
+      }
       const tasks = scheduler.getUserTasks(userId);
       const channels = health.getAllStats(channelIds);
       const relay = RelayService.getInstance();
@@ -1196,7 +1208,7 @@ ${AUI_BUNDLE_CSS}
 
       <div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:10px;">
         <button class="pill-btn accent" onclick="pickWatchlistTonight(this)">🎲 今晚看哪部</button>
-        <button class="pill-btn" onclick="enrichWatchlistNow(this)">✨ 补全豆瓣评分</button>
+        <button class="pill-btn" onclick="enrichWatchlistNow(this)">✨ 补全封面与评分</button>
         <button class="pill-btn" onclick="syncWatchlistCloud(this)">☁️ 网盘库存对账</button>
         <button class="pill-btn" onclick="exportWatchlistNow(this)">📤 导出片单</button>
       </div>
@@ -1380,7 +1392,8 @@ function posterFallback(img){
 
 function posterThumbHtml(cover, title, cls){
   var c = posterUrl(cover);
-  var ch = esc((title || "片").slice(0, 1));
+  var cleanTitle = String(title || "").replace(/^(?:【[^】]*】|\[[^\]]*\])+/g, "").replace(/^[\s《【\[\(（]+/, "");
+  var ch = esc((cleanTitle || "片").slice(0, 1));
   var baseCls = cls || "wl-poster";
   if (!c) {
     return '<div class="' + baseCls + ' wl-poster-fallback"><span>' + ch + '</span></div>';

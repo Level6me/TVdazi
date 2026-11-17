@@ -12,6 +12,7 @@ import QRCode from 'qrcode';
 import { encodeWechatMediaAesKey } from '../wechat/CdnUpload';
 import { WeixinBot } from '../wechat/WeixinBot';
 import { isAllowedPosterUrl, detectImageMimeAndExt, sendCoverToWechatUser } from '../utils/PosterHelper';
+import { MetadataResolver } from '../services/MetadataResolver';
 
 import { maskSensitive } from '../utils/Logger';
 import { LruCache } from '../utils/LruCache';
@@ -1049,4 +1050,19 @@ test('影视封面安全校验、魔数识别、H5海报代理防SSRF及微信�
     (axios as any).get = origAxiosGet;
     await new Promise<void>((resolve) => server.close(() => resolve()));
   }
+});
+
+test('MetadataResolver.extractMediaQuery 能准确剥离网盘画质与标签噪点提取片名和年份', () => {
+  assert.deepEqual(MetadataResolver.extractMediaQuery('【原盘】星际穿越 (2014) 4K REMUX 外挂中字字幕'), {
+    title: '星际穿越',
+    year: '2014',
+  });
+  assert.deepEqual(MetadataResolver.extractMediaQuery('功夫 (2004) 4K 高码 60帧 国粤多音轨'), {
+    title: '功夫',
+    year: '2004',
+  });
+  assert.deepEqual(MetadataResolver.extractMediaQuery('《好东西》'), {
+    title: '好东西',
+    year: undefined,
+  });
 });

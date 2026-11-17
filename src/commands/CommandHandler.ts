@@ -685,6 +685,10 @@ export class CommandHandler {
       const item = searchSession.items[itemIndex];
       const category = item.category || CategoryClassifier.classify(item.title, item.rawText);
       const standardTitle = searchSession.keyword || item.title;
+      const saveTitle =
+        MetadataResolver.extractMediaQuery(standardTitle).title ||
+        MetadataResolver.extractMediaQuery(item.title).title ||
+        standardTitle;
 
       if (item.panType === 'quark' || item.shareUrl.includes('pan.quark.cn')) {
         const res = await this.quarkService.saveShareFiles(item.shareId, item.passcode || '', category, {
@@ -694,9 +698,9 @@ export class CommandHandler {
           userId: userId,
         });
         if (res.success) {
-          this.userManager.recordSave(userId, item.title, item.shareUrl, category, res.targetPath);
+          this.userManager.recordSave(userId, saveTitle, item.shareUrl, category, res.targetPath);
           UserProfileService.getInstance()
-            .recordImplicitBehavior(userId, item.title, 'save', {
+            .recordImplicitBehavior(userId, saveTitle, 'save', {
               mediaType: category,
             })
             .catch(() => {});
@@ -745,7 +749,7 @@ export class CommandHandler {
             userId,
           });
           if (panRes.success) {
-            this.userManager.recordSave(userId, item.title, item.shareUrl, category);
+            this.userManager.recordSave(userId, saveTitle, item.shareUrl, category);
             WebhookService.notifyMediaSaved(userPlan.webhookUrl, {
               userId,
               title: item.title,

@@ -159,34 +159,48 @@ export class WatchlistService {
 
     const douban = new DoubanService();
     const userManager = UserManager.getInstance();
-    try {
-      const sub = await Promise.race([
-        douban.searchAndEnrichSubjectByTitle(cleanTitle),
-        new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
-      ]);
-      if (!sub) return null;
+    const { title: queryTitle, year: extractedYear } = MetadataResolver.extractMediaQuery(cleanTitle);
+    const lookupTitle = queryTitle || cleanTitle;
 
-      const epNum = sub.episodesCount ? parseInt(String(sub.episodesCount), 10) : NaN;
+    try {
+      const [subSettled, coverSettled] = await Promise.allSettled([
+        Promise.race([
+          douban.searchAndEnrichSubjectByTitle(lookupTitle),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 3500)),
+        ]),
+        Promise.race([
+          MetadataResolver.getInstance().resolveCoverUrl(lookupTitle, {
+            year: extractedYear,
+            userId,
+          }),
+          new Promise<undefined>((resolve) => setTimeout(() => resolve(undefined), 3500)),
+        ]),
+      ]);
+
+      const sub = subSettled.status === 'fulfilled' ? subSettled.value : null;
+      const fallbackCover = coverSettled.status === 'fulfilled' ? coverSettled.value : undefined;
+      const coverUrl = (sub?.cover || '').trim() || fallbackCover || undefined;
+
+      if (!sub && !coverUrl) return null;
+
+      const epNum = sub?.episodesCount ? parseInt(String(sub.episodesCount), 10) : NaN;
       const totalEpisodes = Number.isFinite(epNum) && epNum > 0 ? epNum : undefined;
-      const inferredMedia = UserProfileService.getInstance().inferSubjectMediaTypes(sub);
+      const inferredMedia = sub ? UserProfileService.getInstance().inferSubjectMediaTypes(sub) : [];
       const primaryCategory = inferredMedia[0] || undefined;
 
-      let coverUrl = sub.cover || undefined;
-      if (!coverUrl) {
-        coverUrl = await MetadataResolver.getInstance()
-          .resolveCoverUrl(cleanTitle, { year: sub.year })
-          .catch(() => undefined);
-      }
-
       return userManager.updateWatchlistItem(userId, cleanTitle, {
-        rating: sub.rate || undefined,
-        year: sub.year || undefined,
-        region: sub.region || undefined,
-        genres: sub.types && sub.types.length > 0 ? sub.types.slice(0, 4) : undefined,
+        rating: sub?.rate || undefined,
+        year: sub?.year || extractedYear || undefined,
+        region: sub?.region || undefined,
+        genres: sub?.types && sub.types.length > 0 ? sub.types.slice(0, 4) : undefined,
         totalEpisodes,
         cover: coverUrl,
-        doubanId: sub.id || undefined,
-        type: totalEpisodes || (primaryCategory && /剧|动画|综艺|纪录片/.test(primaryCategory)) ? 'tv' : 'movie',
+        doubanId: sub?.id || undefined,
+        ...(sub
+          ? {
+              type: totalEpisodes || (primaryCategory && /剧|动画|综艺|纪录片/.test(primaryCategory)) ? 'tv' : 'movie',
+            }
+          : {}),
         ...(primaryCategory ? { category: primaryCategory } : {}),
       });
     } catch {
@@ -195,17 +209,25 @@ export class WatchlistService {
   }
 
   /**
-   * 批量补全尚未拉取豆瓣元数据或封面的片单条目（最多处理 maxItems 条）
+   * 批量补全尚未拉取豆瓣元数据或封面的片单条目（并发处理，最多 maxItems 条）
    */
   static async enrichPendingItems(userId: string, maxItems: number = 8): Promise<number> {
     const plan = UserManager.getInstance().getUserPlan(userId);
     const pending = plan.watchlist
       .filter((w) => (!w.rating && !w.doubanId && !w.year) || !w.cover)
       .slice(0, maxItems);
+    if (pending.length === 0) return 0;
+
     let updated = 0;
-    for (const item of pending) {
-      const res = await this.enrichWatchlistItem(userId, item.title);
-      if (res) updated += 1;
+    const batchSize = 4;
+    for (let i = 0; i < pending.length; i += batchSize) {
+      const batch = pending.slice(i, i + batchSize);
+      const results = await Promise.allSettled(
+        batch.map((item) => this.enrichWatchlistItem(userId, item.title))
+      );
+      for (const r of results) {
+        if (r.status === 'fulfilled' && r.value) updated += 1;
+      }
     }
     return updated;
   }

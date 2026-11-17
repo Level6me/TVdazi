@@ -101,6 +101,40 @@ export class MetadataResolver {
       .trim();
   }
 
+  /**
+   * 从网盘资源标题中剥离【原盘】、4K、REMUX、60帧、外挂字幕、年份等噪点，提取纯净片名与年份
+   */
+  public static extractMediaQuery(raw?: string): { title: string; year?: string } {
+    const base = MetadataResolver.cleanTitleStatic(raw);
+    if (!base) return { title: '' };
+
+    const yearMatch = base.match(/(?:^|[\s(\[（【])((?:19|20)\d{2})(?:[\s)\]）】]|$)/);
+    const year = yearMatch ? yearMatch[1] : undefined;
+
+    const cleaned = base
+      .replace(/^(?:【[^】]{1,24}】|\[[^\]]{1,24}\])\s*/g, '')
+      .replace(/[（(\[【]\s*(?:19|20)\d{2}\s*[）)\]】]/g, ' ')
+      .replace(/\b(?:19|20)\d{2}\b/g, ' ')
+      .replace(
+        /\b(?:4k|2k|8k|1080p|2160p|720p|uhd|hdr\d*|dv|sdr|remux|bluray|blu-ray|bdmv|web-dl|webrip|hdtv|hevc|avc|x264|x265|h\.?264|h\.?265|10bit|8bit|aac|ac3|dts(?:-hd)?|truehd|atmos|flac|fps)\b/gi,
+        ' '
+      )
+      .replace(
+        /(?:杜比视界|杜比全景声|全景声|高码率?|高帧率|\d{2,3}帧|原盘|国粤双语|国粤多音轨|多音轨|双语|国语|粤语|英语|中英双字|外挂中?字?字幕|内封中?字?|简繁中字|简体中字|繁体中字|中文字幕|双语字幕|特效字幕|中字|未删减|无删减|加长版|导演剪辑版|终极版|完整版|珍藏版|合集|全集|全\d+集)/gi,
+        ' '
+      )
+      .replace(/\bS\d{1,2}(?:E\d{1,3})?\b/gi, ' ')
+      .replace(/[（(\[【][^（）()\[\]【】]{0,20}[）)\]】]\s*$/g, ' ')
+      .replace(/[\s\-_|/]+$/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    return {
+      title: cleaned || base,
+      year,
+    };
+  }
+
   private normalizeCleanTitle(raw?: string): string {
     return MetadataResolver.cleanTitleStatic(raw);
   }
@@ -750,28 +784,60 @@ export class MetadataResolver {
   }
 
   /**
-   * 快捷解析单部影视作品的官方海报封面 URL（优先豆瓣，缺失时回退 TMDB / Bangumi）
+   * 快捷解析单部影视作品的官方海报封面 URL（支持脏标题清洗，并发检索豆瓣 / TMDB，缺失时回退 LLM 错别字纠偏再查）
    */
   public async resolveCoverUrl(
     title: string,
-    opts?: { year?: string; mediaType?: 'movie' | 'tv' }
+    opts?: { year?: string; mediaType?: 'movie' | 'tv'; userId?: string }
   ): Promise<string | undefined> {
-    const clean = this.normalizeCleanTitle(title);
+    const extracted = MetadataResolver.extractMediaQuery(title);
+    const clean = extracted.title;
+    const year = opts?.year || extracted.year;
     if (!clean) return undefined;
 
-    const doubanMeta = await this.doubanService.getMovieMeta(clean).catch(() => null);
-    if (doubanMeta?.cover) {
-      return doubanMeta.cover;
-    }
+    const noDigitTitle = clean.replace(/(?:第[一二三四五六七八九十\d]+季|\s*\d+)$/, '').trim();
+    const candidates = noDigitTitle && noDigitTitle !== clean ? [clean, noDigitTitle] : [clean];
+
+    const [doubanMeta, tmdbRes] = await Promise.all([
+      (async () => {
+        for (const q of candidates) {
+          const m = await this.doubanService.getMovieMeta(q).catch(() => null);
+          if (m?.cover) return m.cover;
+        }
+        return undefined;
+      })(),
+      this.hasTmdbConfigured()
+        ? this.resolveWithTmdb(candidates, year, opts?.mediaType).catch(() => null)
+        : Promise.resolve(null),
+    ]);
+
+    if (doubanMeta) return doubanMeta;
+    if (tmdbRes?.coverUrl) return tmdbRes.coverUrl;
 
     const resolved = await this.resolveMedia({
       query: clean,
       guessTitle: clean,
-      year: opts?.year,
+      year,
       mediaType: opts?.mediaType,
-      forceLlm: false,
+      userId: opts?.userId,
+      forceLlm: true,
     }).catch(() => null);
 
-    return resolved?.coverUrl;
+    if (resolved?.coverUrl) return resolved.coverUrl;
+
+    // 若大模型将错别字片名（如“财狼的日子2”->“豺狼的日子”）纠偏为标准片名，按标准片名补查一次封面
+    const corrected = resolved?.standardTitle ? MetadataResolver.extractMediaQuery(resolved.standardTitle).title : '';
+    if (corrected && corrected !== clean) {
+      const [retryDouban, retryTmdb] = await Promise.all([
+        this.doubanService.getMovieMeta(corrected).catch(() => null),
+        this.hasTmdbConfigured()
+          ? this.resolveWithTmdb([corrected], resolved?.year || year, opts?.mediaType).catch(() => null)
+          : Promise.resolve(null),
+      ]);
+      if (retryDouban?.cover) return retryDouban.cover;
+      if (retryTmdb?.coverUrl) return retryTmdb.coverUrl;
+    }
+
+    return undefined;
   }
 }
