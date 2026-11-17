@@ -120,7 +120,10 @@ export class DoubanService {
   /**
    * 根据片名检索豆瓣信息，获取准确 ID、年份、评分、原名与海报封面
    */
-  async getMovieMeta(keyword: string): Promise<{ id?: string; title: string; year?: string; rate?: string; subTitle?: string; cover?: string } | null> {
+  async getMovieMeta(
+    keyword: string,
+    opts?: { allowExactTie?: boolean; year?: string }
+  ): Promise<{ id?: string; title: string; year?: string; rate?: string; subTitle?: string; cover?: string } | null> {
     const clean = keyword.replace(/^(电影|电视剧|网剧|动漫)\s*/, '').trim();
     if (!clean) return null;
 
@@ -135,22 +138,31 @@ export class DoubanService {
       });
 
       if (Array.isArray(resp.data) && resp.data.length > 0) {
-        const yearMatch = clean.match(/(?:19|20)\d{2}/)?.[0];
+        const yearMatch = opts?.year || clean.match(/(?:19|20)\d{2}/)?.[0];
         const queryTitle = clean.replace(/[（(](?:19|20)\d{2}[）)]?/g, '').replace(/(?:19|20)\d{2}/g, '').trim() || clean;
         const ranked = resp.data
-          .map((item: any) => {
+          .map((item: any, idx: number) => {
             const similarity = Math.max(
               this.titleSimilarity(queryTitle, item.title),
               this.titleSimilarity(queryTitle, item.sub_title)
             );
             const matchesYear = Boolean(yearMatch && String(item.year || '') === yearMatch);
             const hasYearConflict = Boolean(yearMatch && item.year && String(item.year) !== yearMatch);
-            return { item, similarity, matchesYear, hasYearConflict, score: similarity + (matchesYear ? 0.2 : hasYearConflict ? -0.2 : 0) };
+            const hasCover = Boolean(item.img && String(item.img).trim());
+            return {
+              item,
+              idx,
+              similarity,
+              matchesYear,
+              hasYearConflict,
+              score: similarity + (matchesYear ? 0.2 : hasYearConflict ? -0.2 : 0) + (opts?.allowExactTie && hasCover ? 0.01 : 0),
+            };
           })
-          .sort((a: any, b: any) => b.score - a.score);
+          .sort((a: any, b: any) => b.score - a.score || a.idx - b.idx);
         const best = ranked[0];
         if (!best || best.similarity < 0.58 || (yearMatch && best.hasYearConflict)) return null;
-        if (ranked[1] && best.score - ranked[1].score < 0.06) return null;
+        const allowTie = Boolean(opts?.allowExactTie && best.similarity >= 0.99);
+        if (!allowTie && ranked[1] && best.score - ranked[1].score < 0.06) return null;
         const matched = best.item;
         return {
           id: matched.id ? String(matched.id) : undefined,
@@ -170,7 +182,7 @@ export class DoubanService {
    * 根据片名直接查询豆瓣并补全真实详情摘要（用于特定剧情/相似剧集精准核验）
    */
   async searchAndEnrichSubjectByTitle(title: string): Promise<DoubanSubject | null> {
-    const meta = await this.getMovieMeta(title);
+    const meta = await this.getMovieMeta(title, { allowExactTie: true });
     if (!meta || !meta.id) return null;
 
     const abs = await this.getSubjectAbstract(meta.id);

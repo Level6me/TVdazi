@@ -239,7 +239,8 @@ export class MetadataResolver {
   private async resolveWithTmdb(
     queries: string[],
     preferredYear?: string,
-    preferredMediaType?: 'movie' | 'tv'
+    preferredMediaType?: 'movie' | 'tv',
+    allowExactTie: boolean = false
   ): Promise<ResolvedMediaInfo | null> {
     const cred = this.getTmdbCredential();
     if (!cred) return null;
@@ -287,9 +288,11 @@ export class MetadataResolver {
             const typeMismatch = Boolean(preferredMediaType && item.media_type !== preferredMediaType);
             const score = nameScore * 0.78 + (preferredYear ? (yearMatch ? 0.18 : yearMismatch ? -0.12 : 0) : 0.1) +
               (preferredMediaType ? (typeMatch ? 0.08 : typeMismatch ? -0.12 : 0) : 0.08);
-            return { item, nameScore, yearMatch, yearMismatch, typeMatch, score };
+            const popularity = Number(item.popularity) || 0;
+            const hasPoster = Boolean(item.poster_path);
+            return { item, nameScore, yearMatch, yearMismatch, typeMatch, score, popularity, hasPoster };
           })
-          .sort((a: any, b: any) => b.score - a.score);
+          .sort((a: any, b: any) => b.score - a.score || Number(b.hasPoster) - Number(a.hasPoster) || b.popularity - a.popularity);
         const bestRanked = ranked[0];
         const runnerUp = ranked[1];
         if (!bestRanked || bestRanked.nameScore < 0.58) continue;
@@ -297,7 +300,7 @@ export class MetadataResolver {
         const exactName = bestRanked.nameScore >= 0.999;
         const clearWinner = !runnerUp || bestRanked.score - runnerUp.score >= 0.08;
         if (!exactName && !bestRanked.yearMatch && !bestRanked.typeMatch && !clearWinner) continue;
-        if (runnerUp && bestRanked.score - runnerUp.score < 0.06) continue;
+        if (!(allowExactTie && exactName) && runnerUp && bestRanked.score - runnerUp.score < 0.06) continue;
         const best = bestRanked.item;
 
         const mediaType: 'movie' | 'tv' = best.media_type === 'tv' ? 'tv' : 'movie';
@@ -801,13 +804,13 @@ export class MetadataResolver {
     const [doubanMeta, tmdbRes] = await Promise.all([
       (async () => {
         for (const q of candidates) {
-          const m = await this.doubanService.getMovieMeta(q).catch(() => null);
+          const m = await this.doubanService.getMovieMeta(q, { allowExactTie: true, year }).catch(() => null);
           if (m?.cover) return m.cover;
         }
         return undefined;
       })(),
       this.hasTmdbConfigured()
-        ? this.resolveWithTmdb(candidates, year, opts?.mediaType).catch(() => null)
+        ? this.resolveWithTmdb(candidates, year, opts?.mediaType, true).catch(() => null)
         : Promise.resolve(null),
     ]);
 
@@ -829,9 +832,9 @@ export class MetadataResolver {
     const corrected = resolved?.standardTitle ? MetadataResolver.extractMediaQuery(resolved.standardTitle).title : '';
     if (corrected && corrected !== clean) {
       const [retryDouban, retryTmdb] = await Promise.all([
-        this.doubanService.getMovieMeta(corrected).catch(() => null),
+        this.doubanService.getMovieMeta(corrected, { allowExactTie: true, year: resolved?.year || year }).catch(() => null),
         this.hasTmdbConfigured()
-          ? this.resolveWithTmdb([corrected], resolved?.year || year, opts?.mediaType).catch(() => null)
+          ? this.resolveWithTmdb([corrected], resolved?.year || year, opts?.mediaType, true).catch(() => null)
           : Promise.resolve(null),
       ]);
       if (retryDouban?.cover) return retryDouban.cover;
