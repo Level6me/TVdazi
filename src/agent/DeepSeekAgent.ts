@@ -718,9 +718,13 @@ export class DeepSeekAgent {
                   type: 'boolean',
                   description: '是否从 Top250 或榜单中随机抽几部（如“Top250随机推一部”）',
                 },
+                page: {
+                  type: 'number',
+                  description: '页码（从 1 开始，每页 10 部；用户追问“还有吗/下一页/后面还有哪些”时传 2 或下一页页码）',
+                },
                 limit: {
                   type: 'number',
-                  description: '返回数量，默认 10',
+                  description: '单页返回数量，默认 10',
                 },
               },
               required: ['chart'],
@@ -1039,20 +1043,35 @@ export class DeepSeekAgent {
             },
           };
           const cfg = chartMap[String(args.chart || 'upcoming')] || chartMap.upcoming;
-          const limit = Math.min(15, Math.max(1, Number(args.limit) || (cfg.type === 'movie_soon' ? 12 : 10)));
+          const pageSize = Math.min(15, Math.max(1, Number(args.limit) || 10));
+          const reqPage = Math.max(1, Number(args.page) || 1);
+          const fetchCount = cfg.type === 'movie_soon' || cfg.type === 'movie_showing' ? 25 : 20;
           const start = cfg.type === 'movie_top250' && args.random_pick ? Math.floor(Math.random() * 20) * 10 : 0;
           const doubanSvc = new DoubanService();
-          let list = await doubanSvc.getDoubanChart(cfg.type, limit, start);
+          let list =
+            cfg.type === 'movie_soon'
+              ? await doubanSvc.getUpcomingMovies(fetchCount)
+              : await doubanSvc.getDoubanChart(cfg.type, fetchCount, start);
           if (args.random_pick && list.length > 3) {
             list = list.sort(() => Math.random() - 0.5).slice(0, 3);
           }
-          this.sessionManager.setHot(userId, cfg.media, list, cfg.title, 1, list.length || limit);
-          if (list[0]?.title) {
-            this.sessionManager.setLastMentionedTitle(userId, list[0].title);
+          this.sessionManager.setHot(userId, cfg.media, list, cfg.title, reqPage, pageSize, undefined, {
+            mode: 'chart',
+            chartHeading: cfg.title,
+            showWishOrDate: cfg.showWishOrDate,
+            chartHint: cfg.hint,
+          });
+          const pageData = this.sessionManager.getHotPage(userId, reqPage);
+          if (pageData?.items[0]?.title) {
+            this.sessionManager.setLastMentionedTitle(userId, pageData.items[0].title);
           }
-          const cinemaReply = DoubanService.formatChartMarkdown(cfg.title, list, {
+          const cinemaReply = DoubanService.formatChartMarkdown(cfg.title, pageData?.items || list, {
             showWishOrDate: cfg.showWishOrDate,
             hint: cfg.hint,
+            page: pageData?.page,
+            pageSize: pageData?.pageSize,
+            total: pageData?.total,
+            startIdx: pageData?.startIdx,
           });
           appendUserHistory(trimmed, cinemaReply);
           return cinemaReply;
@@ -1076,7 +1095,10 @@ export class DeepSeekAgent {
 
           this.sessionManager.setLastMentionedTitle(userId, detail.title);
           if (similar.length > 0) {
-            this.sessionManager.setHot(userId, detail.type, similar, `类似《${detail.title}》`, 1, similar.length);
+            this.sessionManager.setHot(userId, detail.type, similar, `类似《${detail.title}》`, 1, similar.length, undefined, {
+              mode: 'chart',
+              chartHeading: `🍿 类似《${detail.title}》推荐`,
+            });
           }
 
           const deepReply = DoubanService.formatDeepDetailMarkdown({
@@ -1095,12 +1117,23 @@ export class DeepSeekAgent {
             appendUserHistory(trimmed, missReply);
             return missReply;
           }
-          this.sessionManager.setHot(userId, 'movie', celeb.works, `${celeb.name}作品`, 1, celeb.works.length);
-          if (celeb.works[0]?.title) {
-            this.sessionManager.setLastMentionedTitle(userId, celeb.works[0].title);
+          const celebHeading = `🎭 ${celeb.name} · 豆瓣代表作品`;
+          const celebHint = `👉 看中哪部直接回数字（如 **「1」**）我帮你搜网盘资源~`;
+          this.sessionManager.setHot(userId, 'movie', celeb.works, `${celeb.name}作品`, 1, 10, undefined, {
+            mode: 'chart',
+            chartHeading: celebHeading,
+            chartHint: celebHint,
+          });
+          const pageData = this.sessionManager.getHotPage(userId, 1);
+          if (pageData?.items[0]?.title) {
+            this.sessionManager.setLastMentionedTitle(userId, pageData.items[0].title);
           }
-          const celebReply = DoubanService.formatChartMarkdown(`🎭 ${celeb.name} · 豆瓣代表作品`, celeb.works, {
-            hint: `👉 看中哪部直接回数字（如 **「1」**）我帮你搜网盘资源~`,
+          const celebReply = DoubanService.formatChartMarkdown(celebHeading, pageData?.items || celeb.works, {
+            hint: celebHint,
+            page: pageData?.page,
+            pageSize: pageData?.pageSize,
+            total: pageData?.total,
+            startIdx: pageData?.startIdx,
           });
           appendUserHistory(trimmed, celebReply);
           return celebReply;

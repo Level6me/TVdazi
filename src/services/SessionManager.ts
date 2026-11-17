@@ -17,6 +17,10 @@ export interface HotSession {
   page: number;
   pageSize: number;
   updatedAt: number;
+  mode?: 'recommend' | 'chart';
+  chartHeading?: string;
+  showWishOrDate?: boolean;
+  chartHint?: string;
 }
 
 export interface PendingImageSearch {
@@ -91,7 +95,13 @@ export class SessionManager {
     tag: string = '热门',
     page: number = 1,
     pageSize: number = 10,
-    query?: string
+    query?: string,
+    extra?: {
+      mode?: 'recommend' | 'chart';
+      chartHeading?: string;
+      showWishOrDate?: boolean;
+      chartHint?: string;
+    }
   ): HotSession {
     const session: HotSession = {
       type,
@@ -101,10 +111,50 @@ export class SessionManager {
       page,
       pageSize,
       updatedAt: Date.now(),
+      mode: extra?.mode || 'recommend',
+      chartHeading: extra?.chartHeading,
+      showWishOrDate: extra?.showWishOrDate,
+      chartHint: extra?.chartHint,
     };
     this.setBounded(this.hotSessions, userId, session);
     this.setBounded(this.lastActiveSessionType, userId, 'hot');
     return session;
+  }
+
+  /**
+   * 获取指定页码的热门/豆瓣榜单列表切片（用于「还有吗 / 下一页」本地真分页）
+   */
+  getHotPage(userId: string, targetPage?: number): {
+    items: DoubanSubject[];
+    page: number;
+    pageSize: number;
+    totalPages: number;
+    startIdx: number;
+    total: number;
+    session: HotSession;
+  } | null {
+    const session = this.getHot(userId);
+    if (!session || session.items.length === 0) return null;
+
+    const total = session.items.length;
+    const pageSize = Math.max(1, session.pageSize || 10);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    let page = targetPage !== undefined ? targetPage : session.page || 1;
+    if (page < 1) page = 1;
+    if (page > totalPages) page = totalPages;
+    session.page = page;
+    session.updatedAt = Date.now();
+
+    const startIdx = (page - 1) * pageSize;
+    return {
+      items: session.items.slice(startIdx, startIdx + pageSize),
+      page,
+      pageSize,
+      totalPages,
+      startIdx,
+      total,
+      session,
+    };
   }
 
   getHot(userId: string): HotSession | undefined {
@@ -320,7 +370,26 @@ export class SessionManager {
    */
   static parsePagination(text: string): { action: 'next' | 'prev' | 'goto' | 'refresh'; page?: number } | null {
     const trimmed = text.trim();
-    if (['下一页', '下页', '后一页', 'next'].includes(trimmed.toLowerCase())) {
+    const cleanQ = trimmed.replace(/[?？!！。.~～]+$/g, '').trim();
+    if (
+      [
+        '下一页',
+        '下页',
+        '后一页',
+        'next',
+        '还有吗',
+        '还有嘛',
+        '还有没有',
+        '还有别的吗',
+        '还有其他吗',
+        '还有啥',
+        '后面呢',
+        '后面的',
+        '接着看',
+        '还有',
+        '更多',
+      ].includes(cleanQ.toLowerCase())
+    ) {
       return { action: 'next' };
     }
     if (['上一页', '上页', '前一页', 'prev'].includes(trimmed.toLowerCase())) {

@@ -21,6 +21,7 @@ export interface DoubanSubject {
   rank?: number;
   roles?: string[];
   type?: 'movie' | 'tv';
+  isRerelease?: boolean;
 }
 
 export type DoubanChartType =
@@ -442,10 +443,41 @@ export class DoubanService {
   }
 
   /**
-   * 1. 大陆院线「即将上映 / 待映」新片清单（含定档日期、想看人数）
+   * 1. 大陆院线「即将上映 / 待映」新片清单（拉取全量待映池，当年新片优先、往年重映标注 [重映] 并靠后排序）
    */
-  async getUpcomingMovies(limit = 12): Promise<DoubanSubject[]> {
-    return this.getDoubanChart('movie_soon', limit, 0);
+  async getUpcomingMovies(limit = 25, now: Date = new Date()): Promise<DoubanSubject[]> {
+    const rawList = await this.getDoubanChart('movie_soon', Math.max(limit, 25), 0);
+    return DoubanService.sortUpcomingSubjects(rawList, now).slice(0, limit);
+  }
+
+  /**
+   * 将豆瓣 movie_soon 列表中的真实新片与往年重映旧片分离排序（新片优先，重映标为 isRerelease）
+   */
+  public static sortUpcomingSubjects(list: DoubanSubject[], now: Date = new Date()): DoubanSubject[] {
+    const currentYear = now.getFullYear();
+    const currentMonth = now.getMonth() + 1;
+    const fresh: DoubanSubject[] = [];
+    const rereleases: DoubanSubject[] = [];
+
+    for (const item of list) {
+      const yNum = item.year ? parseInt(item.year, 10) : NaN;
+      const mMatch = item.releaseDate ? item.releaseDate.match(/^(\d{1,2})\./) : null;
+      const relMonth = mMatch ? parseInt(mMatch[1], 10) : NaN;
+
+      // 年份早于去年（如2018/2021/2024），或去年作品但月日明显属于早先旧档期（月<当前月-1且非跨年1~2月新片），判定为重映/旧档期
+      const isOldReissue =
+        Number.isFinite(yNum) &&
+        ((yNum <= currentYear - 2) ||
+          (yNum < currentYear && Number.isFinite(relMonth) && relMonth < currentMonth - 1 && relMonth > 2));
+
+      if (isOldReissue) {
+        rereleases.push({ ...item, isRerelease: true });
+      } else {
+        fresh.push({ ...item, isRerelease: false });
+      }
+    }
+
+    return [...fresh, ...rereleases];
   }
 
   /**
@@ -623,19 +655,39 @@ export class DoubanService {
   }
 
   /**
-   * 将榜单 / 热映 / 待映 / 影人作品集格式化为微信精排版 Markdown 卡片
+   * 将榜单 / 热映 / 待映 / 影人作品集格式化为微信精排版 Markdown 卡片（支持完整分页与续看提示）
    */
   public static formatChartMarkdown(
     heading: string,
     subjects: DoubanSubject[],
-    opts?: { hint?: string; showWishOrDate?: boolean }
+    opts?: {
+      hint?: string;
+      showWishOrDate?: boolean;
+      page?: number;
+      pageSize?: number;
+      total?: number;
+      startIdx?: number;
+    }
   ): string {
     if (!subjects || subjects.length === 0) {
       return `暂时没拉到「${heading}」的数据，过会儿再试一下~`;
     }
-    const lines: string[] = [`**${heading}**`, ''];
+
+    const startIdx = Math.max(0, opts?.startIdx ?? 0);
+    const total = Math.max(startIdx + subjects.length, opts?.total ?? subjects.length);
+    const pageSize = Math.max(1, opts?.pageSize ?? subjects.length);
+    const totalPages = Math.max(1, Math.ceil(total / pageSize));
+    const page = Math.min(totalPages, Math.max(1, opts?.page ?? 1));
+    const hasMore = page < totalPages;
+    const remaining = Math.max(0, total - (startIdx + subjects.length));
+
+    const headerSuffix = totalPages > 1 ? `（第 ${page}/${totalPages} 页 · 共 ${total} 部）` : total > subjects.length ? `（共 ${total} 部）` : '';
+    const lines: string[] = [`**${heading}**${headerSuffix}`, ''];
+
     subjects.forEach((s, idx) => {
+      const seq = startIdx + idx + 1;
       const meta: string[] = [];
+      if (s.isRerelease) meta.push('重映');
       if (s.releaseDate) meta.push(`${s.releaseDate}上映`);
       else if (s.year) meta.push(s.year);
       if (s.rate) meta.push(`⭐ ${s.rate}分`);
@@ -645,15 +697,23 @@ export class DoubanService {
       if (s.roles && s.roles.length > 0) meta.push(s.roles.slice(0, 2).join('/'));
 
       const metaText = meta.length > 0 ? `（${meta.join(' · ')}）` : '';
-      lines.push(`**${idx + 1}. 《${s.title}》**${metaText}`);
+      lines.push(`**${seq}. 《${s.title}》**${metaText}`);
       if (s.shortComment) {
         lines.push(`> ${s.shortComment.slice(0, 65)}`);
       } else if (s.actors) {
         lines.push(`> 主演：${s.actors}`);
       }
     });
+
     lines.push('');
-    lines.push(opts?.hint || '👉 看中哪部直接回数字（如 **「1」**）搜网盘，或说 **「蹲守第1部」** 盯资源~');
+    const firstSeq = startIdx + 1;
+    if (hasMore) {
+      lines.push(`👉 回 **「还有吗」** 或 **「下一页」** 看剩下 ${remaining} 部；看中哪部回数字（如 **「${firstSeq}」**）搜资源/蹲守~`);
+    } else if (totalPages > 1) {
+      lines.push(`👉 已看完本榜全部 ${total} 部~ 看中哪部回数字（如 **「${firstSeq}」**）搜资源，或回 **「上一页」** 回顾~`);
+    } else {
+      lines.push(opts?.hint || `👉 看中哪部直接回数字（如 **「${firstSeq}」**）搜网盘，或说 **「蹲守第${firstSeq}部」** 盯资源~`);
+    }
     return lines.join('\n');
   }
 

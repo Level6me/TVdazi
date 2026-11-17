@@ -288,34 +288,78 @@ export class CommandHandler {
     }
 
     if (['/热映', '热映', '正在热映'].includes(cmd)) {
-      const list = await this.doubanService.getNowPlaying(10);
-      this.sessionManager.setHot(userId, 'movie', list, '正在热映', 1, 10);
-      return DoubanService.formatChartMarkdown('🎟️ 大陆院线正在热映（豆瓣实时）', list, {
+      const list = await this.doubanService.getNowPlaying(25);
+      const heading = '🎟️ 大陆院线正在热映（豆瓣实时）';
+      const hint = '👉 想看哪部直接回数字（如 **「1」**）搜资源或加入蹲守~';
+      this.sessionManager.setHot(userId, 'movie', list, '正在热映', 1, 10, undefined, {
+        mode: 'chart',
+        chartHeading: heading,
         showWishOrDate: true,
-        hint: '👉 想看哪部直接回数字（如 **「1」**）搜资源或加入蹲守~',
+        chartHint: hint,
+      });
+      const pageData = this.sessionManager.getHotPage(userId, 1);
+      return DoubanService.formatChartMarkdown(heading, pageData?.items || list, {
+        showWishOrDate: true,
+        hint,
+        page: pageData?.page,
+        pageSize: pageData?.pageSize,
+        total: pageData?.total,
+        startIdx: pageData?.startIdx,
       });
     }
 
     if (['/待映', '待映', '即将上映'].includes(cmd)) {
-      const list = await this.doubanService.getUpcomingMovies(12);
-      this.sessionManager.setHot(userId, 'movie', list, '即将上映', 1, 12);
-      return DoubanService.formatChartMarkdown('🎬 大陆院线即将上映（豆瓣待映）', list, {
+      const list = await this.doubanService.getUpcomingMovies(25);
+      const heading = '🎬 大陆院线即将上映（豆瓣待映）';
+      const hint = '👉 想提前盯哪部新片？直接说 **「蹲守第1部」** 或回数字先搜看看~';
+      this.sessionManager.setHot(userId, 'movie', list, '即将上映', 1, 10, undefined, {
+        mode: 'chart',
+        chartHeading: heading,
         showWishOrDate: true,
-        hint: '👉 想提前盯哪部新片？直接说 **「蹲守第1部」** 或回数字先搜看看~',
+        chartHint: hint,
+      });
+      const pageData = this.sessionManager.getHotPage(userId, 1);
+      return DoubanService.formatChartMarkdown(heading, pageData?.items || list, {
+        showWishOrDate: true,
+        hint,
+        page: pageData?.page,
+        pageSize: pageData?.pageSize,
+        total: pageData?.total,
+        startIdx: pageData?.startIdx,
       });
     }
 
     if (['/口碑榜', '口碑榜', '一周口碑榜'].includes(cmd)) {
-      const list = await this.doubanService.getDoubanChart('movie_weekly_best', 10, 0);
-      this.sessionManager.setHot(userId, 'movie', list, '一周口碑榜', 1, 10);
-      return DoubanService.formatChartMarkdown('🏆 豆瓣一周口碑电影榜', list);
+      const list = await this.doubanService.getDoubanChart('movie_weekly_best', 20, 0);
+      const heading = '🏆 豆瓣一周口碑电影榜';
+      this.sessionManager.setHot(userId, 'movie', list, '一周口碑榜', 1, 10, undefined, {
+        mode: 'chart',
+        chartHeading: heading,
+      });
+      const pageData = this.sessionManager.getHotPage(userId, 1);
+      return DoubanService.formatChartMarkdown(heading, pageData?.items || list, {
+        page: pageData?.page,
+        pageSize: pageData?.pageSize,
+        total: pageData?.total,
+        startIdx: pageData?.startIdx,
+      });
     }
 
     if (['/top250', 'top250', '豆瓣top250'].includes(cmd)) {
       const randomStart = Math.floor(Math.random() * 10) * 10;
-      const list = await this.doubanService.getDoubanChart('movie_top250', 10, randomStart);
-      this.sessionManager.setHot(userId, 'movie', list, '豆瓣Top250', 1, 10);
-      return DoubanService.formatChartMarkdown('💎 豆瓣电影 Top 250 精选', list);
+      const list = await this.doubanService.getDoubanChart('movie_top250', 20, randomStart);
+      const heading = '💎 豆瓣电影 Top 250 精选';
+      this.sessionManager.setHot(userId, 'movie', list, '豆瓣Top250', 1, 10, undefined, {
+        mode: 'chart',
+        chartHeading: heading,
+      });
+      const pageData = this.sessionManager.getHotPage(userId, 1);
+      return DoubanService.formatChartMarkdown(heading, pageData?.items || list, {
+        page: pageData?.page,
+        pageSize: pageData?.pageSize,
+        total: pageData?.total,
+        startIdx: pageData?.startIdx,
+      });
     }
 
     if (['/search', '/搜索', '搜', '搜索'].includes(cmd)) {
@@ -639,6 +683,40 @@ export class CommandHandler {
     userId: string,
     hotSession: any
   ): Promise<string> {
+    if (hotSession.mode === 'chart' && Array.isArray(hotSession.items) && hotSession.items.length > 0) {
+      const pageSize = Math.max(1, hotSession.pageSize || 10);
+      const totalPages = Math.max(1, Math.ceil(hotSession.items.length / pageSize));
+      const curPage = Math.max(1, hotSession.page || 1);
+      let targetPage = curPage;
+
+      if (nav.action === 'next' || nav.action === 'refresh') {
+        if (curPage >= totalPages) {
+          return `**${hotSession.chartHeading || hotSession.tag || '当前片单'}** 全部 ${hotSession.items.length} 部都已经看完啦~ 看中哪部直接回数字（如 **「1」**）搜资源，或回 **「上一页」** 往前看。`;
+        }
+        targetPage = curPage + 1;
+      } else if (nav.action === 'prev') {
+        if (curPage <= 1) {
+          return `当前已经是第 1 页啦，回复 **「还有吗」** 或 **「下一页」** 可以继续往下看~`;
+        }
+        targetPage = curPage - 1;
+      } else if (nav.action === 'goto' && nav.page !== undefined) {
+        targetPage = Math.min(totalPages, Math.max(1, nav.page));
+      }
+
+      const pageData = this.sessionManager.getHotPage(userId, targetPage);
+      if (!pageData) {
+        return '当前榜单已过期，重新跟我说想看的榜单名称就行~';
+      }
+      return DoubanService.formatChartMarkdown(hotSession.chartHeading || hotSession.tag || '豆瓣榜单', pageData.items, {
+        showWishOrDate: hotSession.showWishOrDate,
+        hint: hotSession.chartHint,
+        page: pageData.page,
+        pageSize: pageData.pageSize,
+        total: pageData.total,
+        startIdx: pageData.startIdx,
+      });
+    }
+
     let targetPage = (hotSession.page || 1);
     if (nav.action === 'next' || nav.action === 'refresh') {
       if (nav.action === 'refresh' && Array.isArray(hotSession.items) && hotSession.items[0]) {
@@ -688,7 +766,10 @@ export class CommandHandler {
 
     // 若用户刚刚触发的是影视推荐 (hot)，优先从推荐列表中按序号搜存，避免被旧的搜索会话抢占
     if (lastType === 'hot' && hotSession && hotSession.items.length > 0) {
-      return await this.handleHotSelection(rawIndex, userId, hotSession, userPlan);
+      const hotPage = Math.max(1, hotSession.page || 1);
+      const hotSize = Math.max(1, hotSession.pageSize || 10);
+      const hotIndex = parsed.isPageRelative && hotPage > 1 ? (hotPage - 1) * hotSize + rawIndex : rawIndex;
+      return await this.handleHotSelection(hotIndex, userId, hotSession, userPlan);
     }
 
     if (searchSession && searchSession.items.length > 0) {
@@ -818,7 +899,10 @@ export class CommandHandler {
     }
 
     if (hotSession && hotSession.items.length > 0) {
-      return await this.handleHotSelection(rawIndex, userId, hotSession, userPlan);
+      const hotPage = Math.max(1, hotSession.page || 1);
+      const hotSize = Math.max(1, hotSession.pageSize || 10);
+      const hotIndex = parsed.isPageRelative && hotPage > 1 ? (hotPage - 1) * hotSize + rawIndex : rawIndex;
+      return await this.handleHotSelection(hotIndex, userId, hotSession, userPlan);
     }
 
     return '还没有在搜索或者看榜单呢~ 告诉我你想看的片名（如“流浪地球2”），或者发送“热门”先挑挑看吧！';

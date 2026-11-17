@@ -1292,6 +1292,38 @@ test('DoubanService 全面接入待映/热映/口碑榜/Top250/深度详情/高�
     const soonText = await handler.handle('/待映', '__douban_cmd_u__');
     assert.ok(soonText.includes('深度安静'));
     assert.ok(soonText.includes('11.19上映'));
+
+    // 验证「还有吗」分页与重映旧片靠后排序
+    const mixedUpcoming = Array.from({ length: 12 }, (_, idx) => ({
+      id: String(100 + idx),
+      title: idx === 0 ? '重映旧片' : `新片${idx}`,
+      rate: '',
+      cover: '',
+      url: '',
+      year: idx === 0 ? '2021' : '2026',
+      releaseDate: idx === 0 ? '10.22' : `11.${15 + idx}`,
+    }));
+    const sorted = DoubanService.sortUpcomingSubjects(mixedUpcoming, new Date('2026-11-17T12:00:00Z'));
+    assert.equal(sorted[0].title, '新片1');
+    assert.equal(sorted[sorted.length - 1].title, '重映旧片');
+    assert.equal(sorted[sorted.length - 1].isRerelease, true);
+
+    const { SessionManager } = require('../services/SessionManager');
+    assert.deepEqual(SessionManager.parsePagination('还有吗'), { action: 'next' });
+    assert.deepEqual(SessionManager.parsePagination('还有别的吗？'), { action: 'next' });
+
+    SessionManager.getInstance().setHot('__pag_chart_u__', 'movie', sorted, '即将上映', 1, 10, undefined, {
+      mode: 'chart',
+      chartHeading: '🎬 大陆院线即将上映（豆瓣待映）',
+      showWishOrDate: true,
+    });
+    assert.equal(handler.isCommand('还有吗', '__pag_chart_u__'), true);
+    const page2 = await handler.handle('还有吗', '__pag_chart_u__');
+    assert.ok(page2.includes('第 2/2 页'));
+    assert.ok(page2.includes('**11. 《新片11》**'));
+    assert.ok(page2.includes('重映'));
+    const endHint = await handler.handle('还有吗', '__pag_chart_u__');
+    assert.ok(endHint.includes('全部 12 部都已经看完啦'));
   } finally {
     (axios as any).get = origAxiosGet;
   }
