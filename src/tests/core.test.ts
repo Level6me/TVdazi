@@ -1735,6 +1735,68 @@ test('QuarkService inspects transferred archive files, reminds user, and execute
     assert.ok(batchReply.includes('已完成 **19** 个'));
     assert.equal(batchReply.includes('EP01.zip'), false);
     assert.equal(sm.getPendingUnarchive(userId), undefined);
+
+    // 7. 回归测试：concurrent task limit 精准识别（绝不误判为会员限制）+ 自动退避重试 + 仅保留失败项一键补解
+    let transientCalls = 0;
+    let persistentFailCount = 0;
+    const prevPost = (axios as any).post;
+    (axios as any).post = async (url: string, body?: any) => {
+      if (url.includes('/clouddrive/archive/unarchive')) {
+        if (body?.fid === 'ep_retry_ok') {
+          transientCalls++;
+          if (transientCalls <= 2) {
+            return { data: { status: 400, code: 31020, message: 'concurrent task limit[{0}]' } };
+          }
+          return { data: { status: 200, code: 0, data: { task_id: 'unzip_task_1' } } };
+        }
+        if (body?.fid === 'ep_fail_once') {
+          persistentFailCount++;
+          // 前 3 次（首次+2次退避重试）均报并发上限，等用户回复“重试”后的第 4 次成功
+          if (persistentFailCount <= 3) {
+            return { data: { status: 400, code: 31020, message: 'concurrent task limit[{0}]' } };
+          }
+          return { data: { status: 200, code: 0, data: { task_id: 'unzip_task_1' } } };
+        }
+      }
+      return prevPost(url, body);
+    };
+
+    const singleLimitRes = await qs.unarchiveFile(
+      { fid: 'ep_fail_once', file_name: 'E12.zip', pdir_fid: 'dir_tv_19' },
+      { customCookie: '__pus=mock_cookie' }
+    );
+    assert.equal(singleLimitRes.success, false);
+    assert.equal(singleLimitRes.concurrentLimit, true);
+    assert.equal(Boolean(singleLimitRes.needVip), false);
+    assert.ok(singleLimitRes.message.includes('同时解压任务数达上限'));
+
+    // 重置计数，验证批量解压自动退避重试：ep_retry_ok 2次限流后自动成功，ep_fail_once 保留到待补解队列
+    transientCalls = 0;
+    persistentFailCount = 0;
+    const origBatch = qs.unarchiveFilesBatch.bind(qs);
+    (qs as any).unarchiveFilesBatch = (files: any, opts?: any) =>
+      origBatch(files, { ...opts, retryDelaysMs: [5, 5] });
+
+    sm.setPendingUnarchive(userId, '《测试剧》', [
+      { fid: 'ep_retry_ok', file_name: 'E11.zip', dir: false, pdir_fid: 'dir_tv_19' },
+      { fid: 'ep_fail_once', file_name: 'E12.zip', dir: false, pdir_fid: 'dir_tv_19' },
+    ]);
+    const partialReply = await agent.chat('全部解压', userId);
+    assert.equal(transientCalls, 3); // 首次 + 2 次自动退避重试后成功
+    assert.ok(partialReply.includes('已完成 **1** 个'));
+    assert.ok(partialReply.includes('失败 **1** 个'));
+    assert.ok(partialReply.includes('重试'));
+    // 仅保留失败的 E12.zip，不再包含已成功的 E11.zip
+    const remaining = sm.getPendingUnarchive(userId);
+    assert.equal(remaining?.items.length, 1);
+    assert.equal(remaining?.items[0].fid, 'ep_fail_once');
+
+    // 用户回复“重试”只补解 E12.zip，并成功清空待补解队列
+    const retryReply = await agent.chat('重试', userId);
+    assert.equal(transientCalls, 3); // E11.zip 未被重复解压
+    assert.ok(retryReply.includes('E12.zip'));
+    assert.ok(retryReply.includes('解压完成'));
+    assert.equal(sm.getPendingUnarchive(userId), undefined);
   } finally {
     (axios as any).get = origGet;
     (axios as any).post = origPost;

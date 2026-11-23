@@ -22,6 +22,7 @@ export interface QuarkUnarchiveResult {
   inProgress?: boolean;
   needPassword?: boolean;
   needVip?: boolean;
+  concurrentLimit?: boolean;
   mode: 'cloud_unarchive' | 'fake_ext_renamed' | 'failed';
   sourceFile: string;
   restoredName?: string;
@@ -1469,6 +1470,7 @@ export class QuarkService {
       message: string;
       needPassword?: boolean;
       needVip?: boolean;
+      concurrentLimit?: boolean;
     } => {
       const text = rawMsg || '';
       if (httpStatus === 401 || code === 40001 || /登录|未授权/.test(text)) {
@@ -1481,6 +1483,12 @@ export class QuarkService {
         return {
           needPassword: true,
           message: `压缩包「${file.file_name}」需要解压密码${password ? '（刚才提供的密码不对）' : ''}，请直接回复「解压 密码xxx」再试~`,
+        };
+      }
+      if (/concurrent|并发|task\s*limit|too\s*many|频繁|排队|正在解压/i.test(text)) {
+        return {
+          concurrentLimit: true,
+          message: `「${file.file_name}」因夸克云端同时解压任务数达上限暂未提交成功（${text}），稍等几秒重试即可。`,
         };
       }
       if (/vip|svip|会员|权益|上限|超过|太大|容量|空间不足|size|limit/i.test(text)) {
@@ -1541,6 +1549,7 @@ export class QuarkService {
         sourceFile: file.file_name,
         needPassword: translated.needPassword,
         needVip: translated.needVip,
+        concurrentLimit: translated.concurrentLimit,
         message: translated.message,
       };
     }
@@ -1553,7 +1562,7 @@ export class QuarkService {
     if (taskId) {
       const poll = await this.pollTaskResult(taskId, customCookie, {
         maxAttempts: options?.maxPollAttempts ?? 12,
-        intervalMs: 1000,
+        intervalMs: 750,
         baseHost: lastHost,
       });
 
@@ -1592,6 +1601,7 @@ export class QuarkService {
         sourceFile: file.file_name,
         needPassword: translated.needPassword,
         needVip: translated.needVip,
+        concurrentLimit: translated.concurrentLimit,
         message: translated.message,
       };
     }
@@ -1619,12 +1629,13 @@ export class QuarkService {
       sourceFile: file.file_name,
       needPassword: translated.needPassword,
       needVip: translated.needVip,
+      concurrentLimit: translated.concurrentLimit,
       message: translated.message,
     };
   }
 
   /**
-   * 批量云端解压多个压缩包（自动跳过分卷压缩的后续分卷 .part2.rar / .002，全量处理不截断）
+   * 批量云端解压多个压缩包（默认串行防撞并发槽位上限，遇 concurrent task limit 自动退避重试，并返回失败项供一键补解）
    */
   async unarchiveFilesBatch(
     files: Array<Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>>,
@@ -1636,9 +1647,11 @@ export class QuarkService {
       deleteAfter?: boolean;
       maxCount?: number;
       concurrency?: number;
+      retryDelaysMs?: number[];
     }
   ): Promise<{
     results: QuarkUnarchiveResult[];
+    failedFiles: Array<Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>>;
     skippedSplitParts: string[];
     successCount: number;
     inProgressCount: number;
@@ -1658,21 +1671,41 @@ export class QuarkService {
 
     const targets = queue.slice(0, maxCount);
     const isLargeBatch = targets.length > 3;
-    const concurrency = isLargeBatch ? Math.min(3, options?.concurrency ?? 3) : 1;
+    // 夸克服务端对同时运行的云端解压任务槽位有严格并发限制（通常 1~2 个），默认串行最稳妥
+    const concurrency = Math.max(1, Math.min(2, options?.concurrency ?? 1));
+    const retryDelays = options?.retryDelaysMs ?? [2500, 4000, 6000, 8000];
     const singleOpts = {
       ...options,
-      // 批量解压多文件时缩短单包轮询等待，大包提交后立即记为云端后台解压中，避免超时卡顿
-      maxPollAttempts: isLargeBatch ? 3 : 12,
+      // 批量解压时适度轮询让快速完成的包立即释放并发槽位，超大包则记为后台运行不阻塞
+      maxPollAttempts: isLargeBatch ? 4 : 12,
+    };
+
+    const runWithConcurrentRetry = async (
+      item: Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>
+    ): Promise<QuarkUnarchiveResult> => {
+      let res = await this.unarchiveFile(item, singleOpts);
+      for (const delayMs of retryDelays) {
+        if (!res.concurrentLimit) break;
+        await new Promise((r) => setTimeout(r, delayMs));
+        res = await this.unarchiveFile(item, singleOpts);
+      }
+      return res;
     };
 
     const results: QuarkUnarchiveResult[] = [];
+    const failedFiles: Array<Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>> = [];
     let aborted = false;
 
     for (let i = 0; i < targets.length && !aborted; i += concurrency) {
       const chunk = targets.slice(i, i + concurrency);
-      const chunkRes = await Promise.all(chunk.map((item) => this.unarchiveFile(item, singleOpts)));
-      for (const res of chunkRes) {
+      const chunkRes = await Promise.all(chunk.map((item) => runWithConcurrentRetry(item)));
+      for (let j = 0; j < chunkRes.length; j++) {
+        const res = chunkRes[j];
+        const item = chunk[j];
         results.push(res);
+        if (!res.success) {
+          failedFiles.push(item);
+        }
         // 若触发密码错误或 Cookie 过期，提前中止后续批次避免连续报错
         if (res.needPassword || res.message.includes('Cookie')) {
           aborted = true;
@@ -1686,6 +1719,7 @@ export class QuarkService {
 
     return {
       results,
+      failedFiles,
       skippedSplitParts,
       successCount,
       inProgressCount,

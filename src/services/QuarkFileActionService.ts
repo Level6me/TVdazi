@@ -68,9 +68,9 @@ export class QuarkFileActionService {
 
     const deleteAfter = /(?:删掉?原|删除原|顺便删|解完删|删压缩包)/.test(trimmed);
 
-    // 1. 纯确认词或全量确认词（如“全部解压”“19个全部解压”“全部”“都解压”“解压”“好的”）
+    // 1. 纯确认词、全量确认词或补解重试词（如“全部解压”“19个全部解压”“全部”“重试”“继续解压”“补解”“好的”）
     if (
-      /^(?:(?:\d+\s*个)?(?:全部|全都|全|都|所有)?(?:帮我)?(?:云端|直接)?解压(?:全部|吧|一下|完)?|全部(?:\d+\s*个)?(?:都)?(?:解压|解)?|解一下|开始解压|要|要的|需要|好|好的|好呀|可以|行|嗯|嗯嗯|ok|yes)(?:并删除原(?:文件|压缩包|包)|顺便删(?:掉|了)?原(?:文件|压缩包|包))?[!！。.~～]*$/i.test(
+      /^(?:(?:\d+\s*个)?(?:全部|全都|全|都|所有)?(?:帮我)?(?:云端|直接)?解压(?:全部|吧|一下|完)?|全部(?:\d+\s*个)?(?:都)?(?:解压|解)?|重试(?:解压)?|继续(?:解压)?|补解(?:一下)?|再试一次|把失败的(?:都)?解压|解压失败的|解一下|开始解压|要|要的|需要|好|好的|好呀|可以|行|嗯|嗯嗯|ok|yes)(?:并删除原(?:文件|压缩包|包)|顺便删(?:掉|了)?原(?:文件|压缩包|包))?[!！。.~～]*$/i.test(
         trimmed
       )
     ) {
@@ -273,15 +273,16 @@ export class QuarkFileActionService {
       lines.push('⏳ 云端后台解压中的文件稍等片刻直接在夸克网盘里就能看到啦~');
     }
     if (batch.failCount > 0) {
-      const failReasons = Array.from(
-        new Set(
-          batch.results
-            .filter((r) => !r.success)
-            .map((r) => r.message)
-        )
-      ).slice(0, 3);
+      const failResults = batch.results.filter((r) => !r.success);
+      const failReasons = Array.from(new Set(failResults.map((r) => r.message))).slice(0, 3);
       for (const reason of failReasons) {
         lines.push(`• ${reason}`);
+      }
+      const needPwdOrCookie = failResults.some((r) => r.needPassword || r.message.includes('Cookie'));
+      if (!needPwdOrCookie) {
+        lines.push(
+          `👉 已只为你保留这 **${batch.failCount}** 个未完成的文件，稍等几秒直接回复 **「重试」** 或 **「继续解压」** 即可补解（不会重复解压已成功的）~`
+        );
       }
     }
     if (batch.skippedSplitParts.length > 0) {
@@ -665,10 +666,24 @@ export class QuarkFileActionService {
       deleteAfter,
     });
 
-    // 若仍需密码，保留待解压队列方便用户直接回复密码继续
+    // 若仍需密码，保留原待解压队列方便直接回复密码；若仅部分失败，仅保留失败项供“重试/继续解压”补解；全成功则清空
     const stillNeedsPassword = batch.results.some((r) => r.needPassword);
+    const cookieExpired = batch.results.some((r) => r.message.includes('Cookie'));
     if (!stillNeedsPassword) {
       this.sessionManager.clearAwaitingUnarchive(userId);
+      if (batch.failedFiles.length > 0 && !cookieExpired) {
+        const retryNodes: QuarkFileNode[] = batch.failedFiles.map((f) => ({
+          fid: f.fid,
+          file_name: f.file_name,
+          dir: false,
+          pdir_fid: f.pdir_fid,
+        }));
+        this.sessionManager.setPendingUnarchive(
+          userId,
+          targetHint ? `${targetHint}·待补解` : '待补解压缩包',
+          retryNodes
+        );
+      }
     }
 
     return this.formatUnarchiveBatchReply(batch, targetHint);
