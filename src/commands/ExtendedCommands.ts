@@ -1,6 +1,7 @@
 import { UserManager } from '../services/UserManager';
 import { QuarkService } from '../services/QuarkService';
 import { QuarkOrganizer } from '../services/QuarkOrganizer';
+import { QuarkFileActionService } from '../services/QuarkFileActionService';
 import { WatchlistService } from '../services/WatchlistService';
 import { ChannelHealthService } from '../services/ChannelHealthService';
 import { ChannelManager } from '../services/ChannelManager';
@@ -299,6 +300,51 @@ export async function handleExtendedCommand(
       return '✅ 已清空你的个人观影口味画像，之后会根据你的新喜好和转存重新学习啦！';
     }
     return profileSvc.renderProfileCard(userId);
+  }
+
+  if (['/ls', '/files', '/网盘', '网盘文件'].includes(cmd)) {
+    const fileActions = new QuarkFileActionService(ctx.quarkService, ctx.userManager);
+    return fileActions.execute(userId, {
+      action: 'list',
+      path: rawArg || undefined,
+    });
+  }
+
+  if (['/unzip', '/unarchive', '/解压'].includes(cmd)) {
+    const fileActions = new QuarkFileActionService(ctx.quarkService, ctx.userManager);
+    const pwd = QuarkOrganizer.extractArchivePasswordHint(rawArg);
+    const cleanedTarget = rawArg
+      .replace(/(?:解压密码|解压码|压缩密码|密码|口令|pwd|password)[：:=\s]*[A-Za-z0-9._@#\-!$%^&*]{1,32}/gi, '')
+      .trim();
+
+    if (!cleanedTarget) {
+      return fileActions.execute(userId, {
+        action: 'unarchive',
+        password: pwd,
+      });
+    }
+    if (/^\d+$/.test(cleanedTarget)) {
+      return fileActions.execute(userId, {
+        action: 'unarchive',
+        target_scope: 'index',
+        index: parseInt(cleanedTarget, 10),
+        password: pwd,
+      });
+    }
+    if (cleanedTarget.startsWith('/')) {
+      return fileActions.execute(userId, {
+        action: 'unarchive',
+        target_scope: 'path',
+        path: cleanedTarget,
+        password: pwd,
+      });
+    }
+    return fileActions.execute(userId, {
+      action: 'unarchive',
+      target_scope: 'search',
+      query: cleanedTarget,
+      password: pwd,
+    });
   }
 
   return null;

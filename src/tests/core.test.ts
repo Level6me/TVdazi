@@ -21,6 +21,8 @@ import { SerializedJsonStore } from '../utils/StorageQueue';
 import { QualityTagger } from '../services/QualityTagger';
 import { ChannelHealthService } from '../services/ChannelHealthService';
 import { QuarkOrganizer } from '../services/QuarkOrganizer';
+import { QuarkService } from '../services/QuarkService';
+import { QuarkFileActionService } from '../services/QuarkFileActionService';
 import { WatchlistService } from '../services/WatchlistService';
 import { ScheduleTimeParser } from '../services/scheduler/ScheduleTimeParser';
 import { DashboardServer } from '../web/DashboardServer';
@@ -1435,5 +1437,276 @@ test('DoubanService 全面接入待映/热映/口碑榜/Top250/深度详情/高�
     assert.equal(manualPlan.intervalMinutes, 10);
   } finally {
     (axios as any).get = origAxiosGet;
+  }
+});
+
+test('QuarkOrganizer detects archives, fake video extensions, split volumes and summarizes file types', () => {
+  assert.equal(QuarkOrganizer.isArchiveFile('沙丘2.zip'), true);
+  assert.equal(QuarkOrganizer.isArchiveFile('剧集合集.part1.rar'), true);
+  assert.equal(QuarkOrganizer.isArchiveFile('movie.tar.gz'), true);
+  assert.equal(QuarkOrganizer.isNonFirstSplitPart('剧集合集.part2.rar'), true);
+  assert.equal(QuarkOrganizer.isNonFirstSplitPart('剧集合集.part1.rar'), false);
+  assert.equal(QuarkOrganizer.isNonFirstSplitPart('movie.7z.002'), true);
+
+  const fake = QuarkOrganizer.detectFakeArchiveVideo('沙丘2.4K.mp4.zip');
+  assert.ok(fake);
+  assert.equal(fake?.restoredName, '沙丘2.4K.mp4');
+  assert.equal(QuarkOrganizer.isArchiveFile('沙丘2.4K.mp4.zip'), false);
+  assert.equal(QuarkOrganizer.classifyFile({ file_name: '沙丘2.4K.mp4.zip', dir: false }), 'fake_archive');
+
+  assert.equal(QuarkOrganizer.extractArchivePasswordHint('解压 密码：6688'), '6688');
+  assert.equal(QuarkOrganizer.extractArchivePasswordHint('电影_密码abc123.zip'), 'abc123');
+  assert.equal(QuarkOrganizer.preserveExtensionOnRename('庆余年.S01E01.mkv', '庆余年第一集', false), '庆余年第一集.mkv');
+  assert.equal(QuarkOrganizer.preserveExtensionOnRename('庆余年.mkv', '庆余年.mp4', false), '庆余年.mp4');
+  assert.equal(QuarkOrganizer.preserveExtensionOnRename('旧目录', '新目录', true), '新目录');
+
+  const summary = QuarkOrganizer.summarizeFileTypes([
+    { fid: '1', file_name: '正片.zip', dir: false, size: 1024 * 1024 * 500 },
+    { fid: '2', file_name: '花絮.mp4.rar', dir: false, size: 1024 * 1024 * 200 },
+    { fid: '3', file_name: '字幕.ass', dir: false, size: 1024 * 50 },
+  ]);
+  assert.equal(summary.hasArchives, true);
+  assert.equal(summary.archiveFiles.length, 1);
+  assert.equal(summary.fakeArchiveFiles.length, 1);
+  assert.equal(summary.subtitleCount, 1);
+  assert.ok(summary.summaryLine.includes('压缩包 1 个'));
+  assert.ok(summary.summaryLine.includes('伪装后缀视频 1 个'));
+});
+
+test('QuarkService inspects transferred archive files, reminds user, and executes cloud/fake unarchive + file CRUD', async () => {
+  const origGet = axios.get;
+  const origPost = axios.post;
+  const userId = `__quark_ops_test_${Date.now()}__`;
+  const deletedFids: string[] = [];
+  const renamedPairs: Array<{ fid: string; name: string }> = [];
+  const movedRecords: Array<{ fids: string[]; to: string }> = [];
+  const unarchivePayloads: any[] = [];
+
+  (axios as any).get = async (url: string, cfg?: any) => {
+    const params = cfg?.params || {};
+    if (url.includes('/share/sharepage/detail')) {
+      return {
+        data: {
+          status: 200,
+          data: {
+            list: [{ fid: 'share_dir_1', file_name: '沙丘2合集', dir: true, size: 0, share_fid_token: 'tok1' }],
+          },
+        },
+      };
+    }
+    if (url.includes('/clouddrive/file/sort')) {
+      const pdir = String(params.pdir_fid || '0');
+      if (pdir === '0') {
+        return { data: { status: 200, data: { list: [{ fid: 'root_res', file_name: '我的资源', dir: true }] } } };
+      }
+      if (pdir === 'root_res') {
+        return { data: { status: 200, data: { list: [{ fid: 'dir_movie', file_name: '电影', dir: true }] } } };
+      }
+      if (pdir === 'dir_movie') {
+        return {
+          data: {
+            status: 200,
+            data: {
+              list: [
+                { fid: 'saved_dir_1', file_name: '沙丘2合集', dir: true, size: 0, pdir_fid: 'dir_movie' },
+                { fid: 'vid_normal', file_name: '奥本海默.mkv', dir: false, size: 4 * 1024 ** 3, pdir_fid: 'dir_movie' },
+              ],
+            },
+          },
+        };
+      }
+      if (pdir === 'saved_dir_1') {
+        return {
+          data: {
+            status: 200,
+            data: {
+              list: [
+                { fid: 'arch_1', file_name: '沙丘2.part1.rar', dir: false, size: 2 * 1024 ** 3, pdir_fid: 'saved_dir_1' },
+                { fid: 'arch_2', file_name: '沙丘2.part2.rar', dir: false, size: 2 * 1024 ** 3, pdir_fid: 'saved_dir_1' },
+                { fid: 'fake_1', file_name: '沙丘2花絮.mp4.zip', dir: false, size: 300 * 1024 ** 2, pdir_fid: 'saved_dir_1' },
+              ],
+            },
+          },
+        };
+      }
+      return { data: { status: 200, data: { list: [] } } };
+    }
+    if (url.includes('/clouddrive/task')) {
+      const tid = String(params.task_id || '');
+      if (tid === 'save_task_1') {
+        return { data: { status: 200, data: { status: 2, save_as: { save_as_top_fids: ['saved_dir_1'] } } } };
+      }
+      if (tid === 'unzip_task_1') {
+        return { data: { status: 200, data: { status: 2, archive_unarchive: { top_fids: ['extracted_mp4'] } } } };
+      }
+      return { data: { status: 200, data: { status: 2 } } };
+    }
+    if (url.includes('/clouddrive/file/search')) {
+      const q = String(params.q || '');
+      if (q.includes('奥本')) {
+        return {
+          data: {
+            status: 200,
+            data: {
+              list: [{ fid: 'vid_normal', file_name: '<em>奥本</em>海默.mkv', dir: false, size: 4 * 1024 ** 3, pdir_fid: 'dir_movie' }],
+            },
+          },
+        };
+      }
+      if (q.includes('同名')) {
+        return {
+          data: {
+            status: 200,
+            data: {
+              list: [
+                { fid: 'dup_a', file_name: '同名电影1.mkv', dir: false, size: 1024 ** 3, pdir_fid: 'dir_movie' },
+                { fid: 'dup_b', file_name: '同名电影2.mkv', dir: false, size: 1024 ** 3, pdir_fid: 'dir_movie' },
+              ],
+            },
+          },
+        };
+      }
+      return { data: { status: 200, data: { list: [] } } };
+    }
+    return { data: { status: 200, data: {} } };
+  };
+
+  (axios as any).post = async (url: string, body?: any) => {
+    if (url.includes('/share/sharepage/token')) {
+      return { data: { status: 200, data: { stoken: 'stoken_ok' } } };
+    }
+    if (url.includes('/share/sharepage/save')) {
+      return { data: { status: 200, data: { task_id: 'save_task_1' } } };
+    }
+    if (url.includes('/clouddrive/archive/unarchive')) {
+      unarchivePayloads.push(body);
+      if (body?.pwd === 'wrong') {
+        return { data: { status: 400, code: 31001, message: '解压密码错误' } };
+      }
+      return { data: { status: 200, code: 0, data: { task_id: 'unzip_task_1' } } };
+    }
+    if (url.includes('/clouddrive/file/rename')) {
+      renamedPairs.push({ fid: body.fid, name: body.file_name });
+      return { data: { status: 200, code: 0 } };
+    }
+    if (url.includes('/clouddrive/file/delete')) {
+      deletedFids.push(...(body.filelist || []));
+      return { data: { status: 200, code: 0 } };
+    }
+    if (url.includes('/clouddrive/file/move')) {
+      movedRecords.push({ fids: body.filelist || [], to: body.to_pdir_fid });
+      return { data: { status: 200, code: 0 } };
+    }
+    if (url.includes('/clouddrive/file?')) {
+      return { data: { status: 200, data: { fid: `new_dir_${body?.file_name || 'x'}` } } };
+    }
+    return { data: { status: 200, code: 0 } };
+  };
+
+  try {
+    const qs = new QuarkService('__pus=mock_cookie');
+    const um = UserManager.getInstance();
+    um.setUserQuarkCookie(userId, '__pus=mock_cookie');
+    um.setUserRootDir(userId, '/我的资源');
+    const sm = SessionManager.getInstance();
+
+    // 1. 转存含嵌套压缩包+伪装后缀视频的文件夹，自动识别文件类型并提醒解压
+    const saveRes = await qs.saveShareFiles('mockpwd', '', '电影', {
+      customCookie: '__pus=mock_cookie',
+      rootDir: '/我的资源',
+      standardTitle: '沙丘2',
+      userId,
+      autoCleanCensor: false,
+    });
+    assert.equal(saveRes.success, true);
+    assert.equal(saveRes.fileTypeSummary?.hasArchives, true);
+    assert.equal(saveRes.fileTypeSummary?.archiveFiles.length, 2);
+    assert.equal(saveRes.fileTypeSummary?.fakeArchiveFiles.length, 1);
+    assert.ok(saveRes.message.includes('检测到刚转存的内容含压缩包'));
+    assert.ok(saveRes.message.includes('要不要我现在直接帮你云端解压'));
+
+    const recent = sm.getRecentSaved(userId);
+    assert.ok(recent);
+    assert.equal(recent?.awaitingUnarchiveConfirm, true);
+
+    // 2. 验证快捷确认解析（确认 / 带密码 / 删除原包 / 拒绝）
+    assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('解压 密码6688', true), {
+      kind: 'confirm',
+      password: '6688',
+      deleteAfter: false,
+    });
+    assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('解压并删除原压缩包', true), {
+      kind: 'confirm',
+      deleteAfter: true,
+    });
+    assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('不解压', true), { kind: 'decline' });
+
+    // 3. 验证通过 DeepSeekAgent 极简回复“解压 密码8888”直接完成刚转存压缩包解压 + 伪装后缀改名 + 跳过 part2 分卷
+    const agent = new DeepSeekAgent('dummy_key');
+    (agent as any).quarkService = qs;
+    (agent as any).quarkFileActions = new QuarkFileActionService(qs, um, sm);
+    const quickReply = await agent.chat('解压 密码8888', userId);
+    assert.ok(quickReply.includes('沙丘2.part1.rar'));
+    assert.ok(quickReply.includes('沙丘2花絮.mp4'));
+    assert.ok(quickReply.includes('跳过 1 个后续分卷'));
+    assert.equal(unarchivePayloads.length, 1);
+    assert.equal(unarchivePayloads[0].fid, 'arch_1');
+    assert.equal(unarchivePayloads[0].pwd, '8888');
+    assert.ok(renamedPairs.some((r) => r.fid === 'fake_1' && r.name === '沙丘2花絮.mp4'));
+    assert.equal(sm.getRecentSaved(userId)?.awaitingUnarchiveConfirm, false);
+
+    // 4. 验证密码错误翻译
+    const wrongPwdRes = await qs.unarchiveFile(
+      { fid: 'arch_1', file_name: '沙丘2.part1.rar', pdir_fid: 'saved_dir_1' },
+      { password: 'wrong', customCookie: '__pus=mock_cookie' }
+    );
+    assert.equal(wrongPwdRes.success, false);
+    assert.equal(wrongPwdRes.needPassword, true);
+    assert.ok(wrongPwdRes.message.includes('解压密码'));
+
+    // 5. 验证网盘文件搜索、重命名（保留扩展名）、模糊删除防误删保护、明确序号删除与移动
+    const actions = new QuarkFileActionService(qs, um, sm);
+    const searchReply = await actions.execute(userId, { action: 'search', query: '奥本' });
+    assert.ok(searchReply.includes('奥本海默.mkv'));
+    assert.equal(searchReply.includes('<em>'), false);
+
+    const renameReply = await actions.execute(userId, {
+      action: 'rename',
+      target_scope: 'index',
+      index: 1,
+      new_name: '奥本海默 2023 4K',
+    });
+    assert.ok(renameReply.includes('奥本海默 2023 4K.mkv'));
+    assert.ok(renamedPairs.some((r) => r.fid === 'vid_normal' && r.name === '奥本海默 2023 4K.mkv'));
+
+    const moveReply = await actions.execute(userId, {
+      action: 'move',
+      target_scope: 'index',
+      index: 1,
+      to_dir: '/我的资源/科幻',
+    });
+    assert.ok(moveReply.includes('移动至夸克网盘【/我的资源/科幻】'));
+    assert.equal(movedRecords.length, 1);
+
+    const ambigDelReply = await actions.execute(userId, { action: 'delete', query: '同名' });
+    assert.ok(ambigDelReply.includes('为防误删'));
+    assert.equal(deletedFids.length, 0);
+
+    const confirmDelReply = await actions.execute(userId, {
+      action: 'delete',
+      target_scope: 'index',
+      index: 2,
+    });
+    assert.ok(confirmDelReply.includes('回收站'));
+    assert.deepEqual(deletedFids, ['dup_b']);
+  } finally {
+    (axios as any).get = origGet;
+    (axios as any).post = origPost;
+    const userHexFile = path.resolve(process.cwd(), 'data/users', `${Buffer.from(userId).toString('hex')}.json`);
+    setTimeout(() => {
+      try {
+        if (fs.existsSync(userHexFile)) fs.unlinkSync(userHexFile);
+      } catch {}
+    }, 50);
   }
 });

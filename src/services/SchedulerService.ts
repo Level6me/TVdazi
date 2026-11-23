@@ -1240,7 +1240,16 @@ export class SchedulerService {
 
     const autoRes = await this.trySaveQuarkCandidates(validItems, userId, defaultCategory, title);
     if (autoRes.success) {
-      return `⚡ 已为你把《${title}》自动转存进夸克网盘：【${autoRes.targetPath}】！`;
+      const base = `⚡ 已为你把《${title}》自动转存进夸克网盘：【${autoRes.targetPath}】！`;
+      if (autoRes.message && autoRes.message.includes('检测到刚转存的内容含压缩包')) {
+        const archiveLines = autoRes.message
+          .split('\n')
+          .filter((l) => l.startsWith('📦') || l.startsWith('⚠️') || l.startsWith('👉'));
+        if (archiveLines.length > 0) {
+          return `${base}\n${archiveLines.join('\n')}`;
+        }
+      }
+      return base;
     }
     return null;
   }

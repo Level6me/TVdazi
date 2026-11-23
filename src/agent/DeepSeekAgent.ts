@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import { ResourceSearcher } from '../services/Searcher';
 import { QuarkService } from '../services/QuarkService';
+import { QuarkFileActionService, QuarkFileActionInput } from '../services/QuarkFileActionService';
 import { DoubanService, DoubanChartType } from '../services/DoubanService';
 import { ChannelManager } from '../services/ChannelManager';
 import { CommandHandler } from '../commands/CommandHandler';
@@ -28,6 +29,7 @@ export interface RecognizedImageResult {
 export class DeepSeekAgent {
   private searcher: ResourceSearcher;
   private quarkService: QuarkService;
+  private quarkFileActions: QuarkFileActionService;
   private doubanService: DoubanService;
   private channelManager: ChannelManager;
   private commandHandler: CommandHandler;
@@ -49,6 +51,7 @@ export class DeepSeekAgent {
     this.commandHandler = new CommandHandler();
     this.sessionManager = SessionManager.getInstance();
     this.userManager = UserManager.getInstance();
+    this.quarkFileActions = new QuarkFileActionService(this.quarkService, this.userManager, this.sessionManager);
   }
 
   private getClientForUser(userId: string, timeoutMs: number = 12000) {
@@ -358,6 +361,31 @@ export class DeepSeekAgent {
 
       // 用户未按确认词回复而是发了其他指令或新片名，清理旧的待确认态继续正常处理
       this.sessionManager.clearPendingImageSearch(userId);
+    }
+
+    // 0.5 优先处理“刚转存含压缩包提醒”后的极简快捷确认/拒绝（如“解压”、“好的”、“解压 密码1234”、“不解压”）
+    const recentSaved = this.sessionManager.getRecentSaved(userId);
+    if (recentSaved?.awaitingUnarchiveConfirm && !trimmed.startsWith('/')) {
+      const quickIntent = QuarkFileActionService.parseQuickUnarchiveIntent(trimmed, true);
+      if (quickIntent) {
+        if (quickIntent.kind === 'decline') {
+          this.sessionManager.clearAwaitingUnarchive(userId);
+          const declineReply = '好嘞，先不动这几个压缩包，回头想让我帮你解压随时喊一声就行~';
+          appendUserHistory(trimmed, declineReply);
+          return declineReply;
+        }
+        if (onProgress) {
+          await onProgress('📦 收到！正在为你云端处理刚刚转存的压缩包，请稍候...').catch(() => {});
+        }
+        const unzipReply = await this.quarkFileActions.execute(userId, {
+          action: 'unarchive',
+          target_scope: 'recent_saved',
+          password: quickIntent.password,
+          delete_after: quickIntent.deleteAfter,
+        });
+        appendUserHistory(trimmed, unzipReply);
+        return unzipReply;
+      }
     }
 
     // 1. 仅对确定性交互（/斜杠指令、翻页/选号、网盘链接、系统配置命令、明确任务管理指令）走 0ms 快路径
@@ -781,6 +809,92 @@ export class DeepSeekAgent {
             },
           },
         },
+        {
+          type: 'function',
+          function: {
+            name: 'manage_quark_files',
+            description:
+              '直接管理用户夸克网盘里的文件与文件夹，支持：浏览目录(list)、搜索网盘文件或扫描压缩包(search)、查看刚刚转存的文件类型与明细(recent_saved)、云端在线解压或还原伪装视频后缀(unarchive)、重命名(rename)、删除移入回收站(delete)、移动(move)、新建文件夹(mkdir)、清洗防和谐火星文名(clean_censor)、Emby规范重命名(organize)、重复资源清理(dedup)。只要用户要求解压压缩包、查看网盘文件、问刚转存的是什么格式、或要删除/重命名/移动网盘里的文件，必须调用此工具！',
+            parameters: {
+              type: 'object',
+              properties: {
+                action: {
+                  type: 'string',
+                  enum: [
+                    'list',
+                    'search',
+                    'recent_saved',
+                    'unarchive',
+                    'rename',
+                    'delete',
+                    'move',
+                    'mkdir',
+                    'clean_censor',
+                    'organize',
+                    'dedup',
+                  ],
+                  description: '要执行的网盘文件操作类型',
+                },
+                target_scope: {
+                  type: 'string',
+                  enum: ['recent_saved', 'search', 'index', 'path'],
+                  description:
+                    '目标定位方式：recent_saved=刚刚转存的文件，index=最近展示的网盘文件列表序号，path=明确完整路径，search=按关键词搜索网盘文件',
+                },
+                query: {
+                  type: 'string',
+                  description: '要搜索或操作的文件名/片名关键词（如 庆余年、沙丘2.zip）',
+                },
+                path: {
+                  type: 'string',
+                  description: '网盘目录或文件完整路径（如 /、/我的资源/电影、/我的资源/电影/沙丘2.zip）',
+                },
+                index: {
+                  type: 'number',
+                  description: '操作最近展示的网盘文件列表中第几个（1-based）',
+                },
+                indices: {
+                  type: 'array',
+                  items: { type: 'number' },
+                  description: '批量操作最近展示的网盘文件列表中多个序号（如 [1, 2]）',
+                },
+                new_name: {
+                  type: 'string',
+                  description: 'rename 时的新文件名，或 mkdir 时的新文件夹名',
+                },
+                to_dir: {
+                  type: 'string',
+                  description: 'move 时的目标目录路径，或 unarchive 时指定的解压目标目录路径',
+                },
+                password: {
+                  type: 'string',
+                  description: 'unarchive 时用户提供的压缩包解压密码（无密码省略）',
+                },
+                delete_after: {
+                  type: 'boolean',
+                  description: 'unarchive 解压成功后是否顺便把原压缩包移入回收站（仅用户明确要求删除原包时传 true）',
+                },
+                archives_only: {
+                  type: 'boolean',
+                  description: 'search 时是否仅筛选网盘中的压缩包文件（如“看看我网盘里有哪些压缩包”）',
+                },
+                all_matches: {
+                  type: 'boolean',
+                  description: '当用户明确说“全部解压/全删了/全部移动”时设为 true',
+                },
+                execute_delete: {
+                  type: 'boolean',
+                  description: 'dedup 时是否直接删除重复冗余副本（默认 false 仅预览）',
+                },
+                dry_run: {
+                  type: 'boolean',
+                  description: 'organize 时是否仅预览不实际改名',
+                },
+              },
+              required: ['action'],
+            },
+          },
+        },
       ];
 
       const relay = RelayService.getInstance();
@@ -788,6 +902,7 @@ export class DeepSeekAgent {
       const myName = relay.getDisplayName(userId, userId);
       const pendingRelay = relay.getPendingReply(userId);
       const recentTitle = this.sessionManager.getRecentTargetTitle(userId);
+      const netdiskListing = this.sessionManager.getNetdiskListing(userId);
       const directoryHint =
         directory.length > 0
           ? directory.map((u) => `${u.index}.${u.displayName}${u.isSelf ? '(我)' : ''}`).join('、')
@@ -795,13 +910,32 @@ export class DeepSeekAgent {
       const pendingHint = pendingRelay
         ? `刚刚「${pendingRelay.fromDisplayName}」给你传了话（内容：“${pendingRelay.originalMessage}”）`
         : '暂无待回复传话';
+      const recentSavedHint = recentSaved
+        ? `目录【${recentSaved.targetPath}】，类型：${recentSaved.fileTypeSummary.summaryLine}${
+            recentSaved.fileTypeSummary.hasArchives
+              ? `，含压缩包：${[
+                  ...recentSaved.archiveFiles.map((f) => f.file_name),
+                  ...recentSaved.fakeArchiveFiles.map((f) => f.node.file_name),
+                ]
+                  .slice(0, 3)
+                  .join('、')}`
+              : ''
+          }`
+        : '暂无最近转存记录';
+      const netdiskListingHint =
+        netdiskListing && netdiskListing.items.length > 0
+          ? netdiskListing.items
+              .slice(0, 8)
+              .map((it, idx) => `${idx + 1}.${it.file_name}${it.dir ? '(目录)' : ''}`)
+              .join('；')
+          : '暂无';
 
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
         {
           role: 'system',
           content: `你是一个微信端像朋友一样的智能影视云盘助手「电视搭子 (TVdazi)」。
 你的性格：热情亲切、自然随和、说话通俗简单、接地气，绝不要输出冰冷呆板的客服话术或技术术语。
-当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}；最近刚推荐或讨论过的影视：${recentTitle ? `《${recentTitle}》` : '暂无'}。
+当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}；最近刚推荐或讨论过的影视：${recentTitle ? `《${recentTitle}》` : '暂无'}；最近刚转存的网盘文件：${recentSavedHint}；当前网盘文件列表：${netdiskListingHint}。
 核心系统能力与规则（重要）：
 1. 你是所有自然语言消息的总控意图分析大脑，必须先准确理解用户的真实意图再调用对应工具。
 2. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时、延时、周期蹲守或追更任务（如“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守《某剧》”），【绝对严禁】推脱拒答！遇到此类需求直接调用 manage_scheduled_task。
@@ -809,11 +943,12 @@ export class DeepSeekAgent {
 4. 当用户直接发来影视名称（如“庆余年”、“突如其来”、“Inception”）、带动词的搜片需求（如“搜索电影 突如其来”、“帮我找一下沙丘2”），或用演员外号/剧情描述寻找某部特定作品时，必须立即调用 search_cloud_resources，并提取出纯粹干净的标准中文官方片名填入 keyword（严禁在 keyword 中残留“搜索/搜/电影/电视剧/想看”等修饰字样！）。
 5. 当用户寻求【立即】影视推荐、榜单或延续上一轮推荐条件追问（如“有什么好看的韩剧”、“换一部”、“美剧呢”）时，调用 get_movie_recommendation 工具（结合对话历史保留类型/年份/题材要求）。若带延时，调用 manage_scheduled_task。
 6. 当用户询问网盘状态、容量时，调用 get_system_status；想修改网盘保存目录时，调用 set_save_directory。
-7. 当用户用自然语言表达自己喜欢/不喜欢什么样的【电影、电视剧、综艺、动漫、纪录片、题材、地区、导演、演员、代表作】（如“我平时喜欢看韩国悬疑电影和搞笑综艺”、“我爱看《漫长的季节》，不爱看恐怖片”），或让 bot 分析/查看自己的口味画像时，必须调用 update_user_taste_profile！
-8. 当用户问国内院线「即将上映/待映新片」「正在热映」「一周口碑榜」「华语/全球口碑剧集榜」「豆瓣 Top 250」时，必须调用 query_douban_cinema 获取真实数据，严禁凭记忆瞎编或推脱说查不到！
-9. 当用户问某部作品「讲什么剧情、值不值得看、豆瓣短评评价/排雷、拿过什么奖、类似《XX》的电影、某部剧集总共多少集/完结没」时，调用 get_movie_deep_info！
-10. 当用户按导演或演员找作品（如“诺兰拍过哪些电影”“张译有什么剧”）时，调用 search_celebrity_works！
-11. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
+7. 你拥有完整的【夸克网盘文件管理与云端解压】能力！当用户询问能否帮忙解压网盘压缩包、要求解压刚刚转存的或网盘里指定的压缩包、查看网盘目录/文件、问刚转存的是什么文件类型、重命名/移动/新建文件夹/删除网盘文件、或整理去重时，【绝对严禁】说“帮不上忙/只能搜片转存”！必须直接调用 manage_quark_files 执行或先扫出网盘压缩包供用户选择（若用户问“你能帮我解压吗”，直接调用 manage_quark_files(action="unarchive") 帮他检查刚转存或网盘里的压缩包，或在没有任何压缩包时热情告知支持云端解压并可随时指定！）。
+8. 当用户用自然语言表达自己喜欢/不喜欢什么样的【电影、电视剧、综艺、动漫、纪录片、题材、地区、导演、演员、代表作】（如“我平时喜欢看韩国悬疑电影和搞笑综艺”、“我爱看《漫长的季节》，不爱看恐怖片”），或让 bot 分析/查看自己的口味画像时，必须调用 update_user_taste_profile！
+9. 当用户问国内院线「即将上映/待映新片」「正在热映」「一周口碑榜」「华语/全球口碑剧集榜」「豆瓣 Top 250」时，必须调用 query_douban_cinema 获取真实数据，严禁凭记忆瞎编或推脱说查不到！
+10. 当用户问某部作品「讲什么剧情、值不值得看、豆瓣短评评价/排雷、拿过什么奖、类似《XX》的电影、某部剧集总共多少集/完结没」时，调用 get_movie_deep_info！
+11. 当用户按导演或演员找作品（如“诺兰拍过哪些电影”“张译有什么剧”）时，调用 search_celebrity_works！
+12. 仅在明确属于日常打招呼、感谢或普通闲聊时，像微信好友一样简短、风趣、有温度地直接回复。`,
         },
         ...chatHistory,
         { role: 'user', content: trimmed },
@@ -1137,6 +1272,29 @@ export class DeepSeekAgent {
           });
           appendUserHistory(trimmed, celebReply);
           return celebReply;
+        } else if (toolCall.function.name === 'manage_quark_files') {
+          const actionInput: QuarkFileActionInput = {
+            action: args.action,
+            target_scope: args.target_scope,
+            query: args.query ? String(args.query) : undefined,
+            path: args.path ? String(args.path) : undefined,
+            index: typeof args.index === 'number' ? args.index : undefined,
+            indices: Array.isArray(args.indices) ? args.indices.map(Number).filter((n: number) => Number.isFinite(n)) : undefined,
+            new_name: args.new_name ? String(args.new_name) : undefined,
+            to_dir: args.to_dir ? String(args.to_dir) : undefined,
+            password: args.password ? String(args.password) : undefined,
+            delete_after: Boolean(args.delete_after),
+            archives_only: Boolean(args.archives_only),
+            all_matches: Boolean(args.all_matches),
+            execute_delete: Boolean(args.execute_delete),
+            dry_run: Boolean(args.dry_run),
+          };
+          if (onProgress && actionInput.action === 'unarchive') {
+            await onProgress('📦 收到！正在连接夸克网盘为你处理压缩包，请稍候...').catch(() => {});
+          }
+          const fileReply = await this.quarkFileActions.execute(userId, actionInput);
+          appendUserHistory(trimmed, fileReply);
+          return fileReply;
         }
       }
 

@@ -1,5 +1,27 @@
 import { CloudResource } from '../types';
 import { DoubanSubject } from './DoubanService';
+import { FileTypeSummary, QuarkFileNode } from './QuarkOrganizer';
+
+export interface RecentSavedSession {
+  title?: string;
+  targetPath: string;
+  targetDirFid: string;
+  topItems: QuarkFileNode[];
+  allInspectedItems: QuarkFileNode[];
+  archiveFiles: QuarkFileNode[];
+  fakeArchiveFiles: Array<{ node: QuarkFileNode; restoredName: string; realExt: string; fakeExt: string }>;
+  fileTypeSummary: FileTypeSummary;
+  awaitingUnarchiveConfirm: boolean;
+  savedAt: number;
+}
+
+export interface NetdiskListingSession {
+  source: 'list' | 'search' | 'archives' | 'recent_saved';
+  pathOrQuery: string;
+  dirFid?: string;
+  items: QuarkFileNode[];
+  updatedAt: number;
+}
 
 export interface SearchSession {
   keyword: string;
@@ -42,6 +64,8 @@ export class SessionManager {
   private lastActiveSessionType: Map<string, 'search' | 'hot'> = new Map();
   private lastMentionedTitles: Map<string, { title: string; updatedAt: number }> = new Map();
   private pendingImageSearches: Map<string, PendingImageSearch> = new Map();
+  private recentSavedSessions: Map<string, RecentSavedSession> = new Map();
+  private netdiskListings: Map<string, NetdiskListingSession> = new Map();
 
   static getInstance(): SessionManager {
     if (!SessionManager.instance) {
@@ -236,6 +260,67 @@ export class SessionManager {
 
   clearPendingImageSearch(userId: string): void {
     this.pendingImageSearches.delete(userId);
+  }
+
+  /**
+   * 记录最近一次成功转存到网盘的资源与文件类型详情（供“解压刚转存的 / 删掉刚存的 / 重命名刚存的”直接衔接）
+   */
+  setRecentSaved(userId: string, info: Omit<RecentSavedSession, 'savedAt'>): RecentSavedSession {
+    const entry: RecentSavedSession = {
+      ...info,
+      savedAt: Date.now(),
+    };
+    this.setBounded(this.recentSavedSessions, userId, entry);
+    if (info.allInspectedItems.length > 0 || info.topItems.length > 0) {
+      const listingItems = info.allInspectedItems.length > 0 ? info.allInspectedItems : info.topItems;
+      this.setNetdiskListing(userId, {
+        source: 'recent_saved',
+        pathOrQuery: info.targetPath,
+        dirFid: info.targetDirFid,
+        items: listingItems,
+      });
+    }
+    return entry;
+  }
+
+  getRecentSaved(userId: string): RecentSavedSession | undefined {
+    const entry = this.recentSavedSessions.get(userId);
+    if (!entry) return undefined;
+    // 转存记录保留 2 小时，方便用户稍后再让 AI 解压或管理刚存的文件
+    if (Date.now() - entry.savedAt > 2 * 60 * 60 * 1000) {
+      this.recentSavedSessions.delete(userId);
+      return undefined;
+    }
+    return entry;
+  }
+
+  clearAwaitingUnarchive(userId: string): void {
+    const entry = this.recentSavedSessions.get(userId);
+    if (entry) {
+      entry.awaitingUnarchiveConfirm = false;
+    }
+  }
+
+  /**
+   * 记录最近一次展示给用户的网盘文件列表（供“把第2个删了 / 解压第1个 / 重命名第3个”按序号精准操作）
+   */
+  setNetdiskListing(userId: string, info: Omit<NetdiskListingSession, 'updatedAt'>): NetdiskListingSession {
+    const entry: NetdiskListingSession = {
+      ...info,
+      updatedAt: Date.now(),
+    };
+    this.setBounded(this.netdiskListings, userId, entry);
+    return entry;
+  }
+
+  getNetdiskListing(userId: string): NetdiskListingSession | undefined {
+    const entry = this.netdiskListings.get(userId);
+    if (!entry) return undefined;
+    if (this.isExpired(entry.updatedAt)) {
+      this.netdiskListings.delete(userId);
+      return undefined;
+    }
+    return entry;
   }
 
   /**
