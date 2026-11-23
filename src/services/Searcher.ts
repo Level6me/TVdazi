@@ -67,13 +67,13 @@ export class ResourceSearcher {
     let score = 0;
 
     // 1. 标题完全包含完整关键词（最优先）
-    if (kw && title.includes(kw)) {
+    if (item.titleSource !== 'keyword_fallback' && item.titleSource !== 'matched_line' && kw && title.includes(kw)) {
       score += 1000;
       score += Math.max(0, 100 - title.length);
     } else if (aliasKeywords && aliasKeywords.length > 0) {
       const matchedAlias = aliasKeywords.find((a) => {
         const ak = a.toLowerCase().trim();
-        return ak.length >= 2 && title.includes(ak);
+        return item.titleSource !== 'keyword_fallback' && item.titleSource !== 'matched_line' && ak.length >= 2 && title.includes(ak);
       });
       if (matchedAlias) {
         score += 750;
@@ -101,10 +101,6 @@ export class ResourceSearcher {
     const tags = item.qualityTags || QualityTagger.extractTags(item.title, item.rawText);
     score += tags.qualityScoreBonus;
     score += QualityTagger.scoreByPreference(tags, preferredQuality);
-
-    if (title.includes('4k') || raw.includes('4k') || full.includes('2160p')) score += 10;
-    if (title.includes('remux') || raw.includes('remux') || full.includes('原盘') || full.includes('蓝光')) score += 10;
-    if (title.includes('1080p') || raw.includes('1080p')) score += 5;
 
     return score;
   }
@@ -248,31 +244,74 @@ export class ResourceSearcher {
         const combinedText = hrefLinks.length > 0 ? `${rawTextContent}\n${hrefLinks.join('\n')}` : rawTextContent;
         if (!combinedText) return;
 
-        let extractedTitle = keyword;
         const nameMatch = rawTextContent.match(/(?:名称|片名|剧名|标题|资源名称)[：:]\s*([^\n\r]+)/);
+        const lines = rawTextContent
+          .split(/\r?\n/)
+          .map((l) => l.trim())
+          .filter((l) => l && !/^https?:\/\//i.test(l));
+        let extractedTitle = keyword;
+        let titleSource: NonNullable<CloudResource['titleSource']> = 'keyword_fallback';
         if (nameMatch && nameMatch[1]) {
           extractedTitle = nameMatch[1].trim();
+          titleSource = 'labeled';
         } else {
-          const lines = rawTextContent
-            .split(/\r?\n/)
-            .map((l) => l.trim())
-            .filter((l) => l && !/^https?:\/\//i.test(l));
-          extractedTitle = lines[0] ? lines[0].replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
+          const matchedLine = lines.find((line) =>
+            this.isSingleTermRelevant(this.normalizeForMatch(line), keyword)
+          );
+          const titleLine = matchedLine || lines[0];
+          extractedTitle = titleLine ? titleLine.replace(/^(?:名称|片名|剧名|标题)[：:]\s*/, '').trim() : keyword;
+          if (titleLine) titleSource = titleLine === lines[0] ? 'first_line' : 'matched_line';
         }
 
         const cleanTitle = this.cleanRawTitle(extractedTitle, keyword);
-        const category = CategoryClassifier.classify(cleanTitle || keyword, rawTextContent);
-        const qualityTags = QualityTagger.extractTags(cleanTitle || keyword, rawTextContent);
+        const shareLocations = Array.from(
+          combinedText.matchAll(/https?:\/\/(?:pan\.quark\.cn|(?:\w+\.)?(?:alipan|aliyundrive)\.com|drive\.uc\.cn|(?:115|anxia|115cdn)\.com|(?:www\.)?123[^/\s<>\"]+\.com|cloud\.189\.cn|(?:pan|yun)\.baidu\.com)\/[^\s<>\"]+/gi)
+        ).map((m) => ({ start: m.index ?? 0, end: (m.index ?? 0) + m[0].length }));
+        const getLinkContext = (start: number, end: number): string => {
+          if (shareLocations.length <= 1) return rawTextContent;
+          if (start >= rawTextContent.length) return '';
+          const lineStart = rawTextContent.lastIndexOf('\n', Math.max(0, start - 1)) + 1;
+          const lineEndAt = rawTextContent.indexOf('\n', end);
+          const lineEnd = lineEndAt < 0 ? rawTextContent.length : lineEndAt;
+          const locationIndex = shareLocations.findIndex((location) => location.start === start);
+          const previousLocation = locationIndex > 0 ? shareLocations[locationIndex - 1] : undefined;
+          const segmentStart = previousLocation && previousLocation.start >= lineStart ? previousLocation.end : lineStart;
+          let context = rawTextContent
+            .slice(segmentStart, start)
+            .replace(/https?:\/\/\S+/gi, ' ')
+            .replace(/[|｜•;]/g, ' ')
+            .trim();
+
+          // 链接单独占一行时，向上找最近一条非链接说明行；跳过前一个链接，避免串用它的版本信息。
+          if (!context && /^https?:\/\//i.test(rawTextContent.slice(lineStart, lineEnd).trim())) {
+            let cursor = lineStart;
+            while (cursor > 0) {
+              const previousEnd = cursor - 1;
+              const previousStart = rawTextContent.lastIndexOf('\n', Math.max(0, previousEnd - 1)) + 1;
+              const previousLine = rawTextContent.slice(previousStart, previousEnd).trim();
+              cursor = previousStart;
+              if (previousLine && !/^https?:\/\//i.test(previousLine)) {
+                context = previousLine.replace(/[|｜•;]/g, ' ').trim();
+                break;
+              }
+            }
+          }
+          return context.slice(0, 260);
+        };
 
         const addResource = (
           shareUrl: string,
           shareId: string,
           panType: CloudResource['panType'],
-          passcode?: string
+          passcode?: string,
+          linkContext: string = rawTextContent
         ) => {
           if (!shareUrl || seenUrls.has(shareUrl)) return;
           seenUrls.add(shareUrl);
           extractedInChannel++;
+          const contextForTags = shareLocations.length > 1 ? linkContext : rawTextContent;
+          const qualityTags = QualityTagger.extractTags(cleanTitle || keyword, contextForTags);
+          const category = CategoryClassifier.classify(cleanTitle || keyword, contextForTags);
           results.push({
             title: cleanTitle || keyword,
             shareUrl,
@@ -282,6 +321,8 @@ export class ResourceSearcher {
             category,
             qualityTags,
             rawText: rawTextContent.slice(0, 400),
+            linkContext: linkContext.slice(0, 260),
+            titleSource,
             sourceChannel: channel,
           });
         };
@@ -292,13 +333,15 @@ export class ResourceSearcher {
           const shareId = m[1];
           const shareUrl = `https://pan.quark.cn/s/${shareId}`;
           const matchPos = m.index ?? 0;
+          const linkContext = getLinkContext(matchPos, matchPos + m[0].length);
           const nearbySlice = combinedText.slice(Math.max(0, matchPos - 20), Math.min(combinedText.length, matchPos + m[0].length + 45));
-          const nearbyPassMatch = nearbySlice.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
-          const fallbackPassMatch = !nearbyPassMatch
+          const passcodeContext = shareLocations.length > 1 ? linkContext : nearbySlice;
+          const nearbyPassMatch = passcodeContext.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i);
+          const fallbackPassMatch = !nearbyPassMatch && shareLocations.length <= 1
             ? combinedText.match(/(?:提取码|密码|访问码|口令)[：:\s]*([a-zA-Z0-9]{4})\b/i)
             : null;
           const passcode = m[2] || nearbyPassMatch?.[1] || fallbackPassMatch?.[1] || '';
-          addResource(shareUrl, shareId, 'quark', passcode);
+          addResource(shareUrl, shareId, 'quark', passcode, linkContext);
         }
 
         const otherPatterns: Array<{ regex: RegExp; panType: CloudResource['panType']; hasId: boolean }> = [
@@ -312,7 +355,8 @@ export class ResourceSearcher {
 
         for (const pat of otherPatterns) {
           for (const m of combinedText.matchAll(pat.regex)) {
-            addResource(m[0], pat.hasId ? m[1] || '' : '', pat.panType);
+            const matchPos = m.index ?? 0;
+            addResource(m[0], pat.hasId ? m[1] || '' : '', pat.panType, undefined, getLinkContext(matchPos, matchPos + m[0].length));
           }
         }
       });
@@ -478,7 +522,7 @@ export class ResourceSearcher {
     );
   }
 
-  async verifyQuarkLink(pwdId: string): Promise<boolean> {
+  async verifyQuarkLink(pwdId: string): Promise<boolean | null> {
     try {
       const resp = await axios.get(`https://pan.quark.cn/s/${pwdId}`, {
         timeout: 5000,
@@ -486,9 +530,13 @@ export class ResourceSearcher {
           'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_6 like Mac OS X) AppleWebKit/605.1.15',
         },
       });
-      return !resp.data.includes('分享已失效') && !resp.data.includes('分享不存在');
+      const body = String(resp.data || '');
+      if (/(?:分享已失效|分享不存在|链接已失效)/.test(body)) return false;
+      if (resp.status >= 200 && resp.status < 400 && body.length > 0) return true;
+      return null;
     } catch {
-      return true;
+      // null 表示网络错误导致状态未知；调用方不得据此认为链接有效。
+      return null;
     }
   }
 }

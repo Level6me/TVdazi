@@ -3,6 +3,7 @@ import { QualityTags } from '../types';
 export interface QualityPreferenceSpec {
   targetResolution?: '4K' | '1080P' | '原盘' | 'any';
   preferDolby?: boolean;
+  preferHdr?: boolean;
   preferSmallSize?: boolean;
   preferHighBitrate?: boolean;
   preferSubtitle?: boolean;
@@ -34,8 +35,10 @@ export class QualityTagger {
     }
 
     let hdr: QualityTags['hdr'];
+    let dolbyVision = false;
     if (/(?:杜比视界|dolby[\s._-]*vision|\bdovi\b|\bdv\b)/i.test(text)) {
       hdr = '杜比视界';
+      dolbyVision = true;
       badges.push('杜比视界');
       bonus += 20;
     } else if (/(?:hdr10\+?|hdr)/i.test(text)) {
@@ -58,12 +61,15 @@ export class QualityTagger {
     }
 
     let audio: string | undefined;
+    let audioLanguage: QualityTags['audioLanguage'];
     if (/(?:国粤双语|国粤|双语配音)/i.test(text)) {
       audio = '国粤双语';
+      audioLanguage = '国粤双语';
       badges.push('国粤双语');
       bonus += 8;
     } else if (/(?:国语配音|国配|台配|中配|国英双语)/i.test(text)) {
       audio = '国语配音';
+      audioLanguage = '国语配音';
       badges.push('国语');
       bonus += 6;
     } else if (/(?:全景声|atmos|truehd|dts-hd)/i.test(text)) {
@@ -98,8 +104,10 @@ export class QualityTagger {
     return {
       resolution,
       hdr,
+      dolbyVision,
       codec,
       audio,
+      audioLanguage,
       subtitle,
       sizeHint,
       isSubtitleOnly,
@@ -120,7 +128,8 @@ export class QualityTagger {
     else if (/(?:原盘|remux|蓝光)/i.test(raw)) spec.targetResolution = '原盘';
     else if (/1080/i.test(raw)) spec.targetResolution = '1080P';
 
-    if (/(?:杜比|dolby|hdr)/i.test(raw)) spec.preferDolby = true;
+    if (/(?:杜比|dolby)/i.test(raw)) spec.preferDolby = true;
+    if (/hdr/i.test(raw)) spec.preferHdr = true;
     if (/(?:体积小|小体积|省流|压缩|轻量)/i.test(raw)) spec.preferSmallSize = true;
     if (/(?:高码|60帧|高帧率|无损)/i.test(raw)) spec.preferHighBitrate = true;
     if (/(?:中字|字幕|特效)/i.test(raw)) spec.preferSubtitle = true;
@@ -141,10 +150,11 @@ export class QualityTagger {
     if (spec.targetResolution === '原盘' && tags.codec === '原盘/REMUX') score += 95;
     if (spec.targetResolution === '1080P' && tags.resolution === '1080P') score += 90;
 
-    if (spec.preferDolby && tags.hdr) score += 60;
+    if (spec.preferDolby && (tags.dolbyVision || tags.hdr === '杜比视界')) score += 60;
+    if (spec.preferHdr && tags.hdr) score += 45;
     if (spec.preferHighBitrate && (tags.codec === '高码率' || tags.codec === '原盘/REMUX')) score += 50;
     if (spec.preferSubtitle && tags.subtitle) score += 45;
-    if (spec.preferMandarinCantonese && tags.audio) score += 45;
+    if (spec.preferMandarinCantonese && tags.audioLanguage) score += 45;
 
     if (spec.preferSmallSize && tags.sizeHint) {
       const m = tags.sizeHint.match(/^(\d+(?:\.\d+)?)(GB|MB|TB)$/i);

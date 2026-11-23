@@ -12,6 +12,7 @@ export interface ChannelHealthRecord {
   avgLatencyMs: number;
   lastSuccessAt?: number;
   lastFailAt?: number;
+  lastSampleAt?: number;
   circuitOpenUntil?: number;
 }
 
@@ -26,6 +27,8 @@ export class ChannelHealthService {
   private readonly storePath: string;
   private readonly failThreshold = 3;
   private readonly circuitCooldownMs = 5 * 60 * 1000;
+  private readonly metricHalfLifeMs = 7 * 24 * 60 * 60 * 1000;
+  private readonly failureStreakWindowMs = 30 * 60 * 1000;
   private saveTimer: NodeJS.Timeout | null = null;
   private activeProbePromise: Promise<Array<ChannelHealthRecord & { score: number; circuitOpen: boolean }>> | null = null;
 
@@ -48,6 +51,9 @@ export class ChannelHealthService {
         if (Array.isArray(parsed)) {
           for (const rec of parsed) {
             if (rec && rec.channelId) {
+              if (!Number.isFinite(rec.lastSampleAt)) {
+                rec.lastSampleAt = Math.max(Number(rec.lastSuccessAt) || 0, Number(rec.lastFailAt) || 0) || Date.now();
+              }
               this.records.set(rec.channelId, rec);
             }
           }
@@ -97,6 +103,7 @@ export class ChannelHealthService {
 
   recordSuccess(channelId: string, latencyMs: number, extractedItems: number = 0): void {
     const rec = this.getOrCreate(channelId);
+    this.decayMetrics(rec, Date.now());
     rec.successCount += 1;
     if (extractedItems > 0) {
       rec.hitCount += 1;
@@ -113,9 +120,14 @@ export class ChannelHealthService {
 
   recordFailure(channelId: string, latencyMs: number = 5500): void {
     const rec = this.getOrCreate(channelId);
+    const now = Date.now();
+    this.decayMetrics(rec, now);
+    if (rec.lastFailAt && now - rec.lastFailAt > this.failureStreakWindowMs) {
+      rec.consecutiveFails = 0;
+    }
     rec.failCount += 1;
     rec.consecutiveFails += 1;
-    rec.lastFailAt = Date.now();
+    rec.lastFailAt = now;
     rec.avgLatencyMs =
       rec.avgLatencyMs <= 0
         ? Math.round(latencyMs)
@@ -127,6 +139,28 @@ export class ChannelHealthService {
     this.schedulePersist();
   }
 
+  private decayMetrics(rec: ChannelHealthRecord, now: number): void {
+    const anchor = rec.lastSampleAt || Math.max(rec.lastSuccessAt || 0, rec.lastFailAt || 0) || now;
+    const elapsed = Math.max(0, now - anchor);
+    if (elapsed > 0) {
+      const factor = Math.pow(0.5, elapsed / this.metricHalfLifeMs);
+      rec.successCount *= factor;
+      rec.failCount *= factor;
+      rec.hitCount *= factor;
+    }
+    rec.lastSampleAt = now;
+  }
+
+  private getDecayedMetrics(rec: ChannelHealthRecord, now: number): { success: number; fail: number; hit: number } {
+    const anchor = rec.lastSampleAt || Math.max(rec.lastSuccessAt || 0, rec.lastFailAt || 0) || now;
+    const factor = Math.pow(0.5, Math.max(0, now - anchor) / this.metricHalfLifeMs);
+    return {
+      success: rec.successCount * factor,
+      fail: rec.failCount * factor,
+      hit: rec.hitCount * factor,
+    };
+  }
+
   /**
    * 计算频道健康评分 (0~100)
    */
@@ -135,14 +169,18 @@ export class ChannelHealthService {
     if (!rec) return 75; // 未知新频道给予中等基准分以获得探测机会
     if (this.isCircuitOpen(channelId)) return 0;
 
-    const total = rec.successCount + rec.failCount;
+    const metrics = this.getDecayedMetrics(rec, Date.now());
+    const total = metrics.success + metrics.fail;
     if (total === 0) return 75;
 
-    const successRate = rec.successCount / total;
-    const hitRate = rec.successCount > 0 ? rec.hitCount / rec.successCount : 0;
+    const successRate = metrics.success / total;
+    const hitRate = metrics.success > 0 ? metrics.hit / metrics.success : 0;
     const latencyPenalty = Math.min(25, Math.max(0, (rec.avgLatencyMs - 1000) / 180));
+    const evidenceConfidence = total / (total + 8);
+    const observedScore = successRate * 75 + hitRate * 25 - latencyPenalty;
 
-    return Math.max(5, Math.min(100, Math.round(successRate * 75 + hitRate * 25 - latencyPenalty)));
+    // 样本少或数据陈旧时回归中性分，避免少量偶然结果或陈旧数据长期控制频道优先级。
+    return Math.max(5, Math.min(100, Math.round(75 + (observedScore - 75) * evidenceConfidence)));
   }
 
   /**

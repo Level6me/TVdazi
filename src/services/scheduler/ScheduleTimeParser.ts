@@ -4,21 +4,40 @@ export interface ParsedScheduleTime {
   oneShotDate?: string;
   isRelative?: boolean;
   triggerAt?: number;
+  invalid?: boolean;
 }
 
-const CN_NUMS: Record<string, number> = {
-  零: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9, 十: 10,
-  十一: 11, 十二: 12, 十三: 13, 十四: 14, 十五: 15, 十六: 16, 十七: 17, 十八: 18, 十九: 19, 二十: 20,
-  二十一: 21, 二十二: 22, 二十三: 23, 三十: 30, 四十: 40, 四十五: 45, 五十: 50,
-};
+const CN_DIGITS: Record<string, number> = { 零: 0, 〇: 0, 一: 1, 二: 2, 两: 2, 三: 3, 四: 4, 五: 5, 六: 6, 七: 7, 八: 8, 九: 9 };
 
 /**
  * 定时任务时间与片名自然语言解析引擎（从 SchedulerService 解耦，支持独立单元测试）
  */
 export class ScheduleTimeParser {
-  static parseChineseNumber(s: string, fallback: number = 8): number {
-    if (/^\d+(?:\.\d+)?$/.test(s)) return parseFloat(s);
-    return CN_NUMS[s] ?? fallback;
+  static parseChineseNumber(s: string, fallback: number = Number.NaN): number {
+    const raw = String(s || '').trim();
+    if (/^\d+(?:\.\d+)?$/.test(raw)) return parseFloat(raw);
+    if (raw === '半') return 0.5;
+    const normalized = raw.replace(/廿/g, '二十').replace(/卅/g, '三十');
+    if (!normalized || !/^[零〇一二两三四五六七八九十百千万]+$/.test(normalized)) return fallback;
+
+    let total = 0;
+    let section = 0;
+    let number = 0;
+    for (const char of normalized) {
+      if (char in CN_DIGITS) {
+        number = CN_DIGITS[char];
+      } else if (char === '十' || char === '百' || char === '千') {
+        const unit = char === '十' ? 10 : char === '百' ? 100 : 1000;
+        section += (number || (unit === 10 ? 1 : 0)) * unit;
+        number = 0;
+      } else if (char === '万') {
+        section += number;
+        total += (section || 1) * 10000;
+        section = 0;
+        number = 0;
+      }
+    }
+    return total + section + number;
   }
 
   static getBeijingParts(timestampMs: number = Date.now()): {
@@ -54,46 +73,56 @@ export class ScheduleTimeParser {
    * 从自然语言文本中解析时间（支持相对延时“两分钟后/半小时后”以及定点“早上8点/20:30/后天”）
    */
   static parseTimeFromText(text: string, nowMs: number = Date.now()): ParsedScheduleTime {
-    const isPollingExpr = /(?:每|每隔|间隔|改成|改为|设为|设置成|调整为|调成)\s*(?:\d+(?:\.\d+)?|[一二两三四五六七八九十半]{1,3})\s*(?:分钟|分|个?\s*小时|钟头|min|h\b|m\b)/i.test(
+    const isPollingExpr = /(?:每|每隔|间隔|改成|改为|设为|设置成|调整为|调成)\s*(?:\d+(?:\.\d+)?|半|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:分钟|分|个?\s*小时|钟头|min|h\b|m\b)/i.test(
       text
     );
 
     let offsetMs = 0;
+    let invalidRelative = false;
     if (!isPollingExpr) {
       const relativeHalfHourMatch = text.match(
         /(?:等|过)?\s*半\s*个?\s*小时\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
       );
       const relativeMinMatch = text.match(
-        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|min(?:utes?)?|m\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|半|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:分钟|分(?!钟|辨|享|类|数|析|集|季|片|账)|min(?:utes?)?|m\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
       );
       const relativeHourMatch = text.match(
-        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:个?\s*小时|钟头|hours?|h\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|半|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:个?\s*小时|钟头|hours?|h\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
       );
       const relativeSecMatch = text.match(
-        /(?:等|过)?\s*(\d+(?:\.\d+)?|[一二两三四五六七八九十]{1,3})\s*(?:秒钟?|sec(?:onds?)?|s\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|半|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:秒钟?|sec(?:onds?)?|s\b)\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
+      );
+      const hourAndHalfMatch = text.match(
+        /(?:等|过)?\s*(\d+(?:\.\d+)?|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:个?\s*小时|钟头)\s*半\s*(?:之?后|再|内|给|帮|替|提醒|叫|通知|转存|存|推|发|搜|查|看|$)/i
       );
 
       if (/一个半\s*小时/.test(text)) {
         offsetMs = 90 * 60 * 1000;
+      } else if (hourAndHalfMatch) {
+        const val = this.parseChineseNumber(hourAndHalfMatch[1]);
+        if (Number.isFinite(val) && val > 0) offsetMs = Math.round((val + 0.5) * 60 * 60 * 1000);
+        else invalidRelative = true;
       } else if (relativeHalfHourMatch) {
         offsetMs = 30 * 60 * 1000;
       } else if (relativeMinMatch) {
         const val = this.parseChineseNumber(relativeMinMatch[1]);
-        if (!isNaN(val) && val > 0) {
+        if (Number.isFinite(val) && val > 0) {
           offsetMs = Math.round(val * 60 * 1000);
-        }
+        } else invalidRelative = true;
       } else if (relativeHourMatch) {
         const val = this.parseChineseNumber(relativeHourMatch[1]);
-        if (!isNaN(val) && val > 0) {
+        if (Number.isFinite(val) && val > 0) {
           offsetMs = Math.round(val * 60 * 60 * 1000);
-        }
+        } else invalidRelative = true;
       } else if (relativeSecMatch) {
         const val = this.parseChineseNumber(relativeSecMatch[1]);
-        if (!isNaN(val) && val > 0) {
+        if (Number.isFinite(val) && val > 0) {
           offsetMs = Math.round(val * 1000);
-        }
+        } else invalidRelative = true;
       }
     }
+
+    if (invalidRelative) return { timeStr: '', invalid: true };
 
     if (offsetMs > 0) {
       const triggerAt = nowMs + offsetMs;
@@ -111,20 +140,31 @@ export class ScheduleTimeParser {
 
     const colonMatch = text.match(/(\d{1,2})\s*[:：]\s*(\d{1,2})/);
     const pointMatch = text.match(
-      /(早上|早晨|今早|明早|每早|上午|中午|下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜|凌晨)?\s*(\d{1,2}|[一二三四五六七八九十两]{1,3})\s*(?:点|时)(?:(\d{1,2}|半|[一二三四五六七八九十]{1,3})\s*分?)?/
+      /(早上|早晨|今早|明早|每早|上午|中午|下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜|凌晨)?\s*(\d{1,2}|[零〇一二两三四五六七八九十百千万廿卅]+)\s*(?:点|时)(?:(\d{1,2}|半|[零〇一二两三四五六七八九十百千万廿卅]+)\s*分?)?/
     );
 
     if (colonMatch) {
       hour = parseInt(colonMatch[1], 10);
       minute = parseInt(colonMatch[2], 10);
-      if (/(?:下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜)/.test(text) && hour < 12) {
+      if (hour > 23 || minute > 59) return { timeStr: '', invalid: true };
+      const prefix = text.slice(0, colonMatch.index);
+      const periods = Array.from(prefix.matchAll(/早上|早晨|今早|明早|每早|上午|中午|下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜|凌晨/g));
+      const period = periods.length > 0 ? periods[periods.length - 1][0] : '';
+      if (/(?:下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜)/.test(period) && hour < 12) {
         hour += 12;
+      } else if (period === '中午' && hour < 11) {
+        hour += 12;
+      } else if (period === '凌晨' && hour === 12) {
+        hour = 0;
       }
     } else if (pointMatch) {
       const period = pointMatch[1] || '';
       hour = this.parseChineseNumber(pointMatch[2]);
       if (pointMatch[3]) {
         minute = pointMatch[3] === '半' ? 30 : this.parseChineseNumber(pointMatch[3]);
+      }
+      if (!Number.isFinite(hour) || !Number.isFinite(minute) || hour > 23 || minute > 59) {
+        return { timeStr: '', invalid: true };
       }
       if (/(?:下午|傍晚|晚上|今晚|明晚|每晚|夜里|今夜)/.test(period) && hour < 12) {
         hour += 12;
