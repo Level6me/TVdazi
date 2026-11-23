@@ -1622,17 +1622,25 @@ test('QuarkService inspects transferred archive files, reminds user, and execute
     assert.equal(saveRes.fileTypeSummary?.hasArchives, true);
     assert.equal(saveRes.fileTypeSummary?.archiveFiles.length, 2);
     assert.equal(saveRes.fileTypeSummary?.fakeArchiveFiles.length, 1);
-    assert.ok(saveRes.message.includes('检测到刚转存的内容含压缩包'));
-    assert.ok(saveRes.message.includes('要不要我现在直接帮你云端解压'));
+    assert.ok(saveRes.message.includes('压缩包文件'));
+    assert.ok(saveRes.message.includes('云端解压'));
 
     const recent = sm.getRecentSaved(userId);
     assert.ok(recent);
     assert.equal(recent?.awaitingUnarchiveConfirm, true);
 
-    // 2. 验证快捷确认解析（确认 / 带密码 / 删除原包 / 拒绝）
+    // 2. 验证快捷确认解析（确认 / 全部解压 / 19个全部解压 / 带密码 / 删除原包 / 拒绝）
     assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('解压 密码6688', true), {
       kind: 'confirm',
       password: '6688',
+      deleteAfter: false,
+    });
+    assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('全部解压', true), {
+      kind: 'confirm',
+      deleteAfter: false,
+    });
+    assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('19个全部解压', true), {
+      kind: 'confirm',
       deleteAfter: false,
     });
     assert.deepEqual(QuarkFileActionService.parseQuickUnarchiveIntent('解压并删除原压缩包', true), {
@@ -1646,9 +1654,9 @@ test('QuarkService inspects transferred archive files, reminds user, and execute
     (agent as any).quarkService = qs;
     (agent as any).quarkFileActions = new QuarkFileActionService(qs, um, sm);
     const quickReply = await agent.chat('解压 密码8888', userId);
-    assert.ok(quickReply.includes('沙丘2.part1.rar'));
-    assert.ok(quickReply.includes('沙丘2花絮.mp4'));
-    assert.ok(quickReply.includes('跳过 1 个后续分卷'));
+    assert.ok(quickReply.includes('全部 **3** 个压缩包已处理'));
+    assert.ok(quickReply.includes('已完成 **2** 个'));
+    assert.ok(quickReply.includes('1 个为后续分卷'));
     assert.equal(unarchivePayloads.length, 1);
     assert.equal(unarchivePayloads[0].fid, 'arch_1');
     assert.equal(unarchivePayloads[0].pwd, '8888');
@@ -1699,6 +1707,34 @@ test('QuarkService inspects transferred archive files, reminds user, and execute
     });
     assert.ok(confirmDelReply.includes('回收站'));
     assert.deepEqual(deletedFids, ['dup_b']);
+
+    // 6. 回归测试：19个压缩包只报总数量不列清单，回复“全部解压”一口气解压全部19个不截断
+    const nineteenArchives = Array.from({ length: 19 }, (_, idx) => ({
+      fid: `ep_zip_${idx + 1}`,
+      file_name: `无可替代.EP${String(idx + 1).padStart(2, '0')}.zip`,
+      dir: false,
+      size: 500 * 1024 * 1024,
+      pdir_fid: 'dir_tv_19',
+    }));
+    const origSearchFiles = qs.searchFiles.bind(qs);
+    (qs as any).searchFiles = async (q: string, opts?: any) => {
+      if (q.includes('无可替代')) return nineteenArchives;
+      return origSearchFiles(q, opts);
+    };
+    unarchivePayloads.length = 0;
+
+    const askReply = await actions.execute(userId, { action: 'unarchive', query: '无可替代' });
+    assert.ok(askReply.includes('**19** 个压缩包文件'));
+    assert.equal(askReply.includes('EP01.zip'), false);
+    assert.equal(askReply.includes('EP19.zip'), false);
+    assert.equal(sm.getPendingUnarchive(userId)?.items.length, 19);
+
+    const batchReply = await agent.chat('全部解压', userId);
+    assert.equal(unarchivePayloads.length, 19);
+    assert.ok(batchReply.includes('全部 **19** 个压缩包已处理'));
+    assert.ok(batchReply.includes('已完成 **19** 个'));
+    assert.equal(batchReply.includes('EP01.zip'), false);
+    assert.equal(sm.getPendingUnarchive(userId), undefined);
   } finally {
     (axios as any).get = origGet;
     (axios as any).post = origPost;

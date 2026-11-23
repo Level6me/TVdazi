@@ -722,19 +722,12 @@ export class QuarkService {
           baseMsg += `\n📦 文件类型：${fileTypeSummary.summaryLine}${sizeStr}`;
 
           if (fileTypeSummary.hasArchives) {
-            const archiveNames = [
-              ...fileTypeSummary.archiveFiles.map((f) => f.file_name),
-              ...fileTypeSummary.fakeArchiveFiles.map((f) => `${f.node.file_name}（疑似伪装后缀）`),
-            ].slice(0, 3);
-            const moreHint =
-              fileTypeSummary.archiveFiles.length + fileTypeSummary.fakeArchiveFiles.length > 3
-                ? ` 等 ${fileTypeSummary.archiveFiles.length + fileTypeSummary.fakeArchiveFiles.length} 个`
-                : '';
-            baseMsg += `\n⚠️ 检测到刚转存的内容含压缩包：${archiveNames.join('、')}${moreHint}`;
+            const totalArchives = fileTypeSummary.archiveFiles.length + fileTypeSummary.fakeArchiveFiles.length;
+            baseMsg += `\n⚠️ 检测到刚转存的内容包含 **${totalArchives}** 个压缩包文件。`;
             if (fileTypeSummary.fakeArchiveFiles.length > 0 && fileTypeSummary.archiveFiles.length === 0) {
-              baseMsg += '\n👉 这些文件看起来是防和谐改后缀的伪装视频，直接回复「解压」我就能秒帮你改回真实视频后缀！';
+              baseMsg += '\n👉 这些文件是防和谐改后缀的伪装视频，直接回复「全部解压」我就能秒帮你全部改回真实视频后缀！';
             } else {
-              baseMsg += '\n👉 要不要我现在直接帮你云端解压？直接回复「解压」或「解压 密码xxx」就行~';
+              baseMsg += `\n👉 要全部帮你云端解压吗？直接回复「${totalArchives > 1 ? '全部解压' : '解压'}」（带密码回「全部解压 密码xxx」）就行~`;
             }
           }
 
@@ -1105,7 +1098,7 @@ export class QuarkService {
   }
 
   /**
-   * 列出指定目录下的全部文件和子目录节点（严格区分空目录与登录凭证过期 401）
+   * 列出指定目录下的全部文件和子目录节点（严格区分空目录与登录凭证过期 401，size > 100 时自动翻页）
    */
   async listFilesInFolderStrict(
     folderFid = '0',
@@ -1115,34 +1108,47 @@ export class QuarkService {
     if (!this.isConfigured(customCookie)) {
       return { ok: false, unauthorized: true, items: [] };
     }
+    const targetLimit = Math.min(500, Math.max(1, size));
+    const pageSize = Math.min(100, targetLimit);
+    const maxPages = Math.ceil(targetLimit / pageSize);
+    const allItems: QuarkFileNode[] = [];
+
     try {
-      const resp = await axios.get('https://drive-h.quark.cn/1/clouddrive/file/sort', {
-        params: {
-          pr: 'ucpro',
-          fr: 'pc',
-          uc_param_str: '',
-          pdir_fid: folderFid,
-          _page: '1',
-          _size: String(size),
-          _sort: 'updated_at:desc',
-        },
-        headers: this.getHeaders(customCookie),
-        timeout: 8000,
-      });
-      if (resp.data?.status === 401 || resp.data?.code === 40001 || resp.data?.message?.includes('登录')) {
-        return { ok: false, unauthorized: true, items: [] };
+      for (let page = 1; page <= maxPages; page++) {
+        const resp = await axios.get('https://drive-h.quark.cn/1/clouddrive/file/sort', {
+          params: {
+            pr: 'ucpro',
+            fr: 'pc',
+            uc_param_str: '',
+            pdir_fid: folderFid,
+            _page: String(page),
+            _size: String(pageSize),
+            _sort: 'updated_at:desc',
+          },
+          headers: this.getHeaders(customCookie),
+          timeout: 8000,
+        });
+        if (resp.data?.status === 401 || resp.data?.code === 40001 || resp.data?.message?.includes('登录')) {
+          return { ok: false, unauthorized: true, items: [] };
+        }
+        const list = resp.data?.data?.list || [];
+        for (const item of list) {
+          allItems.push({
+            fid: item.fid,
+            file_name: item.file_name,
+            dir: Boolean(item.dir),
+            size: Number(item.size || 0),
+            pdir_fid: item.pdir_fid || folderFid,
+            updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
+          });
+        }
+        if (list.length < pageSize || allItems.length >= targetLimit) {
+          break;
+        }
       }
-      const list = resp.data?.data?.list || [];
       return {
         ok: true,
-        items: list.map((item: any) => ({
-          fid: item.fid,
-          file_name: item.file_name,
-          dir: Boolean(item.dir),
-          size: Number(item.size || 0),
-          pdir_fid: item.pdir_fid || folderFid,
-          updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
-        })),
+        items: allItems.slice(0, targetLimit),
       };
     } catch (err: any) {
       const unauthorized = err.response?.status === 401 || err.response?.data?.message?.includes('登录');
@@ -1256,7 +1262,7 @@ export class QuarkService {
     if (!this.isConfigured(customCookie)) return [];
 
     const query = (keyword || '').trim();
-    const size = Math.min(100, Math.max(10, options?.size || 50));
+    const size = Math.min(500, Math.max(10, options?.size || 200));
     const archivesOnly = Boolean(options?.archivesOnly);
 
     const filterArchive = (nodes: QuarkFileNode[]) =>
@@ -1273,35 +1279,46 @@ export class QuarkService {
         'https://drive-pc.quark.cn/1/clouddrive/file/search',
         'https://drive-h.quark.cn/1/clouddrive/file/search',
       ];
+      const pageSize = Math.min(100, size);
+      const maxPages = Math.min(5, Math.ceil(size / pageSize));
       for (const endpoint of endpoints) {
         try {
-          const resp = await axios.get(endpoint, {
-            params: {
-              pr: 'ucpro',
-              fr: 'pc',
-              uc_param_str: '',
-              q: query,
-              _page: '1',
-              _size: String(size),
-              _fetch_total: '1',
-              _sort: 'file_type:desc,updated_at:desc',
-              _is_hl: '0',
-            },
-            headers: this.getHeaders(customCookie),
-            timeout: 8000,
-          });
-          const list = resp.data?.data?.list;
-          if (Array.isArray(list)) {
-            const mapped: QuarkFileNode[] = list.map((item: any) => ({
-              fid: item.fid,
-              file_name: cleanFileName(item.file_name),
-              dir: Boolean(item.dir),
-              size: Number(item.size || 0),
-              pdir_fid: item.pdir_fid || '0',
-              updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
-            }));
-            const filtered = filterArchive(mapped);
-            if (filtered.length > 0 || list.length === 0) {
+          const allMapped: QuarkFileNode[] = [];
+          let apiOk = false;
+          for (let page = 1; page <= maxPages; page++) {
+            const resp = await axios.get(endpoint, {
+              params: {
+                pr: 'ucpro',
+                fr: 'pc',
+                uc_param_str: '',
+                q: query,
+                _page: String(page),
+                _size: String(pageSize),
+                _fetch_total: '1',
+                _sort: 'file_type:desc,updated_at:desc',
+                _is_hl: '0',
+              },
+              headers: this.getHeaders(customCookie),
+              timeout: 8000,
+            });
+            const list = resp.data?.data?.list;
+            if (!Array.isArray(list)) break;
+            apiOk = true;
+            for (const item of list) {
+              allMapped.push({
+                fid: item.fid,
+                file_name: cleanFileName(item.file_name),
+                dir: Boolean(item.dir),
+                size: Number(item.size || 0),
+                pdir_fid: item.pdir_fid || '0',
+                updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
+              });
+            }
+            if (list.length < pageSize || allMapped.length >= size) break;
+          }
+          if (apiOk) {
+            const filtered = filterArchive(allMapped).slice(0, size);
+            if (filtered.length > 0 || allMapped.length === 0) {
               return filtered;
             }
           }
@@ -1309,16 +1326,16 @@ export class QuarkService {
       }
     }
 
-    // 无关键词扫全盘压缩包，或 file/search 接口异常时：扫描根目录 + 保存根目录及分类子目录（最多 2 层）
+    // 无关键词扫全盘压缩包，或 file/search 接口异常时：扫描根目录 + 保存根目录及分类子目录（最多 3 层、80 个目录）
     const baseDir = options?.rootDir || this.defaultRootDir;
     const collected: QuarkFileNode[] = [];
     const visited = new Set<string>();
     const lowerQ = query.toLowerCase();
 
     const scanFolder = async (fid: string, pathPrefix: string, depth: number) => {
-      if (!fid || visited.has(fid) || visited.size >= 35) return;
+      if (!fid || visited.has(fid) || visited.size >= 80) return;
       visited.add(fid);
-      const children = await this.listFilesInFolder(fid, customCookie, 100);
+      const children = await this.listFilesInFolder(fid, customCookie, 200);
       for (const c of children) {
         const fullPath = `${pathPrefix === '/' ? '' : pathPrefix}/${c.file_name}`.replace(/\/+/g, '/');
         const node: QuarkFileNode = { ...c, pdir_fid: c.pdir_fid || fid, path: fullPath };
@@ -1326,7 +1343,7 @@ export class QuarkService {
         if (matchQ) {
           collected.push(node);
         }
-        if (c.dir && depth > 0 && visited.size < 35) {
+        if (c.dir && depth > 0 && visited.size < 80) {
           await scanFolder(c.fid, fullPath, depth - 1);
         }
       }
@@ -1334,9 +1351,9 @@ export class QuarkService {
 
     const rootFid = await this.resolveExistingPathFid(baseDir, customCookie);
     if (rootFid && rootFid !== '0') {
-      await scanFolder(rootFid, baseDir, 2);
+      await scanFolder(rootFid, baseDir, 3);
     }
-    await scanFolder('0', '/', 1);
+    await scanFolder('0', '/', 2);
 
     // 按 fid 去重
     const uniq = new Map<string, QuarkFileNode>();
@@ -1607,7 +1624,7 @@ export class QuarkService {
   }
 
   /**
-   * 批量云端解压多个压缩包（自动跳过分卷压缩的后续分卷 .part2.rar / .002）
+   * 批量云端解压多个压缩包（自动跳过分卷压缩的后续分卷 .part2.rar / .002，全量处理不截断）
    */
   async unarchiveFilesBatch(
     files: Array<Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>>,
@@ -1618,6 +1635,7 @@ export class QuarkService {
       customCookie?: string;
       deleteAfter?: boolean;
       maxCount?: number;
+      concurrency?: number;
     }
   ): Promise<{
     results: QuarkUnarchiveResult[];
@@ -1626,7 +1644,7 @@ export class QuarkService {
     inProgressCount: number;
     failCount: number;
   }> {
-    const maxCount = options?.maxCount ?? 10;
+    const maxCount = options?.maxCount ?? 500;
     const skippedSplitParts: string[] = [];
     const queue: Array<Pick<QuarkFileNode, 'fid' | 'file_name' | 'pdir_fid'>> = [];
 
@@ -1638,13 +1656,27 @@ export class QuarkService {
       queue.push(f);
     }
 
+    const targets = queue.slice(0, maxCount);
+    const isLargeBatch = targets.length > 3;
+    const concurrency = isLargeBatch ? Math.min(3, options?.concurrency ?? 3) : 1;
+    const singleOpts = {
+      ...options,
+      // 批量解压多文件时缩短单包轮询等待，大包提交后立即记为云端后台解压中，避免超时卡顿
+      maxPollAttempts: isLargeBatch ? 3 : 12,
+    };
+
     const results: QuarkUnarchiveResult[] = [];
-    for (const item of queue.slice(0, maxCount)) {
-      const res = await this.unarchiveFile(item, options);
-      results.push(res);
-      // 若触发密码错误或 Cookie 过期，提前中止批量避免连续报错
-      if (res.needPassword || res.message.includes('Cookie')) {
-        break;
+    let aborted = false;
+
+    for (let i = 0; i < targets.length && !aborted; i += concurrency) {
+      const chunk = targets.slice(i, i + concurrency);
+      const chunkRes = await Promise.all(chunk.map((item) => this.unarchiveFile(item, singleOpts)));
+      for (const res of chunkRes) {
+        results.push(res);
+        // 若触发密码错误或 Cookie 过期，提前中止后续批次避免连续报错
+        if (res.needPassword || res.message.includes('Cookie')) {
+          aborted = true;
+        }
       }
     }
 

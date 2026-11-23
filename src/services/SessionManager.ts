@@ -23,6 +23,13 @@ export interface NetdiskListingSession {
   updatedAt: number;
 }
 
+export interface PendingUnarchiveSession {
+  targetHint: string;
+  items: QuarkFileNode[];
+  awaitingConfirm: boolean;
+  updatedAt: number;
+}
+
 export interface SearchSession {
   keyword: string;
   items: CloudResource[];
@@ -66,6 +73,7 @@ export class SessionManager {
   private pendingImageSearches: Map<string, PendingImageSearch> = new Map();
   private recentSavedSessions: Map<string, RecentSavedSession> = new Map();
   private netdiskListings: Map<string, NetdiskListingSession> = new Map();
+  private pendingUnarchives: Map<string, PendingUnarchiveSession> = new Map();
 
   static getInstance(): SessionManager {
     if (!SessionManager.instance) {
@@ -299,6 +307,31 @@ export class SessionManager {
     if (entry) {
       entry.awaitingUnarchiveConfirm = false;
     }
+    this.pendingUnarchives.delete(userId);
+  }
+
+  /**
+   * 记录待确认批量解压的完整压缩包队列（确保用户回复“全部解压”时全量执行，不截断、不漏项）
+   */
+  setPendingUnarchive(userId: string, targetHint: string, items: QuarkFileNode[]): PendingUnarchiveSession {
+    const entry: PendingUnarchiveSession = {
+      targetHint,
+      items,
+      awaitingConfirm: true,
+      updatedAt: Date.now(),
+    };
+    this.setBounded(this.pendingUnarchives, userId, entry);
+    return entry;
+  }
+
+  getPendingUnarchive(userId: string): PendingUnarchiveSession | undefined {
+    const entry = this.pendingUnarchives.get(userId);
+    if (!entry) return undefined;
+    if (this.isExpired(entry.updatedAt)) {
+      this.pendingUnarchives.delete(userId);
+      return undefined;
+    }
+    return entry;
   }
 
   /**

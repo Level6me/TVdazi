@@ -55,7 +55,7 @@ export class QuarkFileActionService {
   }
 
   /**
-   * 识别“刚转存含压缩包提醒”后的极简快捷确认/拒绝回复
+   * 识别“待解压压缩包提醒”后的快捷确认/拒绝回复（支持“全部解压”“19个全部解压”“全部”“解压 密码xxx”等）
    */
   static parseQuickUnarchiveIntent(text: string, awaitingConfirm: boolean): QuickUnarchiveIntent | null {
     if (!awaitingConfirm) return null;
@@ -68,25 +68,27 @@ export class QuarkFileActionService {
 
     const deleteAfter = /(?:删掉?原|删除原|顺便删|解完删|删压缩包)/.test(trimmed);
 
-    // 1. 纯确认词（如“好”“好的”“要”“解压”“解压吧”“帮我解压”）
+    // 1. 纯确认词或全量确认词（如“全部解压”“19个全部解压”“全部”“都解压”“解压”“好的”）
     if (
-      /^(?:解压|帮我解压|解压吧|解压一下|解一下|开始解压|云端解压|直接解压|要|要的|需要|好|好的|好呀|可以|行|嗯|嗯嗯|ok|yes)(?:并删除原(?:文件|压缩包|包)|顺便删(?:掉|了)?原(?:文件|压缩包|包))?[!！。.~～]*$/i.test(
+      /^(?:(?:\d+\s*个)?(?:全部|全都|全|都|所有)?(?:帮我)?(?:云端|直接)?解压(?:全部|吧|一下|完)?|全部(?:\d+\s*个)?(?:都)?(?:解压|解)?|解一下|开始解压|要|要的|需要|好|好的|好呀|可以|行|嗯|嗯嗯|ok|yes)(?:并删除原(?:文件|压缩包|包)|顺便删(?:掉|了)?原(?:文件|压缩包|包))?[!！。.~～]*$/i.test(
         trimmed
       )
     ) {
       return { kind: 'confirm', deleteAfter };
     }
 
-    // 2. 带密码的快捷确认（如“解压 密码1234”、“解压 1234”、“密码是1234”、“密码：abc”）
+    // 2. 带密码的快捷确认（如“全部解压 密码1234”、“解压 密码1234”、“密码是1234”、“密码：abc”）
     const explicitPwd = QuarkOrganizer.extractArchivePasswordHint(trimmed);
     if (
       explicitPwd &&
-      /^(?:解压|帮我解压|直接解压|云端解压|好的?|要|密码|解压密码|解压码|口令|pwd)/i.test(trimmed)
+      /^(?:(?:\d+\s*个)?(?:全部|全都|全|都)?(?:帮我)?(?:直接|云端)?解压|全部|好的?|要|密码|解压密码|解压码|口令|pwd)/i.test(
+        trimmed
+      )
     ) {
       return { kind: 'confirm', password: explicitPwd, deleteAfter };
     }
 
-    const barePwdMatch = trimmed.match(/^(?:解压|帮我解压|云端解压)\s+([A-Za-z0-9._@#\-!$%^&*]{1,32})$/i);
+    const barePwdMatch = trimmed.match(/^(?:(?:\d+\s*个)?(?:全部|全)?(?:帮我)?(?:云端)?解压|全部)\s+([A-Za-z0-9._@#\-!$%^&*]{1,32})$/i);
     if (barePwdMatch && barePwdMatch[1]) {
       return { kind: 'confirm', password: barePwdMatch[1], deleteAfter };
     }
@@ -219,6 +221,25 @@ export class QuarkFileActionService {
     return { nodes: [], sourceLabel: '未指定目标' };
   }
 
+  private formatArchiveCountPrompt(items: QuarkFileNode[], targetHint?: string): string {
+    const summary = QuarkOrganizer.summarizeFileTypes(items);
+    const totalCount = items.length;
+    const sizeText = summary.totalBytes > 0 ? `，共约 ${QuarkOrganizer.formatBytes(summary.totalBytes)}` : '';
+    const scopeText = targetHint ? `在 ${targetHint} 中` : '在你的夸克网盘中';
+
+    if (summary.fakeArchiveFiles.length > 0 && summary.archiveFiles.length === 0) {
+      return [
+        `📦 ${scopeText}共找到 **${totalCount}** 个防和谐伪装后缀文件（${summary.summaryLine}${sizeText}）。`,
+        `👉 要全部帮你改回真实视频后缀吗？直接回复 **「全部解压」** 就行~`,
+      ].join('\n');
+    }
+
+    return [
+      `📦 ${scopeText}共找到 **${totalCount}** 个压缩包文件（${summary.summaryLine}${sizeText}）。`,
+      `👉 要全部帮你云端解压吗？直接回复 **「全部解压」**（带密码回 **「全部解压 密码xxx」**）就能一口气解压全部 ${totalCount} 个~`,
+    ].join('\n');
+  }
+
   private formatUnarchiveBatchReply(
     batch: {
       results: QuarkUnarchiveResult[];
@@ -229,22 +250,42 @@ export class QuarkFileActionService {
     },
     targetHint?: string
   ): string {
-    const lines: string[] = [];
-    if (batch.results.length === 1) {
-      lines.push(batch.results[0].message);
-    } else {
-      lines.push(
-        `📦 压缩包处理完成${targetHint ? `（${targetHint}）` : ''}：成功 ${batch.successCount} 个` +
-          (batch.inProgressCount > 0 ? `，云端后台解压中 ${batch.inProgressCount} 个` : '') +
-          (batch.failCount > 0 ? `，失败 ${batch.failCount} 个` : '')
-      );
-      lines.push('');
-      for (const r of batch.results) {
-        lines.push(`• ${r.message}`);
+    const totalProcessed = batch.results.length;
+    if (totalProcessed === 1) {
+      const singleMsg = batch.results[0].message;
+      if (batch.skippedSplitParts.length > 0) {
+        return `${singleMsg}\n💡 已自动跳过 ${batch.skippedSplitParts.length} 个后续分卷文件（由首个分卷统一解压）。`;
+      }
+      return singleMsg;
+    }
+
+    const totalAll = totalProcessed + batch.skippedSplitParts.length;
+    const parts: string[] = [];
+    if (batch.successCount > 0) parts.push(`已完成 **${batch.successCount}** 个`);
+    if (batch.inProgressCount > 0) parts.push(`已提交夸克云端后台解压 **${batch.inProgressCount}** 个`);
+    if (batch.failCount > 0) parts.push(`失败 **${batch.failCount}** 个`);
+
+    const lines: string[] = [
+      `📦 全部 **${totalAll}** 个压缩包已处理${targetHint ? `（${targetHint}）` : ''}：${parts.join('，')}。`,
+    ];
+
+    if (batch.inProgressCount > 0) {
+      lines.push('⏳ 云端后台解压中的文件稍等片刻直接在夸克网盘里就能看到啦~');
+    }
+    if (batch.failCount > 0) {
+      const failReasons = Array.from(
+        new Set(
+          batch.results
+            .filter((r) => !r.success)
+            .map((r) => r.message)
+        )
+      ).slice(0, 3);
+      for (const reason of failReasons) {
+        lines.push(`• ${reason}`);
       }
     }
     if (batch.skippedSplitParts.length > 0) {
-      lines.push(`\n💡 已自动跳过 ${batch.skippedSplitParts.length} 个后续分卷文件（由首个分卷统一解压）。`);
+      lines.push(`💡 其中 ${batch.skippedSplitParts.length} 个为后续分卷文件，已自动由首卷一并解压。`);
     }
     return lines.join('\n').trim();
   }
@@ -390,7 +431,7 @@ export class QuarkFileActionService {
     const archivesOnly = Boolean(input.archives_only);
     const items = await this.quarkService.searchFiles(query, {
       customCookie,
-      size: 30,
+      size: archivesOnly ? 200 : 50,
       archivesOnly,
       rootDir,
     });
@@ -410,12 +451,19 @@ export class QuarkFileActionService {
       items,
     });
 
-    const summary = QuarkOrganizer.summarizeFileTypes(items);
-    const heading = archivesOnly
-      ? `📦 **网盘压缩包检索${query ? `：「${query}」` : ''}**（找到 ${items.length} 个）`
-      : `🔍 **网盘文件搜索：「${query}」**（找到 ${items.length} 项）`;
+    // 专项查找压缩包时：不刷屏发具体文件名列表，只报总数并写入待确认全量解压队列
+    if (archivesOnly) {
+      const hint = query ? `「${query}」` : '你的夸克网盘';
+      this.sessionManager.setPendingUnarchive(userId, hint, items);
+      return this.formatArchiveCountPrompt(items, hint);
+    }
 
-    const lines: string[] = [heading, `• 文件类型：${summary.summaryLine}`, ''];
+    const summary = QuarkOrganizer.summarizeFileTypes(items);
+    const lines: string[] = [
+      `🔍 **网盘文件搜索：「${query}」**（找到 ${items.length} 项）`,
+      `• 文件类型：${summary.summaryLine}`,
+      '',
+    ];
     items.slice(0, 15).forEach((item, idx) => {
       lines.push(this.formatNodeLine(item, idx + 1));
     });
@@ -425,7 +473,9 @@ export class QuarkFileActionService {
 
     lines.push('');
     if (summary.hasArchives) {
-      lines.push('👉 直接对我说「解压第1个」「把这些压缩包全解压了」「把第2个重命名/删掉」就行~');
+      const archList = [...summary.archiveFiles, ...summary.fakeArchiveFiles.map((f) => f.node)];
+      this.sessionManager.setPendingUnarchive(userId, `「${query}」`, archList);
+      lines.push(`👉 检测到 ${archList.length} 个压缩包，直接回复 **「全部解压」** 即可全部云端解压；也可以按序号重命名或删除~`);
     } else {
       lines.push('👉 直接对我说「把第1个重命名成xxx」「移动到 /某目录」或「把第1个删掉」即可操作~');
     }
@@ -434,10 +484,13 @@ export class QuarkFileActionService {
 
   private async collectArchivesFromNodes(
     nodes: QuarkFileNode[],
-    customCookie?: string
+    customCookie?: string,
+    maxDepth: number = 2
   ): Promise<QuarkFileNode[]> {
     const out: QuarkFileNode[] = [];
     const seen = new Set<string>();
+    const visitedDirs = new Set<string>();
+
     const pushIfArchive = (n: QuarkFileNode) => {
       if (n.dir || seen.has(n.fid)) return;
       if (QuarkOrganizer.isArchiveFile(n.file_name) || QuarkOrganizer.detectFakeArchiveVideo(n.file_name)) {
@@ -446,18 +499,20 @@ export class QuarkFileActionService {
       }
     };
 
-    let dirScanned = 0;
-    for (const node of nodes) {
-      if (!node.dir) {
-        pushIfArchive(node);
-      } else if (dirScanned < 3) {
-        dirScanned++;
-        const children = await this.quarkService.listFilesInFolder(node.fid, customCookie, 100);
-        for (const c of children) {
-          pushIfArchive({ ...c, pdir_fid: c.pdir_fid || node.fid });
+    const walk = async (list: QuarkFileNode[], depth: number) => {
+      for (const node of list) {
+        if (!node.dir) {
+          pushIfArchive(node);
+        } else if (depth > 0 && !visitedDirs.has(node.fid) && visitedDirs.size < 15) {
+          visitedDirs.add(node.fid);
+          const children = await this.quarkService.listFilesInFolder(node.fid, customCookie, 200);
+          const enriched = children.map((c) => ({ ...c, pdir_fid: c.pdir_fid || node.fid }));
+          await walk(enriched, depth - 1);
         }
       }
-    }
+    };
+
+    await walk(nodes, maxDepth);
     return out;
   }
 
@@ -471,12 +526,27 @@ export class QuarkFileActionService {
     const toDirPath = input.to_dir ? this.normalizePath(input.to_dir, rootDir) : undefined;
     const deleteAfter = Boolean(input.delete_after);
     const recent: RecentSavedSession | undefined = this.sessionManager.getRecentSaved(userId);
+    const pendingBatch = this.sessionManager.getPendingUnarchive(userId);
 
     let targets: QuarkFileNode[] = [];
     let targetHint = '';
 
-    // 情况 1：按最近列表序号解压
+    // 情况 0：已有待确认的全量压缩包队列，且用户未指定新的 query/path/index（如回复“全部解压”“19个全部解压”“全部”）
     if (
+      pendingBatch &&
+      pendingBatch.items.length > 0 &&
+      !input.query &&
+      !input.path &&
+      input.target_scope !== 'index' &&
+      !input.index &&
+      !(input.indices && input.indices.length > 0) &&
+      input.target_scope !== 'recent_saved'
+    ) {
+      targets = pendingBatch.items;
+      targetHint = pendingBatch.targetHint;
+    }
+    // 情况 1：按最近列表序号解压
+    else if (
       input.target_scope === 'index' ||
       (typeof input.index === 'number' && input.index > 0) ||
       (Array.isArray(input.indices) && input.indices.length > 0)
@@ -516,6 +586,10 @@ export class QuarkFileActionService {
       if (targets.length === 0) {
         return `路径【${input.path}】下没有发现压缩包文件哦~`;
       }
+      if (targets.length > 1 && !input.all_matches && !password) {
+        this.sessionManager.setPendingUnarchive(userId, targetHint, targets);
+        return this.formatArchiveCountPrompt(targets, targetHint);
+      }
     }
     // 情况 4：按关键词搜网盘，或全盘扫压缩包
     else {
@@ -524,7 +598,7 @@ export class QuarkFileActionService {
         const matched = await this.quarkService.searchFiles(query, {
           customCookie,
           rootDir,
-          size: 30,
+          size: 200,
         });
         targets = await this.collectArchivesFromNodes(matched, customCookie);
         targetHint = `「${query}」`;
@@ -539,36 +613,48 @@ export class QuarkFileActionService {
           }
           return `在夸克网盘里没有找到和「${query}」相关的压缩包，你可以先让我「查一下网盘里有哪些压缩包」看看准确名字~`;
         }
+        // 多压缩包且用户未明确指示“全部解压”时，先只汇报总数量并等待确认（绝不刷屏列文件名）
+        if (targets.length > 1 && !input.all_matches && !password) {
+          this.sessionManager.setPendingUnarchive(userId, targetHint, targets);
+          return this.formatArchiveCountPrompt(targets, targetHint);
+        }
       } else {
-        const authProbe = await this.quarkService.listFilesInFolderStrict('0', customCookie, 1);
-        if (authProbe.unauthorized) {
-          return '可以帮你云端解压呀！不过当前夸克网盘 Cookie 凭证已过期或未绑定，先发 `/set-quark <你的Cookie>` 更新后，我就能直接扫描并帮你解压网盘里的压缩包啦~';
+        // 若此前刚刚列过网盘压缩包且用户说“全部解压”，优先复用完整列表
+        const listing = this.sessionManager.getNetdiskListing(userId);
+        if (input.all_matches && listing && listing.items.length > 0) {
+          const listingArchives = await this.collectArchivesFromNodes(listing.items, customCookie);
+          if (listingArchives.length > 0) {
+            targets = listingArchives;
+            targetHint = listing.pathOrQuery || '网盘压缩包';
+          }
         }
-        const allArchives = await this.quarkService.searchFiles('', {
-          customCookie,
-          rootDir,
-          archivesOnly: true,
-          size: 20,
-        });
-        if (allArchives.length === 0) {
-          return '可以帮你解压呀！我支持夸克云端在线解压（含密码压缩包、分卷包）和防和谐假后缀秒还原。刚才顺手扫了一遍你的网盘常用目录，暂时没发现待解压的压缩包；如果它藏在某个具体文件夹里，直接把文件夹名或压缩包名字告诉我，我立马帮你解~';
-        }
-        if (allArchives.length > 1 && !input.all_matches) {
-          this.sessionManager.setNetdiskListing(userId, {
-            source: 'archives',
-            pathOrQuery: '网盘压缩包',
-            items: allArchives,
+
+        if (targets.length === 0) {
+          const authProbe = await this.quarkService.listFilesInFolderStrict('0', customCookie, 1);
+          if (authProbe.unauthorized) {
+            return '可以帮你云端解压呀！不过当前夸克网盘 Cookie 凭证已过期或未绑定，先发 `/set-quark <你的Cookie>` 更新后，我就能直接扫描并帮你解压网盘里的压缩包啦~';
+          }
+          const allArchives = await this.quarkService.searchFiles('', {
+            customCookie,
+            rootDir,
+            archivesOnly: true,
+            size: 200,
           });
-          const lines = [`📦 可以呀！我顺手帮你扫到网盘里有 **${allArchives.length}** 个压缩包，你想解压哪一个？`, ''];
-          allArchives.slice(0, 12).forEach((item, idx) => {
-            lines.push(this.formatNodeLine(item, idx + 1));
-          });
-          lines.push('');
-          lines.push('👉 直接回复「解压第1个」「解压第2个 密码xxx」或者说「全部解压」我就帮你动手~');
-          return lines.join('\n').trim();
+          if (allArchives.length === 0) {
+            return '可以帮你解压呀！我支持夸克云端在线解压（含密码压缩包、分卷包）和防和谐假后缀秒还原。刚才顺手扫了一遍你的网盘常用目录，暂时没发现待解压的压缩包；如果它藏在某个具体文件夹里，直接把文件夹名或压缩包名字告诉我，我立马帮你解~';
+          }
+          if (allArchives.length > 1 && !input.all_matches) {
+            this.sessionManager.setNetdiskListing(userId, {
+              source: 'archives',
+              pathOrQuery: '网盘压缩包',
+              items: allArchives,
+            });
+            this.sessionManager.setPendingUnarchive(userId, '你的夸克网盘', allArchives);
+            return this.formatArchiveCountPrompt(allArchives, '你的夸克网盘');
+          }
+          targets = allArchives;
+          targetHint = '网盘压缩包';
         }
-        targets = allArchives;
-        targetHint = '网盘压缩包';
       }
     }
 
@@ -579,7 +665,7 @@ export class QuarkFileActionService {
       deleteAfter,
     });
 
-    // 若仍需密码，保留 awaitingUnarchiveConfirm 方便用户直接回复密码继续
+    // 若仍需密码，保留待解压队列方便用户直接回复密码继续
     const stillNeedsPassword = batch.results.some((r) => r.needPassword);
     if (!stillNeedsPassword) {
       this.sessionManager.clearAwaitingUnarchive(userId);

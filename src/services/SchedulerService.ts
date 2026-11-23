@@ -1241,7 +1241,7 @@ export class SchedulerService {
     const autoRes = await this.trySaveQuarkCandidates(validItems, userId, defaultCategory, title);
     if (autoRes.success) {
       const base = `⚡ 已为你把《${title}》自动转存进夸克网盘：【${autoRes.targetPath}】！`;
-      if (autoRes.message && autoRes.message.includes('检测到刚转存的内容含压缩包')) {
+      if (autoRes.message && /检测到刚转存的内容.*压缩包/.test(autoRes.message)) {
         const archiveLines = autoRes.message
           .split('\n')
           .filter((l) => l.startsWith('📦') || l.startsWith('⚠️') || l.startsWith('👉'));

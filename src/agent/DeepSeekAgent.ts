@@ -363,23 +363,32 @@ export class DeepSeekAgent {
       this.sessionManager.clearPendingImageSearch(userId);
     }
 
-    // 0.5 优先处理“刚转存含压缩包提醒”后的极简快捷确认/拒绝（如“解压”、“好的”、“解压 密码1234”、“不解压”）
+    // 0.5 优先处理“待确认解压压缩包”或“刚转存含压缩包提醒”后的极简快捷确认/拒绝（如“全部解压”、“19个全部解压”、“解压 密码1234”、“不解压”）
+    const pendingUnarchive = this.sessionManager.getPendingUnarchive(userId);
     const recentSaved = this.sessionManager.getRecentSaved(userId);
-    if (recentSaved?.awaitingUnarchiveConfirm && !trimmed.startsWith('/')) {
+    const hasAwaitingUnarchive = Boolean(pendingUnarchive?.awaitingConfirm || recentSaved?.awaitingUnarchiveConfirm);
+    if (hasAwaitingUnarchive && !trimmed.startsWith('/')) {
       const quickIntent = QuarkFileActionService.parseQuickUnarchiveIntent(trimmed, true);
       if (quickIntent) {
         if (quickIntent.kind === 'decline') {
           this.sessionManager.clearAwaitingUnarchive(userId);
-          const declineReply = '好嘞，先不动这几个压缩包，回头想让我帮你解压随时喊一声就行~';
+          const declineReply = '好嘞，先不动这些压缩包，回头想让我帮你解压随时喊一声就行~';
           appendUserHistory(trimmed, declineReply);
           return declineReply;
         }
+        const totalPending = pendingUnarchive?.items.length ||
+          ((recentSaved?.archiveFiles.length || 0) + (recentSaved?.fakeArchiveFiles.length || 0));
         if (onProgress) {
-          await onProgress('📦 收到！正在为你云端处理刚刚转存的压缩包，请稍候...').catch(() => {});
+          await onProgress(
+            totalPending > 1
+              ? `📦 收到！正在为你云端解压全部 ${totalPending} 个压缩包，请稍候...`
+              : '📦 收到！正在为你云端处理压缩包，请稍候...'
+          ).catch(() => {});
         }
         const unzipReply = await this.quarkFileActions.execute(userId, {
           action: 'unarchive',
-          target_scope: 'recent_saved',
+          target_scope: pendingUnarchive?.awaitingConfirm ? undefined : 'recent_saved',
+          all_matches: true,
           password: quickIntent.password,
           delete_after: quickIntent.deleteAfter,
         });
@@ -924,10 +933,14 @@ export class DeepSeekAgent {
         : '暂无最近转存记录';
       const netdiskListingHint =
         netdiskListing && netdiskListing.items.length > 0
-          ? netdiskListing.items
-              .slice(0, 8)
+          ? `共 ${netdiskListing.items.length} 项（前5项：${netdiskListing.items
+              .slice(0, 5)
               .map((it, idx) => `${idx + 1}.${it.file_name}${it.dir ? '(目录)' : ''}`)
-              .join('；')
+              .join('；')}）`
+          : '暂无';
+      const pendingUnarchiveHint =
+        pendingUnarchive && pendingUnarchive.items.length > 0
+          ? `共 ${pendingUnarchive.items.length} 个待解压压缩包（${pendingUnarchive.targetHint}）`
           : '暂无';
 
       const messages: OpenAI.Chat.Completions.ChatCompletionMessageParam[] = [
@@ -935,7 +948,7 @@ export class DeepSeekAgent {
           role: 'system',
           content: `你是一个微信端像朋友一样的智能影视云盘助手「电视搭子 (TVdazi)」。
 你的性格：热情亲切、自然随和、说话通俗简单、接地气，绝不要输出冰冷呆板的客服话术或技术术语。
-当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}；最近刚推荐或讨论过的影视：${recentTitle ? `《${recentTitle}》` : '暂无'}；最近刚转存的网盘文件：${recentSavedHint}；当前网盘文件列表：${netdiskListingHint}。
+当前用户对话上下文：你的名字叫「${myName}」；服务通讯录共有 ${directory.length} 位微信用户（${directoryHint}）；传话状态：${pendingHint}；最近刚推荐或讨论过的影视：${recentTitle ? `《${recentTitle}》` : '暂无'}；最近刚转存的网盘文件：${recentSavedHint}；当前待解压压缩包队列：${pendingUnarchiveHint}；当前网盘文件列表：${netdiskListingHint}。
 核心系统能力与规则（重要）：
 1. 你是所有自然语言消息的总控意图分析大脑，必须先准确理解用户的真实意图再调用对应工具。
 2. 你拥有后台高精度持久化定时调度引擎，完全支持任意定时、延时、周期蹲守或追更任务（如“两分钟后推荐一部电影”、“半小时后帮我转存到网盘”、“每天早上8点推送”、“每10分钟蹲守《某剧》”），【绝对严禁】推脱拒答！遇到此类需求直接调用 manage_scheduled_task。
