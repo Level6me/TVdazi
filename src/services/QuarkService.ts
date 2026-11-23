@@ -1105,10 +1105,16 @@ export class QuarkService {
   }
 
   /**
-   * 列出指定目录下的全部文件和子目录节点（含大小、更新时间与目录标志）
+   * 列出指定目录下的全部文件和子目录节点（严格区分空目录与登录凭证过期 401）
    */
-  async listFilesInFolder(folderFid = '0', customCookie?: string, size = 100): Promise<QuarkFileNode[]> {
-    if (!this.isConfigured(customCookie)) return [];
+  async listFilesInFolderStrict(
+    folderFid = '0',
+    customCookie?: string,
+    size = 100
+  ): Promise<{ ok: boolean; unauthorized?: boolean; items: QuarkFileNode[] }> {
+    if (!this.isConfigured(customCookie)) {
+      return { ok: false, unauthorized: true, items: [] };
+    }
     try {
       const resp = await axios.get('https://drive-h.quark.cn/1/clouddrive/file/sort', {
         params: {
@@ -1123,18 +1129,33 @@ export class QuarkService {
         headers: this.getHeaders(customCookie),
         timeout: 8000,
       });
+      if (resp.data?.status === 401 || resp.data?.code === 40001 || resp.data?.message?.includes('登录')) {
+        return { ok: false, unauthorized: true, items: [] };
+      }
       const list = resp.data?.data?.list || [];
-      return list.map((item: any) => ({
-        fid: item.fid,
-        file_name: item.file_name,
-        dir: Boolean(item.dir),
-        size: Number(item.size || 0),
-        pdir_fid: item.pdir_fid || folderFid,
-        updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
-      }));
-    } catch {
-      return [];
+      return {
+        ok: true,
+        items: list.map((item: any) => ({
+          fid: item.fid,
+          file_name: item.file_name,
+          dir: Boolean(item.dir),
+          size: Number(item.size || 0),
+          pdir_fid: item.pdir_fid || folderFid,
+          updated_at: Number(item.updated_at || item.l_updated_at || 0) || undefined,
+        })),
+      };
+    } catch (err: any) {
+      const unauthorized = err.response?.status === 401 || err.response?.data?.message?.includes('登录');
+      return { ok: false, unauthorized, items: [] };
     }
+  }
+
+  /**
+   * 列出指定目录下的全部文件和子目录节点（含大小、更新时间与目录标志）
+   */
+  async listFilesInFolder(folderFid = '0', customCookie?: string, size = 100): Promise<QuarkFileNode[]> {
+    const res = await this.listFilesInFolderStrict(folderFid, customCookie, size);
+    return res.items;
   }
 
   /**
@@ -1146,6 +1167,7 @@ export class QuarkService {
     size = 100
   ): Promise<{
     ok: boolean;
+    unauthorized?: boolean;
     fid: string;
     path: string;
     items: QuarkFileNode[];
@@ -1156,6 +1178,7 @@ export class QuarkService {
     if (!this.isConfigured(customCookie)) {
       return {
         ok: false,
+        unauthorized: true,
         fid: '0',
         path: normalizedPath,
         items: [],
@@ -1166,6 +1189,20 @@ export class QuarkService {
 
     const fid = await this.resolveExistingPathFid(normalizedPath, customCookie);
     if (!fid) {
+      // 检查是否因 Cookie 过期导致找不到目录
+      const probe = await this.listFilesInFolderStrict('0', customCookie, 1);
+      if (probe.unauthorized) {
+        this.invalidateDirCacheForScope(customCookie);
+        return {
+          ok: false,
+          unauthorized: true,
+          fid: '',
+          path: normalizedPath,
+          items: [],
+          summary: QuarkOrganizer.summarizeFileTypes([]),
+          message: '夸克网盘 Cookie 凭证已过期或未激活，请重新复制 Cookie 发送 `/set-quark <新Cookie>` 更新后再试。',
+        };
+      }
       return {
         ok: false,
         fid: '',
@@ -1176,8 +1213,20 @@ export class QuarkService {
       };
     }
 
-    const rawItems = await this.listFilesInFolder(fid, customCookie, size);
-    const items = rawItems.map((it) => ({
+    const listed = await this.listFilesInFolderStrict(fid, customCookie, size);
+    if (listed.unauthorized) {
+      this.invalidateDirCacheForScope(customCookie);
+      return {
+        ok: false,
+        unauthorized: true,
+        fid,
+        path: normalizedPath,
+        items: [],
+        summary: QuarkOrganizer.summarizeFileTypes([]),
+        message: '夸克网盘 Cookie 凭证已过期或未激活，请重新复制 Cookie 发送 `/set-quark <新Cookie>` 更新后再试。',
+      };
+    }
+    const items = listed.items.map((it) => ({
       ...it,
       pdir_fid: it.pdir_fid || fid,
       path: `${normalizedPath === '/' ? '' : normalizedPath}/${it.file_name}`.replace(/\/+/g, '/'),

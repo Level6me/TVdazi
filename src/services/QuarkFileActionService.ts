@@ -491,14 +491,11 @@ export class QuarkFileActionService {
         return `选中的「${picked[0].file_name}」不是压缩包（里面也没发现压缩文件），不需要解压哦~`;
       }
     }
-    // 情况 2：明确解压刚刚转存的，或未传任何 query/path 但刚转存的正好含压缩包
+    // 情况 2：明确解压刚刚转存的（若存在刚转存记录直接处理；若没有记录则顺手扫描网盘压缩包兜底）
     else if (
-      input.target_scope === 'recent_saved' ||
+      (input.target_scope === 'recent_saved' && recent) ||
       (!input.query && !input.path && recent && recent.fileTypeSummary.hasArchives)
     ) {
-      if (!recent) {
-        return '最近没有刚刚转存的记录哦~ 可以告诉我网盘里压缩包的名字或路径，我帮你找出来解压！';
-      }
       targets = [
         ...recent.archiveFiles,
         ...recent.fakeArchiveFiles.map((f) => f.node),
@@ -536,9 +533,17 @@ export class QuarkFileActionService {
             const sum = QuarkOrganizer.summarizeFileTypes(matched);
             return `在网盘里找到了和「${query}」相关的 ${matched.length} 项（${sum.summaryLine}），但里面没有压缩包文件哦~`;
           }
+          const authProbe = await this.quarkService.listFilesInFolderStrict('0', customCookie, 1);
+          if (authProbe.unauthorized) {
+            return '⚠️ 夸克网盘 Cookie 凭证已过期或未激活，先发送 `/set-quark <新Cookie>` 绑定后我就能帮你搜文件并云端解压啦~';
+          }
           return `在夸克网盘里没有找到和「${query}」相关的压缩包，你可以先让我「查一下网盘里有哪些压缩包」看看准确名字~`;
         }
       } else {
+        const authProbe = await this.quarkService.listFilesInFolderStrict('0', customCookie, 1);
+        if (authProbe.unauthorized) {
+          return '可以帮你云端解压呀！不过当前夸克网盘 Cookie 凭证已过期或未绑定，先发 `/set-quark <你的Cookie>` 更新后，我就能直接扫描并帮你解压网盘里的压缩包啦~';
+        }
         const allArchives = await this.quarkService.searchFiles('', {
           customCookie,
           rootDir,
@@ -546,7 +551,7 @@ export class QuarkFileActionService {
           size: 20,
         });
         if (allArchives.length === 0) {
-          return '扫描了你的夸克网盘，目前没有发现待解压的压缩包哦~ 如果它在某个特定子目录里，把目录名或压缩包名告诉我就能精准定位！';
+          return '可以帮你解压呀！我支持夸克云端在线解压（含密码压缩包、分卷包）和防和谐假后缀秒还原。刚才顺手扫了一遍你的网盘常用目录，暂时没发现待解压的压缩包；如果它藏在某个具体文件夹里，直接把文件夹名或压缩包名字告诉我，我立马帮你解~';
         }
         if (allArchives.length > 1 && !input.all_matches) {
           this.sessionManager.setNetdiskListing(userId, {
@@ -554,7 +559,7 @@ export class QuarkFileActionService {
             pathOrQuery: '网盘压缩包',
             items: allArchives,
           });
-          const lines = [`📦 我帮你扫到网盘里有 **${allArchives.length}** 个压缩包，你想解压哪一个？`, ''];
+          const lines = [`📦 可以呀！我顺手帮你扫到网盘里有 **${allArchives.length}** 个压缩包，你想解压哪一个？`, ''];
           allArchives.slice(0, 12).forEach((item, idx) => {
             lines.push(this.formatNodeLine(item, idx + 1));
           });
